@@ -134,16 +134,25 @@ jobs:
           path: rust-source
           key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
 
-      - name: Restore LLVM build trees
-        id: cache-llvm
+      # Two LLVM caches, so that the (slow) build-host LLVM can be saved before
+      # the iOS LLVM is finished: a stage-2 timeout then still leaves the
+      # expensive half behind.
+      - name: Restore LLVM (build host)
+        id: cache-llvm-host
         uses: actions/cache/restore@v4
         with:
           path: |
             rust-source/build/cache
             rust-source/build/aarch64-apple-darwin/llvm
             rust-source/build/x86_64-apple-darwin/llvm
-            rust-source/build/aarch64-apple-ios/llvm
-          key: rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
+          key: rust-llvm-host-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
+
+      - name: Restore LLVM (iOS)
+        id: cache-llvm-ios
+        uses: actions/cache/restore@v4
+        with:
+          path: rust-source/build/aarch64-apple-ios/llvm
+          key: rust-llvm-ios-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
 
       - name: Fetch Rust sources
         run: Scripts/build-rust-toolchain.sh fetch
@@ -158,7 +167,23 @@ jobs:
       - name: Configure bootstrap
         run: Scripts/build-rust-toolchain.sh configure
 
-      - name: Build rustc for iOS
+      # Stage 1 builds the build-host LLVM, the stage1 rustc and std for the
+      # target. Cache it before stage 2 so that a stage-2 timeout (the job is
+      # limited to 6 h) does not throw the cold LLVM build away.
+      - name: Build stage 1 (build-host LLVM, stage1 rustc)
+        run: STAGE=1 Scripts/build-rust-toolchain.sh build
+
+      - name: Save LLVM (build host)
+        if: always() && steps.cache-llvm-host.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            rust-source/build/cache
+            rust-source/build/aarch64-apple-darwin/llvm
+            rust-source/build/x86_64-apple-darwin/llvm
+          key: rust-llvm-host-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
+
+      - name: Build stage 2 (iOS LLVM, final rustc)
         run: Scripts/build-rust-toolchain.sh build
 
       - name: Verify artifacts
@@ -208,16 +233,12 @@ jobs:
 
       # Saved even on failure: a half-built LLVM is still useful on the next
       # run (ninja/cmake pick up where they left off).
-      - name: Save LLVM build trees
-        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+      - name: Save LLVM (iOS)
+        if: always() && steps.cache-llvm-ios.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: |
-            rust-source/build/cache
-            rust-source/build/aarch64-apple-darwin/llvm
-            rust-source/build/x86_64-apple-darwin/llvm
-            rust-source/build/aarch64-apple-ios/llvm
-          key: rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
+          path: rust-source/build/aarch64-apple-ios/llvm
+          key: rust-llvm-ios-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
 
       - name: Summary
         if: always()
@@ -229,7 +250,8 @@ jobs:
             echo "| --- | --- |"
             echo "| host / target | \`${HOST_TRIPLE:-aarch64-apple-ios}\` |"
             echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
-            echo "| cache hit (LLVM) | \`${{ steps.cache-llvm.outputs.cache-hit }}\` |"
+            echo "| cache hit (LLVM host) | \`${{ steps.cache-llvm-host.outputs.cache-hit }}\` |"
+            echo "| cache hit (LLVM iOS) | \`${{ steps.cache-llvm-ios.outputs.cache-hit }}\` |"
             echo "| cache hit (sources) | \`${{ steps.cache-rust-src.outputs.cache-hit }}\` |"
             echo
             echo '```'

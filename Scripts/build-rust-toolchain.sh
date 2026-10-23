@@ -343,6 +343,9 @@ build() {
         stage_args+=(-j "${JOBS}")
     fi
 
+    if [[ "${STAGE}" -eq 1 ]]; then
+        log "building stage 1 only (build-host LLVM + stage1 rustc + target std)"
+    fi
     log "running: python3 x.py ${stage_args[*]}  (this takes hours)"
     ( cd "${RUST_SOURCE_DIR}" && python3 x.py "${stage_args[@]}" )
 }
