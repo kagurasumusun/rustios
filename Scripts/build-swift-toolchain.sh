@@ -60,10 +60,11 @@ SWIFT_INSTALL_DIR="${SWIFT_INSTALL_DIR:-${WORK_DIR}/SwiftToolchain}"
 # shim, include/, lib/*.a). build-rust-toolchain.sh consumes exactly this.
 SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${WORK_DIR}/SwiftLLVM}"
 
-# LLVM backends. Only AArch64 is ever used here (the toolchain runs on an arm64
-# device and targets arm64); building it for the host as well keeps the two
-# trees identical, which is what lets one llvm-config describe the other.
-LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
+# LLVM backends. Left at LLVM's default set: compiler-rt builds builtins for
+# embedded ARM and x86 as part of the runtimes, and those need their backends.
+# (rustc links every component llvm-config reports, so both trees stay
+# identical, which is what lets one llvm-config describe the other.)
+LLVM_TARGETS="${LLVM_TARGETS:-all (LLVM default)}"
 
 PACKAGE_PREFIX="iphoneos-arm64"
 SWIFT_TOOLCHAIN_NAME="SwiftToolchain"

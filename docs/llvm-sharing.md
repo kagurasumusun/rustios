@@ -111,7 +111,7 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 | --- | --- | --- |
 | `[llvm] download-ci-llvm` | `false` | 配布 LLVM は macOS 用で、iOS 用 rustc には使えない |
 | `[llvm] link-shared` | `false` | 静的ライブラリをリンク（`LLVM_LINK_SHARED` を立てない） |
-| `[llvm] targets` | `AArch64` | Swift 側の `llvm-targets-to-build` と一致させる |
+| `[llvm] targets` | `AArch64` | 外部 LLVM を使う場合は未使用（bootstrap が LLVM をビルドしないため） |
 | `[rust] llvm-tools` | `false` | 外部 LLVM に llvm-tools は無い。必要な `llvm-ar` 等は `SwiftLLVM/ios/bin` に同梱 |
 | `[build] build` | `aarch64-apple-darwin` | ビルドマシン |
 | `[target."aarch64-apple-darwin"]` | `llvm-config = <SwiftLLVM>/macosx/bin/llvm-config` | stage1 rustc（macOS で動く）用 |
@@ -127,7 +127,16 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 
 `Scripts/swift-ios-toolchain-presets.ini` は emexlab/LLVM-On-iOS の
 `nyxian_iphoneos_arm64_crosscompiler` を元にしたプリセットで、LLVM を 2 回
-ビルドします（同じソース、同じ `LLVM_TARGETS=AArch64`）。
+ビルドします（同じソース、同じターゲット構成）。
+
+`llvm-targets-to-build` は **指定しません**（LLVM の既定 = 全バックエンド）。
+compiler-rt は runtimes の一部として `macho_embedded` 向け builtins を
+armv6m / armv7m / armv7em / i386 / x86_64 についてビルドし、ARM バックエンドが
+登録する `-arm-add-build-attributes` を clang が使うためです。AArch64 だけに
+絞ると、そのステップが
+`Unknown command line argument '-arm-add-build-attributes'` で失敗します
+（実際に CI で確認）。rustc が使うのは AArch64 バックエンドだけですが、
+LLVM の静的ライブラリは両ツリーで同じ構成にしてあります。
 
 | 出力 | 用途 |
 | --- | --- |

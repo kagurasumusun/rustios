@@ -140,7 +140,7 @@ make RUST_LLVM_MODE=intree   # 比較用: rust-lang 版 LLVM を bootstrap に�
 | `OS_VER` / `IOS_DEPLOYMENT_TARGET` | `16.0` | iOS deployment target（LLVM-On-iOS と同じ） |
 | `HOST_TRIPLE` | `aarch64-apple-ios` | 生成する rustc が動くプラットフォーム |
 | `STAGE` | `2` | bootstrap のステージ |
-| `LLVM_TARGETS` | `AArch64` | LLVM のバックエンド（`AArch64` のみで十分） |
+| `LLVM_TARGETS` | `AArch64` | `intree` モードで bootstrap がビルドする LLVM のバックエンド（`swift` モードでは未使用） |
 | `JOBS` | CPU 数 | 並列度 |
 
 ---
