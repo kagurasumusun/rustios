@@ -1,0 +1,18 @@
+# Rust source checkout and out-of-tree build directory
+/rust-source/
+/rust-build/
+
+# Local working directories / artifacts
+/work/
+/artifacts/
+/RustToolchain/
+/Rust.xcframework/
+
+# Archives
+*.tar.xz
+*.tar.gz
+*.zip
+*.xcframework
+
+# macOS
+.DS_Store
