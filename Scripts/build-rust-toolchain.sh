@@ -485,14 +485,18 @@ configure() {
 
     [[ -n "${JOBS}" ]] && jobs_line="jobs = ${JOBS}"
     # bootstrap feeds `build.ccache` to RUSTC_WRAPPER and to LLVM's
-    # CMAKE_<LANG>_COMPILER_LAUNCHER, so sccache covers both rustc and LLVM.
+    # CMAKE_<LANG>_COMPILER_LAUNCHER, so the wrapper covers both rustc and LLVM.
+    # Only a locally installed wrapper is used: a remote cache that fails mid
+    # build aborts the compiler invocation, and this build is hours long.
+    local ccache_tool=""
     if command -v sccache >/dev/null 2>&1; then
-        ccache_line='ccache = "sccache"'
+        ccache_tool="sccache"
     elif command -v ccache >/dev/null 2>&1; then
-        ccache_line='ccache = "ccache"'
+        ccache_tool="ccache"
     fi
-    if [[ -n "${ccache_line}" ]]; then
-        log "using ${ccache_line#ccache = \"} for compiler caching"
+    if [[ -n "${ccache_tool}" ]]; then
+        ccache_line="ccache = \"${ccache_tool}\""
+        log "using ${ccache_tool} for compiler caching"
     fi
 
     log "writing ${cfg}"

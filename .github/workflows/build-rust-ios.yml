@@ -59,8 +59,6 @@ env:
   # Bump these to invalidate the caches below (e.g. after changing configure).
   CACHE_VERSION: "1"
   LLVM_CACHE_VERSION: "1"
-  SCCACHE_GHA_ENABLED: "true"
-  SCCACHE_CACHE_SIZE: "10G"
   # Never export SDKROOT: the build host is macOS, only the iOS compilation
   # should see the iPhoneOS SDK (the script handles that itself).
   CARGO_INCREMENTAL: "0"
@@ -122,18 +120,16 @@ jobs:
           fi
           ninja --version
 
-      # sccache caches individual rustc/clang invocations (stage 1/2 rustc and
-      # the LLVM build). It is used as both RUSTC_WRAPPER and as the CMake
-      # compiler launcher by bootstrap.
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
-
       # Two caches, both keyed on inputs (never on a run id) so that a hit is a
       # genuine hit:
       #   rust-src-*  : the Rust checkout + the two submodules we need
       #   rust-llvm-* : the macOS and iOS LLVM build trees + the stage0 download
-      # Everything else is cheap, or covered by sccache (which writes to the
-      # GitHub Actions cache itself, so a killed job still leaves objects).
+      # Everything else is cheap to rebuild.
+      #
+      # sccache is deliberately not used: its GitHub Actions backend talks to
+      # Azure storage, and a single transient storage error there aborts the
+      # compiler invocation (it killed a run at the first LLVM object file with
+      # "cache storage failed to read").
       - name: Restore Rust sources
         id: cache-rust-src
         uses: actions/cache/restore@v4
@@ -163,6 +159,7 @@ jobs:
         run: Scripts/build-rust-toolchain.sh fetch
 
       - name: Save Rust sources
+        continue-on-error: true
         if: steps.cache-rust-src.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -188,6 +185,7 @@ jobs:
           RUSTIOS_BUILD_PHASE=host Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
 
       - name: Save LLVM build trees (after stage 1)
+        continue-on-error: true
         if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -265,6 +263,7 @@ jobs:
       # Saved even on failure: a half-built LLVM is still useful on the next
       # run (ninja/cmake pick up where they left off).
       - name: Save LLVM build trees (final)
+        continue-on-error: true
         if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
