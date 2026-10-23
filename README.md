@@ -142,6 +142,26 @@ host = ["aarch64-apple-ios"]
 target = ["aarch64-apple-ios"]
 ```
 
+### なぜ 2 段階なのか
+
+rustc のホストを iOS にすると、**ビルドマシン上で動くコンパイラ**がまず必要です
+（stage0 のバイナリは iOS 用の std を作れません: bootstrap が
+`It is not possible to build the standard library for aarch64-apple-ios using the
+stage0 compiler` で止まります）。そこで bootstrap を 2 回に分けて実行します。
+
+```sh
+# 1) ビルドマシン用: macOS 用 LLVM + stage1 rustc + iOS 用 std
+x.py build --stage 1 --host aarch64-apple-darwin
+
+# 2) iOS 用: iOS 用 LLVM + iOS で動く stage2 rustc
+x.py build --stage 2 --host aarch64-apple-ios compiler
+```
+
+`Scripts/build-rust-toolchain.sh build` は既定でこの 2 つを順に実行します
+（`RUSTIOS_BUILD_PHASE=host` / `target` で個別に実行でき、CI はその間に
+キャッシュを保存します）。2 段目に `compiler` というパスを渡すのは、
+ビルドマシン用の stage2 rustc まで作ってしまうのを避けるためです。
+
 ### LLVM を 2 回ビルドする理由
 
 rustc は LLVM を静的リンクします。iOS で動く rustc には **iOS 用の LLVM** が

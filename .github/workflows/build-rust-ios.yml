@@ -178,11 +178,14 @@ jobs:
       # Build in two stages and cache in between: whichever LLVM stage 1
       # needs is already expensive on a cold runner, and a stage-2 timeout
       # (the job is limited to 6 h) must not throw it away.
-      - name: Build stage 1
+      # A cross-host build needs a compiler that runs on the build machine:
+      # stage 1 produces that compiler (plus the build machine's LLVM and the
+      # iOS std), stage 2 uses it to produce the compiler that runs on iOS.
+      - name: Build stage 1 (build-machine compiler)
         run: |
           set -o pipefail
-          echo "===== build stage 1 =====" | tee -a build.log
-          STAGE=1 Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
+          echo "===== build stage 1 (host phase) =====" | tee -a build.log
+          RUSTIOS_BUILD_PHASE=host Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
 
       - name: Save LLVM build trees (after stage 1)
         if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
@@ -195,11 +198,11 @@ jobs:
             rust-source/build/aarch64-apple-ios/llvm
           key: rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}-stage1
 
-      - name: Build stage 2 (final rustc)
+      - name: Build stage 2 (rustc for iOS)
         run: |
           set -o pipefail
-          echo "===== build stage 2 =====" | tee -a build.log
-          Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
+          echo "===== build stage 2 (target phase) =====" | tee -a build.log
+          RUSTIOS_BUILD_PHASE=target Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
 
       - name: Verify artifacts
         run: |

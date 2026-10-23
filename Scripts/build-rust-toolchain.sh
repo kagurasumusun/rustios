@@ -566,6 +566,28 @@ EOF
 # build
 # ---------------------------------------------------------------------------
 
+# xpy_build <stage> <host> [paths...]
+#
+# Run one phase of the bootstrap. The two phases exist because a cross-host
+# build needs a compiler that runs on the build machine first:
+#
+#   host phase   : LLVM for the build machine, the stage1 compiler, and the
+#                  target's std built by that compiler
+#   target phase : LLVM for the iOS host, and the compiler that runs on iOS
+xpy_build() {
+    local stage="$1" host="$2"
+    shift 2
+
+    local args=(build --stage "${stage}" --host "${host}")
+    if [[ -n "${JOBS}" ]]; then
+        args+=(-j "${JOBS}")
+    fi
+    args+=("$@")
+
+    log "running: python3 x.py ${args[*]}"
+    ( cd "${RUST_SOURCE_DIR}" && python3 x.py "${args[@]}" )
+}
+
 build() {
     require_macos
     require_cmd python3
@@ -588,16 +610,28 @@ build() {
     # SDKROOT is deliberately not exported. It queries xcrun itself when
     # compiling for iOS.
 
-    local stage_args=(build --stage "${STAGE}")
-    if [[ -n "${JOBS}" ]]; then
-        stage_args+=(-j "${JOBS}")
-    fi
-
-    if [[ "${STAGE}" -eq 1 ]]; then
-        log "building stage 1 only (build-host LLVM + stage1 rustc + target std)"
-    fi
-    log "running: python3 x.py ${stage_args[*]}  (this takes hours)"
-    ( cd "${RUST_SOURCE_DIR}" && python3 x.py "${stage_args[@]}" )
+    case "${RUSTIOS_BUILD_PHASE:-all}" in
+        host)
+            xpy_build 1 "${BUILD_TRIPLE}"
+            ;;
+        target)
+            [[ "${STAGE}" -ge 2 ]] || die "the target phase needs STAGE >= 2"
+            # `compiler` = the Assemble step: build the sysroot (compiler +
+            # codegen backends + std link) for the iOS host. Without the path
+            # filter bootstrap would also build a stage-2 compiler for the
+            # build machine, which nothing here needs.
+            xpy_build "${STAGE}" "${HOST_TRIPLE}" compiler
+            ;;
+        all)
+            xpy_build 1 "${BUILD_TRIPLE}"
+            if [[ "${STAGE}" -ge 2 ]]; then
+                xpy_build "${STAGE}" "${HOST_TRIPLE}" compiler
+            fi
+            ;;
+        *)
+            die "unknown RUSTIOS_BUILD_PHASE: ${RUSTIOS_BUILD_PHASE} (host|target|all)"
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1149,7 +1183,11 @@ commands:
 
 environment: RUST_VERSION, RUST_CHANNEL, IOS_DEPLOYMENT_TARGET, HOST_TRIPLE,
              STAGE, LLVM_TARGETS, JOBS, RUST_SOURCE_DIR, BUILD_DIR, WORK_DIR,
-             ARTIFACTS_DIR
+             ARTIFACTS_DIR, RUSTIOS_BUILD_PHASE (host|target|all)
+
+'build' runs both phases by default: the stage1 compiler for this machine
+(needed to compile for iOS) and then the compiler that runs on iOS. Set
+RUSTIOS_BUILD_PHASE to run one of them, e.g. to cache in between.
 EOF
 }
 
