@@ -129,14 +129,15 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 `nyxian_iphoneos_arm64_crosscompiler` を元にしたプリセットで、LLVM を 2 回
 ビルドします（同じソース、同じターゲット構成）。
 
-`llvm-targets-to-build` は **指定しません**（LLVM の既定 = 全バックエンド）。
-compiler-rt は runtimes の一部として `macho_embedded` 向け builtins を
-armv6m / armv7m / armv7em / i386 / x86_64 についてビルドし、ARM バックエンドが
-登録する `-arm-add-build-attributes` を clang が使うためです。AArch64 だけに
-絞ると、そのステップが
+`llvm-targets-to-build=AArch64;ARM;X86` です。rustc と iOS の Swift が使うのは
+AArch64 だけですが、compiler-rt は runtimes の一部として `macho_embedded` 向け
+builtins を armv6m / armv7m / armv7em（ARM）と i386 / x86_64（X86）について
+ビルドします。ARM バックエンドが登録する `-arm-add-build-attributes` を clang が
+使うため、ARM を外すとそのステップが
 `Unknown command line argument '-arm-add-build-attributes'` で失敗します
-（実際に CI で確認）。rustc が使うのは AArch64 バックエンドだけですが、
-LLVM の静的ライブラリは両ツリーで同じ構成にしてあります。
+（CI で確認）。反対に LLVM 既定の全ターゲットでは 1 回のビルドが 6 時間の
+ジョブ上限に収まらなかったため（実測 約 5 時間 45 分でタイムアウト）、
+必要な 3 つに絞っています。
 
 | 出力 | 用途 |
 | --- | --- |

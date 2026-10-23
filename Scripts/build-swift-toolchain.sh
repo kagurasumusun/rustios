@@ -60,11 +60,10 @@ SWIFT_INSTALL_DIR="${SWIFT_INSTALL_DIR:-${WORK_DIR}/SwiftToolchain}"
 # shim, include/, lib/*.a). build-rust-toolchain.sh consumes exactly this.
 SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${WORK_DIR}/SwiftLLVM}"
 
-# LLVM backends. Left at LLVM's default set: compiler-rt builds builtins for
-# embedded ARM and x86 as part of the runtimes, and those need their backends.
-# (rustc links every component llvm-config reports, so both trees stay
-# identical, which is what lets one llvm-config describe the other.)
-LLVM_TARGETS="${LLVM_TARGETS:-all (LLVM default)}"
+# LLVM backends. AArch64 is what the shipped compilers use; ARM and X86 are
+# required by compiler-rt's embedded builtins (see the preset). Must match
+# `llvm-targets-to-build` there.
+LLVM_TARGETS="${LLVM_TARGETS:-AArch64;ARM;X86}"
 
 PACKAGE_PREFIX="iphoneos-arm64"
 SWIFT_TOOLCHAIN_NAME="SwiftToolchain"
@@ -585,7 +584,9 @@ tar_xz() {
     local dir="$1" name="$2" out="$3"
     mkdir -p "$(dirname "${out}")"
     rm -f "${out}"
-    ( cd "${dir}" && XZ_OPT="-T0 -6" tar -cJf "${out}" "${name}" )
+    # -3, not -6: the LLVM tree is several GB of static archives, where -6
+    # costs minutes of CPU for a few percent. The job has a 6 h limit.
+    ( cd "${dir}" && XZ_OPT="-T0 -3" tar -cJf "${out}" "${name}" )
 }
 
 checksum() {

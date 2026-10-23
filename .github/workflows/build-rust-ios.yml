@@ -72,8 +72,10 @@ jobs:
   swift:
     name: swift 6.4 + LLVM for iOS
     # GitHub-hosted runners are limited to 6 hours per job; this one is the
-    # long pole (LLVM for macOS and iOS, then the iOS Swift compiler).
-    timeout-minutes: 355
+    # long pole (LLVM for macOS and iOS, then the two Swift compilers). A run
+    # with LLVM's full target set needed ~5 h 45 min and was cut off while
+    # packaging, hence 360 and the reduced target list in the preset.
+    timeout-minutes: 360
     runs-on: macos-latest
     outputs:
       llvm_version: ${{ steps.versions.outputs.llvm_version }}
