@@ -635,22 +635,67 @@ build() {
             ;;
         target)
             [[ "${STAGE}" -ge 2 ]] || die "the target phase needs STAGE >= 2"
+            # The sysroot must be complete even if nobody runs 'verify' next.
             # `compiler` = the Assemble step: build the sysroot (compiler +
             # codegen backends + std link) for the iOS host. Without the path
             # filter bootstrap would also build a stage-2 compiler for the
             # build machine, which nothing here needs.
             xpy_build "${STAGE}" "${HOST_TRIPLE}" compiler
+            merge_target_std
             ;;
         all)
             xpy_build 1 "${BUILD_TRIPLE}"
             if [[ "${STAGE}" -ge 2 ]]; then
                 xpy_build "${STAGE}" "${HOST_TRIPLE}" compiler
+                merge_target_std
             fi
             ;;
         *)
             die "unknown RUSTIOS_BUILD_PHASE: ${RUSTIOS_BUILD_PHASE} (host|target|all)"
             ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# The stage2 sysroot and the target's std
+# ---------------------------------------------------------------------------
+
+# merge_target_std
+#
+# The compiler that runs on the device is assembled by `Assemble`, which only
+# copies the rustc crates into its sysroot. The std that this compiler links
+# against is the one built by the *stage1* (build machine) compiler - the same
+# compiler that produced it, which is what makes the two ABI-compatible - and
+# bootstrap puts it in the stage1 sysroot's rustlib/${HOST_TRIPLE}/lib.
+#
+# Merge the two so that stage$STAGE is a complete, self-contained sysroot for
+# the target: `rustc --sysroot` on the device, and the static driver on the
+# build machine, both need std and the rustc rlibs in one directory.
+#
+# Idempotent, and it never overwrites what Assemble produced (`cp -n`).
+merge_target_std() {
+    local stage1 src dst
+    stage1="$(build_host_dir)"
+    src="${stage1}/lib/rustlib/${HOST_TRIPLE}/lib"
+    dst="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/lib"
+
+    if [[ "${BUILD_TRIPLE}" == "${HOST_TRIPLE}" || "${dst}" == "${src}" ]]; then
+        return 0
+    fi
+    if [[ ! -d "${src}" ]]; then
+        die "missing ${src}: the host phase (stage 1) did not build std for ${HOST_TRIPLE}"
+    fi
+
+    mkdir -p "${dst}"
+    log "adding std for ${HOST_TRIPLE} to ${dst}"
+    cp -an "${src}/." "${dst}/"
+
+    # codegen-backends lives next to lib, not inside it.
+    if [[ -d "${stage1}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" ]]; then
+        mkdir -p "$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends"
+        cp -an "${stage1}/lib/rustlib/${HOST_TRIPLE}/codegen-backends/." \
+            "$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends/"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -662,6 +707,8 @@ verify() {
     local sysroot rustc desc archs build_info
     sysroot="$(stage_dir)"
     rustc="${sysroot}/bin/rustc"
+
+    merge_target_std
 
     [[ -x "${rustc}" ]] || die "missing ${rustc}; the build did not produce a compiler"
 
@@ -690,8 +737,15 @@ verify() {
     local std_rlibs=("${libdir}"/libstd-*.rlib)
     shopt -u nullglob
     [[ "${#std_rlibs[@]}" -gt 0 ]] || die "libstd for ${HOST_TRIPLE} is missing"
-    [[ -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" ]] \
-        || die "codegen backends for ${HOST_TRIPLE} are missing"
+    # In an in-tree build the LLVM backend is a dylib next to the compiler
+    # libraries (`<sysroot>/lib`), not an installed codegen-backends/*.dylib.
+    shopt -s nullglob
+    local backend_dylibs=("${sysroot}/lib"/librustc_codegen_llvm-*.dylib)
+    shopt -u nullglob
+    if [[ ! -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" \
+          && "${#backend_dylibs[@]}" -eq 0 ]]; then
+        die "no codegen backend for ${HOST_TRIPLE} in ${sysroot}/lib"
+    fi
 
     # A static Rust.xcframework needs the rustc rlibs, which only exist when
     # patch_bootstrap_rustc_artifacts applied before the build.
@@ -726,6 +780,9 @@ package() {
     dest="${WORK_DIR}/${TOOLCHAIN_NAME}"
 
     [[ -x "${stage}/bin/rustc" ]] || die "missing ${stage}/bin/rustc; run 'build' first"
+
+    # The toolchain is only usable on the device if its sysroot carries std.
+    merge_target_std
 
     log "assembling ${dest}"
     rm -rf "${dest}"
@@ -777,6 +834,8 @@ support() {
     dest="${WORK_DIR}/${SUPPORT_NAME}"
 
     [[ -d "${llvm}/lib" ]] || die "missing iOS LLVM at ${llvm}/lib; run 'build' first"
+
+    merge_target_std
     [[ -d "${rustlib}/lib" ]] || die "missing std at ${rustlib}/lib; run 'build' first"
 
     log "collecting iOS LLVM static libraries"
@@ -1026,6 +1085,8 @@ build_xcframework() {
 
     [[ "${STAGE}" -ge 2 ]] || die "the xcframework needs --stage 2 output (STAGE=${STAGE})"
     [[ -x "${stage1}/bin/rustc" ]] || die "missing ${stage1}/bin/rustc; run 'build' first"
+
+    merge_target_std
     [[ -d "${libdir}" ]] || die "missing ${libdir}; run 'build' first"
 
     # Target artifacts live in the sysroot; the compiler dylibs in <sysroot>/lib.
