@@ -410,8 +410,13 @@ build-dir = "build"
 docs = false
 compiler-docs = false
 extended = false
-submodules = true
+# fetch only clones src/llvm-project and library/backtrace; do not let x.py
+# pull cargo/gcc/enzyme/rustc-perf as well (it also keeps the build offline).
+submodules = false
 locked-deps = true
+# Sanitizer runtimes use compiler-rt's own (macOS-flavoured) CMake setup, which
+# the rustios LLVM patch deliberately bypasses. Build LLVM only.
+sanitizers = false
 ${jobs_line}
 ${ccache_line}
 
