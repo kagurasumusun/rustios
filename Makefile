@@ -1,47 +1,64 @@
-# rustios - build a Rust toolchain that runs on iOS.
+# rustios - a Rust toolchain for iOS.
 #
-# Mirrors the layout of https://github.com/emexlab/LLVM-On-iOS:
-#   make all  ->  RustToolchain + support libraries + Rust.xcframework
+# The same interface as emexlab/LLVM-On-iOS:
+#
+#     make            # everything (fetch, configure, build, verify, package)
+#     make fetch      # clone the Rust sources + required submodules
+#     make configure  # write rust-source/bootstrap.toml
+#     make build      # x.py build --stage 2 (host = target = aarch64-apple-ios)
+#     make verify     # check the produced rustc/std are iOS arm64 artifacts
+#     make package    # RustToolchain-iphoneos-arm64-<ver>.tar.xz
+#     make support    # RustSupportLibs-iphoneos-arm64-<ver>.tar.xz
+#     make xcframework  # Rust.xcframework-iphoneos-arm64-<ver>.tar.xz
+#     make clean / clean-all
 #
 # Everything is implemented in Scripts/build-rust-toolchain.sh; this Makefile
-# only wires the steps together.
+# only forwards the configuration and adds a few convenience targets.
 
 SHELL := /bin/bash
-ROOT  := $(CURDIR)
+.DEFAULT_GOAL := all
 
-OS_VER        ?= 16.0
-RUST_VERSION  ?= 1.99.1
-# Empty = let Scripts/build-rust-toolchain.sh derive it from RUST_VERSION
-# (stable for release tags, nightly for nightly-* tags).
-RUST_CHANNEL  ?=
-APPLE_ARCH    := arm64
-TARGET_TRIPLE := $(APPLE_ARCH)-apple-ios$(OS_VER)
-HOST_TRIPLE   ?= aarch64-apple-ios
-STAGE         ?= 2
-LLVM_TARGETS  ?= AArch64
-JOBS          ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
-BUILD_XCFRAMEWORK ?= true
+# ---------------------------------------------------------------------------
+# Configuration (override on the command line: make OS_VER=17.0)
+# ---------------------------------------------------------------------------
 
-SCRIPT        := $(ROOT)/Scripts/build-rust-toolchain.sh
-ARTIFACTS_DIR ?= $(ROOT)/artifacts
+OS_VER                ?= 16.0
+APPLE_ARCH            := arm64
+TARGET_TRIPLE         := $(APPLE_ARCH)-apple-ios$(OS_VER)
+HOST_TRIPLE           ?= aarch64-apple-ios
+RUST_VERSION          ?= 1.99.1
+RUST_CHANNEL          ?= stable
+STAGE                 ?= 2
+LLVM_TARGETS          ?= AArch64
+JOBS                  ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+BUILD_XCFRAMEWORK     ?= true
+
+RUST_SOURCE_DIR       ?= $(CURDIR)/rust-source
+BUILD_DIR             ?= $(RUST_SOURCE_DIR)/build
+WORK_DIR              ?= $(CURDIR)/work
+ARTIFACTS_DIR         ?= $(CURDIR)/artifacts
 
 IOS_DEPLOYMENT_TARGET := $(OS_VER)
+PACKAGE_PREFIX        := iphoneos-$(APPLE_ARCH)
 
+# Exported to the script.
 export RUST_VERSION RUST_CHANNEL IOS_DEPLOYMENT_TARGET HOST_TRIPLE STAGE \
-       LLVM_TARGETS JOBS BUILD_XCFRAMEWORK ARTIFACTS_DIR
+       LLVM_TARGETS JOBS RUST_SOURCE_DIR BUILD_DIR WORK_DIR ARTIFACTS_DIR
 
-TOOLCHAIN_ARCHIVE := $(ARTIFACTS_DIR)/RustToolchain-iphoneos-arm64-$(RUST_VERSION).tar.xz
-SUPPORT_ARCHIVE   := $(ARTIFACTS_DIR)/RustSupportLibs-iphoneos-arm64-$(RUST_VERSION).tar.xz
-XCFRAMEWORK       := $(ARTIFACTS_DIR)/Rust.xcframework-iphoneos-arm64-$(RUST_VERSION).tar.xz
+SCRIPT := $(CURDIR)/Scripts/build-rust-toolchain.sh
 
-.PHONY: all fetch configure build verify package toolchain support xcframework info clean clean-all
+TOOLCHAIN_TARBALL := $(ARTIFACTS_DIR)/RustToolchain-$(PACKAGE_PREFIX)-$(RUST_VERSION).tar.xz
+USR_TARBALL       := $(ARTIFACTS_DIR)/RustToolchain-$(PACKAGE_PREFIX)-$(RUST_VERSION)-usr.tar.xz
+SUPPORT_TARBALL   := $(ARTIFACTS_DIR)/RustSupportLibs-$(PACKAGE_PREFIX)-$(RUST_VERSION).tar.xz
+XCFRAMEWORK_TARBALL := $(ARTIFACTS_DIR)/Rust.xcframework-$(PACKAGE_PREFIX)-$(RUST_VERSION).tar.xz
 
+# Serial execution: every step feeds into the next one.
 .NOTPARALLEL:
 
-# One recipe, so the steps always run in this order (the individual targets
-# below stay available for partial rebuilds).
-all:
-	$(SCRIPT) all
+.PHONY: all fetch configure build verify package support xcframework info clean clean-all
+
+all: fetch configure build verify package support
+	@if [ "$(BUILD_XCFRAMEWORK)" = "true" ]; then $(SCRIPT) xcframework; fi
 	@echo
 	@echo "rustios: artifacts in $(ARTIFACTS_DIR)"
 	@ls -lh $(ARTIFACTS_DIR) 2>/dev/null || true
@@ -61,12 +78,10 @@ verify: build
 package: verify
 	$(SCRIPT) package
 
-toolchain: package
-
-support: build
+support: package
 	$(SCRIPT) support
 
-xcframework: build
+xcframework: support
 	$(SCRIPT) xcframework
 
 info:

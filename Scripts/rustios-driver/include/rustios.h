@@ -1,54 +1,76 @@
 /*
- * rustios.h - run rustc in-process, on iOS.
+ * rustios.h - C interface of the Rust compiler embedded in Rust.xcframework.
  *
- * This header is the public interface of Rust.xcframework, the Rust analogue
- * of LLVM-On-iOS' CoreCompiler framework. The static library is built from the
- * Rust compiler itself (librustc_driver) for aarch64-apple-ios.
+ * The Rust compiler is exposed as a small, synchronous C API. Arguments use
+ * the same conventions as the `rustc` command line, except that argv[0] is
+ * the program name (as with `main()`).
  *
- * Typical use:
+ * Example:
  *
- *     const char *argv[] = {
- *         "rustc",
- *         "--sysroot", sysroot_path,       // e.g. .../RustToolchain/usr
- *         "--edition", "2021",
- *         "-C", "opt-level=2",
- *         source_path,
- *         "-o", output_path,
- *         NULL,
- *     };
- *     if (rustios_run(9, argv) != 0) { ... }
+ *     #include <rustios.h>
+ *     #include <stdio.h>
  *
- * Link with: -lc++ -lSystem (the archive contains rustc + LLVM already).
+ *     int main(void) {
+ *         const char *argv[] = {
+ *             "rustc",
+ *             "--edition", "2021",
+ *             "-C", "opt-level=2",
+ *             "--emit=obj",
+ *             "hello.rs",
+ *             "-o", "hello.o",
+ *         };
+ *         int rc = rustios_run((int)(sizeof(argv) / sizeof(argv[0])), argv);
+ *         printf("rustc exited with %d (version %s)\n", rc, rustios_version());
+ *         return rc;
+ *     }
+ *
+ * When linking, use the static library from Rust.xcframework together with
+ * the support libraries shipped in RustSupportLibs (LLVM for iOS) and the
+ * iOS system libraries (libc++, libSystem), e.g.:
+ *
+ *     clang main.c Rust.xcframework/ios-arm64/libRustCompiler.a \
+ *           -ISupportLibs -LSupportLibs/llvm/lib -lLLVM... -lc++ -lSystem
  */
-
 #ifndef RUSTIOS_H
 #define RUSTIOS_H
-
-#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Version of the embedded compiler (e.g. "1.99.1"). Static storage, do not
- * free. Never returns NULL. */
+/* Compilation finished without errors. */
+#define RUSTIOS_OK 0
+/* Compilation failed; diagnostics were written to stderr. */
+#define RUSTIOS_FAILED 1
+/* argc/argv were invalid (NULL, empty, or not valid UTF-8). */
+#define RUSTIOS_INVALID_ARGS 2
+/* The compiler panicked (internal compiler error). */
+#define RUSTIOS_ICE 101
+
+/*
+ * Version of the embedded compiler, e.g. "1.99.1".
+ *
+ * The returned pointer refers to static storage and must not be freed.
+ */
 const char *rustios_version(void);
 
-/* Run the compiler with rustc's command line interface.
+/*
+ * Run the compiler.
  *
- * argc/argv follow the usual C conventions and are not modified.
- * argv[0] is the program name; pass "rustc".
+ * argc : number of entries in argv (must be > 0)
+ * argv : NULL-terminated UTF-8 strings; argv[0] is the program name and is
+ *        ignored by the compiler itself.
  *
- * Returns 0 on success, 1 when the compilation failed (diagnostics have been
- * printed to stderr), 2 on invalid arguments and 101 if the compiler panicked
- * (ICE). The calling process is never exited.
+ * Returns one of RUSTIOS_OK, RUSTIOS_FAILED, RUSTIOS_INVALID_ARGS or
+ * RUSTIOS_ICE.
  *
- * rustc needs a --sysroot that contains lib/rustlib/aarch64-apple-ios (the
- * RustToolchain/usr directory shipped next to this framework). */
+ * The call is synchronous, is not re-entrant and must not be made from
+ * multiple threads at the same time: rustc keeps global state.
+ */
 int rustios_run(int argc, const char *const *argv);
 
 #ifdef __cplusplus
-}
+} /* extern "C" */
 #endif
 
 #endif /* RUSTIOS_H */

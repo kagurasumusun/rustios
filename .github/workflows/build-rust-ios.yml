@@ -1,14 +1,16 @@
-name: Build Rust for iOS
+name: build-rust-ios
 
 # Builds a Rust toolchain whose *host* is aarch64-apple-ios, i.e. a rustc that
-# runs on an iPhone/iPad, plus the Rust.xcframework static library.
-# Modelled after https://github.com/emexlab/LLVM-On-iOS.
+# runs on an iPhone (the same idea as emexlab/LLVM-On-iOS, which cross-builds
+# clang/Swift for iOS), and packages it the way LLVM-On-iOS does:
 #
-# Unlike emexlab's workflow this one always uploads real artifacts:
-#   * RustToolchain-iphoneos-arm64-<version>.tar.xz
-#   * RustSupportLibs-iphoneos-arm64-<version>.tar.xz
-#   * Rust.xcframework-iphoneos-arm64-<version>.tar.xz   (best effort)
-#   * SHA256SUMS.txt and build logs
+#   RustToolchain-iphoneos-arm64-<ver>.tar.xz      <- SwiftToolchain.zip
+#   RustSupportLibs-iphoneos-arm64-<ver>.tar.xz    <- CoreCompilerSupportLibs
+#   Rust.xcframework-iphoneos-arm64-<ver>.tar.xz   <- LLVM.xcframework
+#
+# Unlike the reference workflow, every artifact listed above is produced by
+# the build itself (no `if: false` jobs, no mismatched paths) and is uploaded
+# with `if-no-files-found: error`.
 
 on:
   push:
@@ -17,29 +19,24 @@ on:
   pull_request:
     paths:
       - ".github/workflows/build-rust-ios.yml"
-      - "Scripts/**"
       - "Makefile"
+      - "Scripts/**"
   workflow_dispatch:
     inputs:
       rust_version:
-        description: "Rust release tag to build (e.g. 1.99.1)"
-        required: false
+        description: "Rust release tag to build"
+        required: true
         default: "1.99.1"
       ios_deployment_target:
-        description: "iOS deployment target (LLVM-On-iOS uses 16.0)"
-        required: false
+        description: "iOS deployment target"
+        required: true
         default: "16.0"
-      channel:
-        description: "rustc channel string (empty = auto)"
-        type: choice
-        options: ["", stable, nightly, dev]
-        default: ""
+      stage:
+        description: "Bootstrap stage (2 = optimised self-hosting compiler)"
+        required: true
+        default: "2"
       build_xcframework:
-        description: "Also build Rust.xcframework (static librustc_driver)"
-        type: boolean
-        default: true
-      use_sccache:
-        description: "Use sccache with the GitHub Actions cache backend"
+        description: "Also build Rust.xcframework (needs rustc_private)"
         type: boolean
         default: true
 
@@ -47,125 +44,124 @@ permissions:
   contents: write
 
 concurrency:
-  group: rust-ios-${{ github.ref }}
-  cancel-in-progress: true
-
-defaults:
-  run:
-    shell: bash
+  group: build-rust-ios-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   RUST_VERSION: ${{ github.event.inputs.rust_version || '1.99.1' }}
   IOS_DEPLOYMENT_TARGET: ${{ github.event.inputs.ios_deployment_target || '16.0' }}
-  RUST_CHANNEL: ${{ github.event.inputs.channel || '' }}
+  STAGE: ${{ github.event.inputs.stage || '2' }}
   BUILD_XCFRAMEWORK: ${{ github.event.inputs.build_xcframework || 'true' }}
-  USE_SCCACHE: ${{ github.event.inputs.use_sccache || 'true' }}
-  # Bump this when the LLVM configuration in Scripts/build-rust-toolchain.sh
-  # changes, so that the CI caches are invalidated on purpose.
-  LLVM_CACHE_VERSION: "1"
+  # Bump these to invalidate the caches below (e.g. after changing configure).
   CACHE_VERSION: "1"
+  LLVM_CACHE_VERSION: "1"
   SCCACHE_GHA_ENABLED: "true"
   SCCACHE_CACHE_SIZE: "10G"
+  # Never export SDKROOT: the build host is macOS, only the iOS compilation
+  # should see the iPhoneOS SDK (the script handles that itself).
   CARGO_INCREMENTAL: "0"
 
 jobs:
   build:
-    name: rustc (aarch64-apple-ios)
-    runs-on: macos-14
-    # GitHub-hosted runners are hard-capped at 6h.
+    name: rustc for aarch64-apple-ios
+    # GitHub-hosted runners are limited to 6 hours per job.
     timeout-minutes: 360
+    runs-on: macos-14
+    outputs:
+      rust_version: ${{ steps.version.outputs.rust_version }}
+
     steps:
-      - name: Checkout rustios
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Show environment
         run: |
+          set -euo pipefail
           uname -a
           xcodebuild -version
-          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
-          echo "cpus: $(sysctl -n hw.ncpu), memory: $(sysctl -n hw.memsize)"
+          xcrun --sdk iphoneos --show-sdk-path
+          python3 --version
+          cmake --version | head -n1
+          ninja --version
           df -h /
           Scripts/build-rust-toolchain.sh info
+          echo "rust_version=${RUST_VERSION}" >> "${GITHUB_OUTPUT}"
+        id: version
 
-      - name: Reclaim disk space
+      - name: Free disk space
         run: |
           set -euo pipefail
-          echo "before:"; df -h /
-          current="$(xcode-select -p)"
-          current="${current%/Contents/Developer}"
           shopt -s nullglob
-          for app in /Applications/Xcode*.app; do
-            if [ "${app}" != "${current}" ]; then
-              echo "removing ${app}"
-              sudo rm -rf "${app}"
+          echo "disk before:"; df -h /
+          # Keep the selected Xcode, drop the other copies.
+          selected="$(xcode-select -p)"
+          selected="${selected%/Contents/Developer}"
+          for xcode in /Applications/Xcode*.app; do
+            if [ "${xcode}" != "${selected}" ]; then
+              echo "removing ${xcode}"
+              sudo rm -rf "${xcode}"
             fi
           done
-          shopt -u nullglob
-          # Simulator runtimes are useless when building for real devices.
+          # Simulators are useless for device builds.
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
-          rm -rf "${HOME}/Library/Developer/CoreSimulator" || true
           rm -rf "${HOME}/Library/Developer/Xcode/DerivedData" || true
-          brew cleanup -s >/dev/null 2>&1 || true
-          rm -rf "${HOME}/Library/Caches/Homebrew" || true
-          echo "after:"; df -h /
+          rm -rf "${HOME}/Library/Developer/CoreSimulator" || true
+          echo "disk after:"; df -h /
 
       - name: Install build dependencies
         run: |
           set -euo pipefail
           if ! command -v ninja >/dev/null 2>&1; then
-            brew install ninja
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ninja
           fi
           ninja --version
-          cmake --version | head -n 1
-          python3 --version
-          xz --version | head -n 1
-          clang --version | head -n 1
 
-      - name: Set up sccache
-        if: env.USE_SCCACHE == 'true'
-        uses: mozilla-actions/sccache-action@v0.0.9
+      # sccache caches individual rustc/clang invocations (stage 1/2 rustc and
+      # the LLVM build). It is used as both RUSTC_WRAPPER and as the CMake
+      # compiler launcher by bootstrap.
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
-      # ---------------------------------------------------------------------
-      # Caching
-      #
-      #  * sccache (above) caches individual rustc / clang invocations in the
-      #    GitHub Actions cache service - this makes incremental compiler
-      #    rebuilds cheap without any manual bookkeeping.
-      #  * The LLVM build directories are the expensive part (~1h) and are
-      #    cached as a plain actions/cache entry, keyed by the LLVM inputs.
-      # ---------------------------------------------------------------------
-      - name: Restore LLVM + stage0 caches
-        id: cache-build
+      # Three caches, all keyed on inputs (not on run ids) so that a cache
+      # hit is a genuine cache hit:
+      #   rust-src-*  : the Rust checkout + the two submodules we need
+      #   rust-llvm-* : the macOS and iOS LLVM build trees + stage0 download
+      # Everything else is cheap (or covered by sccache).
+      - name: Restore Rust sources
+        id: cache-rust-src
+        uses: actions/cache/restore@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
+      - name: Restore LLVM build trees
+        id: cache-llvm
         uses: actions/cache/restore@v4
         with:
           path: |
-            rust-build/cache
-            rust-build/aarch64-apple-darwin/llvm
-            rust-build/aarch64-apple-ios/llvm
+            rust-source/build/cache
+            rust-source/build/aarch64-apple-darwin/llvm
+            rust-source/build/x86_64-apple-darwin/llvm
+            rust-source/build/aarch64-apple-ios/llvm
           key: rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
-          restore-keys: |
-            rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}-
-            rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-
-
-      - name: Cache status
-        run: |
-          echo "cache-hit: ${{ steps.cache-build.outputs.cache-hit }}"
-          echo "matched-key: ${{ steps.cache-build.outputs.cache-matched-key }}"
-          du -sh rust-build/*/llvm 2>/dev/null || true
 
       - name: Fetch Rust sources
         run: Scripts/build-rust-toolchain.sh fetch
 
+      - name: Save Rust sources
+        if: steps.cache-rust-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
       - name: Configure bootstrap
         run: Scripts/build-rust-toolchain.sh configure
 
-      - name: Build rustc for iOS (stage 2)
-        timeout-minutes: 330
-        run: |
-          mkdir -p artifacts/logs
-          Scripts/build-rust-toolchain.sh build 2>&1 | tee artifacts/logs/build.log
+      - name: Build rustc for iOS
+        run: Scripts/build-rust-toolchain.sh build
 
-      - name: Verify iOS artifacts
+      - name: Verify artifacts
         run: Scripts/build-rust-toolchain.sh verify
 
       - name: Package RustToolchain
@@ -176,90 +172,98 @@ jobs:
 
       - name: Build Rust.xcframework
         if: env.BUILD_XCFRAMEWORK == 'true'
-        continue-on-error: true
-        run: |
-          mkdir -p artifacts/logs
-          Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee artifacts/logs/xcframework.log
+        run: Scripts/build-rust-toolchain.sh xcframework
 
-      - name: Collect checksums and summary
+      - name: Upload RustToolchain + support libraries
         if: always()
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          touch artifacts/SHA256SUMS.txt
-          echo "### rustios build" >> "${GITHUB_STEP_SUMMARY}"
-          echo "" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| item | value |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| --- | --- |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| rustc version | ${RUST_VERSION} |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| host / target | aarch64-apple-ios |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| iOS deployment target | ${IOS_DEPLOYMENT_TARGET} |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "| runner | ${ImageOS:-macos} |" >> "${GITHUB_STEP_SUMMARY}"
-          echo "" >> "${GITHUB_STEP_SUMMARY}"
-          echo "**Artifacts**" >> "${GITHUB_STEP_SUMMARY}"
-          echo '```' >> "${GITHUB_STEP_SUMMARY}"
-          ls -lh artifacts || true
-          echo '```' >> "${GITHUB_STEP_SUMMARY}"
-          cat artifacts/SHA256SUMS.txt >> "${GITHUB_STEP_SUMMARY}" 2>/dev/null || true
-          df -h /
-
-      - name: Upload artifacts
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-ios-${{ github.run_number }}
+          name: rustios-toolchain-${{ env.RUST_VERSION }}
           path: |
-            artifacts/*.tar.xz
+            artifacts/RustToolchain-*.tar.xz
+            artifacts/RustSupportLibs-*.tar.xz
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
-          compression-level: 0
+          retention-days: 90
+
+      - name: Upload Rust.xcframework
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustios-xcframework-${{ env.RUST_VERSION }}
+          path: artifacts/Rust.xcframework-*.tar.xz
+          if-no-files-found: warn
           retention-days: 90
 
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-ios-logs-${{ github.run_number }}
-          path: artifacts/logs
+          name: rustios-logs-${{ env.RUST_VERSION }}
+          path: |
+            rust-source/build/*.log
+            rust-source/build/**/*.log
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Save LLVM + stage0 caches
-        if: always() && steps.cache-build.outputs.cache-hit != 'true'
+      # Saved even on failure: a half-built LLVM is still useful on the next
+      # run (ninja/cmake pick up where they left off).
+      - name: Save LLVM build trees
+        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
-            rust-build/cache
-            rust-build/aarch64-apple-darwin/llvm
-            rust-build/aarch64-apple-ios/llvm
+            rust-source/build/cache
+            rust-source/build/aarch64-apple-darwin/llvm
+            rust-source/build/x86_64-apple-darwin/llvm
+            rust-source/build/aarch64-apple-ios/llvm
           key: rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## rustios ${RUST_VERSION}"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| host / target | \`${HOST_TRIPLE:-aarch64-apple-ios}\` |"
+            echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
+            echo "| cache hit (LLVM) | \`${{ steps.cache-llvm.outputs.cache-hit }}\` |"
+            echo "| cache hit (sources) | \`${{ steps.cache-rust-src.outputs.cache-hit }}\` |"
+            echo
+            echo '```'
+            ls -lh artifacts 2>/dev/null || true
+            echo '```'
+            cat artifacts/SHA256SUMS.txt 2>/dev/null || true
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   release:
     name: Publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: rust-ios-${{ github.run_number }}
           path: dist
+          merge-multiple: true
 
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          note="Rust ${RUST_VERSION} built for aarch64-apple-ios (iOS ${IOS_DEPLOYMENT_TARGET}): on-device RustToolchain, support libraries and, when the build succeeded, Rust.xcframework."
-          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${tag}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
           else
-            gh release create "${tag}" dist/* \
+            gh release create "${GITHUB_REF_NAME}" dist/* \
               --repo "${GITHUB_REPOSITORY}" \
-              --title "rustios ${tag}" \
-              --notes "${note}"
+              --title "rustios ${GITHUB_REF_NAME}" \
+              --notes "Rust ${RUST_VERSION} built for aarch64-apple-ios (iOS ${IOS_DEPLOYMENT_TARGET}).
+
+          * \`RustToolchain-*.tar.xz\` - rustc/rustdoc/std that run on iOS
+          * \`RustSupportLibs-*.tar.xz\` - LLVM + std for iOS
+          * \`Rust.xcframework-*.tar.xz\` - the compiler as a static library with a C API"
           fi

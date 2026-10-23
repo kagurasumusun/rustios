@@ -1,92 +1,80 @@
 #!/usr/bin/env bash
 #
-# Build a Rust toolchain whose *host* is iOS: i.e. a rustc that runs on an
-# arm64 iPhone/iPad (the same idea as https://github.com/emexlab/LLVM-On-iOS,
-# which cross-builds Swift/LLVM so that it runs on iOS).
+# rustios - build a Rust toolchain that runs on iOS.
 #
-# The heavy lifting is done by rust-lang/rust's own bootstrap (`x.py`) using a
-# cross-host configuration:
+# This is the rustios equivalent of emexlab/LLVM-On-iOS: it cross-compiles a
+# compiler (rustc instead of clang/Swift) so that it executes on an arm64
+# iPhone/iPad, and packages it into artifacts that can be installed on a
+# device or embedded in an app.
 #
-#   build  = aarch64-apple-darwin   (the macOS runner that does the work)
-#   host   = aarch64-apple-ios      (where the produced rustc runs)
-#   target = aarch64-apple-ios      (what the produced rustc compiles for)
+# The heavy lifting is done by rust-lang/rust's own bootstrap (x.py) using a
+# cross-compiling configuration:
 #
-# See README.md for the full picture.
+#     build  = the macOS machine doing the work  (aarch64-apple-darwin)
+#     host   = where the produced rustc runs     (aarch64-apple-ios)
+#     target = what that rustc compiles for      (aarch64-apple-ios, iOS 16.0)
+#
+# Subcommands: fetch, configure, build, verify, package, support,
+#              xcframework, all, clean, clean-all, info
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ---------------------------------------------------------------------------
-# Configuration (everything can be overridden through the environment)
+# Configuration (all overridable from the environment)
 # ---------------------------------------------------------------------------
 
+# Rust release tag to build.
 RUST_VERSION="${RUST_VERSION:-1.99.1}"
-RUST_CHANNEL="${RUST_CHANNEL:-}"
+
+# Release channel of that tag (stable/beta/nightly/dev).
+RUST_CHANNEL="${RUST_CHANNEL:-stable}"
+
+# Deployment target, matching LLVM-On-iOS' OS_VER=16.0.
 IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-16.0}"
 
+# Triple of the compiler we produce (host == target, like LLVM-On-iOS'
+# arm64-apple-ios16.0 cross-compiler).
 HOST_TRIPLE="${HOST_TRIPLE:-aarch64-apple-ios}"
+
+# Bootstrap stage. Stage 2 is a proper, optimised, self-hosting toolchain.
 STAGE="${STAGE:-2}"
+
+# LLVM backends. rustc only compiles for HOST_TRIPLE, so AArch64 is enough.
 LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
-LLVM_EXPERIMENTAL_TARGETS="${LLVM_EXPERIMENTAL_TARGETS:-}"
 
-RUST_SOURCE_DIR="${RUST_SOURCE_DIR:-${ROOT}/rust-source}"
-BUILD_DIR="${BUILD_DIR:-${ROOT}/rust-build}"
-WORK_DIR="${WORK_DIR:-${ROOT}/work}"
-ARTIFACTS_DIR="${ARTIFACTS_DIR:-${ROOT}/artifacts}"
+# Where things live.
+RUST_SOURCE_DIR="${RUST_SOURCE_DIR:-${REPO_ROOT}/rust-source}"
+BUILD_DIR="${BUILD_DIR:-${RUST_SOURCE_DIR}/build}"
+WORK_DIR="${WORK_DIR:-${REPO_ROOT}/work}"
+ARTIFACTS_DIR="${ARTIFACTS_DIR:-${REPO_ROOT}/artifacts}"
 
-PACKAGE_SUFFIX="${PACKAGE_SUFFIX:-iphoneos-arm64}"
-TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-${WORK_DIR}/RustToolchain}"
-PACKAGE_BASENAME="RustToolchain-${PACKAGE_SUFFIX}-${RUST_VERSION}"
-
+# Parallelism (empty = let x.py decide).
 JOBS="${JOBS:-}"
-BUILD_XCFRAMEWORK="${BUILD_XCFRAMEWORK:-true}"
-SIGN_TOOLCHAIN="${SIGN_TOOLCHAIN:-true}"
-TAR_XZ_LEVEL="${TAR_XZ_LEVEL:-6}"
+
+# Package naming, mirroring LLVM-On-iOS' SwiftToolchain.zip / LLVM.xcframework.
+PACKAGE_PREFIX="iphoneos-arm64"
+TOOLCHAIN_NAME="RustToolchain"
+SUPPORT_NAME="RustSupportLibs"
+XCFRAMEWORK_NAME="Rust.xcframework"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-log()  { printf '\033[32m\033[1m[*]\033[0m \033[32m%s\033[0m\n' "$*"; }
-warn() { printf '\033[33m\033[1m[!]\033[0m \033[33m%s\033[0m\n' "$*" >&2; }
-die()  { printf '\033[31m\033[1m[x]\033[0m \033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-require_tool() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
-
-usage() {
-    cat <<EOF
-Usage: $(basename "$0") <command>
-
-Commands:
-  fetch        Clone the Rust sources (tag \${RUST_VERSION}) plus the two
-               submodules that are needed to build the compiler and std.
-  configure    Write rust-source/bootstrap.toml with the iOS cross-host setup.
-  build        Run x.py build --stage \${STAGE} (rustc for aarch64-apple-ios).
-  package      Assemble RustToolchain/ and write the .tar.xz artifact.
-  support      Write the CoreCompilerSupportLibs-style support library archive.
-  xcframework  Build Rust.xcframework (rustc as a static library + C header).
-  verify       Sanity-check the produced iOS binaries.
-  all          fetch + configure + build + verify + package + support (+ xcframework).
-  clean        Remove build outputs (keeps the Rust checkout).
-  clean-all    Remove build outputs *and* the Rust checkout.
-  info         Print the effective configuration.
-
-Environment:
-  RUST_VERSION=${RUST_VERSION}
-  RUST_CHANNEL=${RUST_CHANNEL:-<auto>}
-  IOS_DEPLOYMENT_TARGET=${IOS_DEPLOYMENT_TARGET}
-  HOST_TRIPLE=${HOST_TRIPLE}
-  STAGE=${STAGE}
-  RUST_SOURCE_DIR=${RUST_SOURCE_DIR}
-  ARTIFACTS_DIR=${ARTIFACTS_DIR}
-  JOBS=${JOBS:-<nproc>}
-  BUILD_XCFRAMEWORK=${BUILD_XCFRAMEWORK}
-EOF
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
+require_macos() {
+    [[ "$(uname -s)" == "Darwin" ]] || die "this step requires macOS (Xcode + iPhoneOS SDK)"
+}
 
 detect_build_triple() {
     case "$(uname -m)" in
@@ -98,243 +86,139 @@ detect_build_triple() {
 
 BUILD_TRIPLE="${BUILD_TRIPLE:-$(detect_build_triple)}"
 
-# The build machine's own LLVM must be able to codegen for the build arch
-# (build scripts, proc macros and the stage1 compiler are built for it), so an
-# Intel build host needs the X86 backend in addition to AArch64.
-if [[ "${BUILD_TRIPLE}" == x86_64-* && "${LLVM_TARGETS}" != *X86* ]]; then
-    LLVM_TARGETS="${LLVM_TARGETS};X86"
-fi
-
-if [[ -z "${RUST_CHANNEL}" ]]; then
-    case "${RUST_VERSION}" in
-        nightly*|dev*) RUST_CHANNEL="nightly" ;;
-        *)             RUST_CHANNEL="stable" ;;
-    esac
-fi
-
-sysroot_dir() { echo "${BUILD_DIR}/${HOST_TRIPLE}/stage${STAGE}"; }
-stage1_dir()  { echo "${BUILD_DIR}/${BUILD_TRIPLE}/stage1"; }
+# Directory layout produced by bootstrap.
+stage_dir()   { echo "${BUILD_DIR}/${HOST_TRIPLE}/stage${STAGE}"; }
 llvm_dir()    { echo "${BUILD_DIR}/${HOST_TRIPLE}/llvm"; }
-sdk_path()    { xcrun --sdk iphoneos --show-sdk-path; }
-rust_src_version() { cat "${RUST_SOURCE_DIR}/src/version" 2>/dev/null || echo "${RUST_VERSION}"; }
+build_host_dir() { echo "${BUILD_DIR}/${BUILD_TRIPLE}/stage1"; }
 
-# shasum (macOS) / sha256sum (Linux); writes one "<hash>  <file>" line.
-sha256_one() {
-    local file="$1"
-    if command -v shasum >/dev/null 2>&1; then
-        ( cd "$(dirname "${file}")" && shasum -a 256 "$(basename "${file}")" )
-    else
-        ( cd "$(dirname "${file}")" && sha256sum "$(basename "${file}")" )
-    fi
-}
-
+# `shasum -a 256` writes "hash  path"; we run it from the artifacts dir so
+# the manifest contains plain file names.
 checksum() {
     local file="$1"
     mkdir -p "${ARTIFACTS_DIR}"
-    sha256_one "${file}" >> "${ARTIFACTS_DIR}/SHA256SUMS.txt"
+    ( cd "${ARTIFACTS_DIR}" && shasum -a 256 "$(basename "${file}")" >> SHA256SUMS.txt )
 }
 
-# compress <parent-dir> <entry> <out-file> [xz-level]
-compress() {
-    local parent="$1" entry="$2" out="$3" level="${4:-${TAR_XZ_LEVEL}}"
+human_size() {
+    du -h "$1" | awk '{print $1}'
+}
+
+# tar_xz <directory> <name> <output> : archive <name> (a direct child of
+# <directory>) as <output>, with all cores used by xz.
+tar_xz() {
+    local dir="$1" name="$2" out="$3"
     mkdir -p "$(dirname "${out}")"
     rm -f "${out}"
-    if command -v xz >/dev/null 2>&1; then
-        ( cd "${parent}" && XZ_OPT="-T0 -${level}" tar -cJf "${out}" "${entry}" )
-    else
-        warn "xz not found; falling back to gzip"
-        ( cd "${parent}" && tar -czf "${out%.xz}.tar.gz" "${entry}" )
-        printf '%s\n' "${out%.xz}.tar.gz"
-    fi
+    ( cd "${dir}" && XZ_OPT="-T0 -6" tar -cJf "${out}" "${name}" )
 }
 
-human_size() { du -h "$1" 2>/dev/null | cut -f1; }
+write_usage_doc() {
+    local dest="$1"
+    cat > "${dest}/USAGE.md" <<EOF
+# ${TOOLCHAIN_NAME} for iOS
+
+A Rust toolchain (rustc) built for **aarch64-apple-ios** with deployment
+target **iOS ${IOS_DEPLOYMENT_TARGET}**, from Rust ${RUST_VERSION}
+(${RUST_CHANNEL}).
+
+This is the rustios counterpart of LLVM-On-iOS' Swift toolchain: the compiler
+itself runs on the device.
+
+## Install
+
+\`\`\`sh
+tar -xJf ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+# on the device / inside your app container:
+export RUST_DIR="\$PWD/${TOOLCHAIN_NAME}/usr"
+export PATH="\$RUST_DIR/bin:\$PATH"
+\`\`\`
+
+## Use
+
+\`\`\`sh
+rustc --version
+rustc --edition 2021 -C opt-level=2 hello.rs -o hello
+\`\`\`
+
+\`rustc\` needs a Mach-O linker (\`ld\`/\`ld64\`, or the one shipped by your
+jailbreak/TrollStore environment) and an iPhoneOS SDK to link programs.
+Compiling to object files (\`--emit=obj\`) or rlibs works without a linker.
+
+cargo is not part of this toolchain: it spawns child processes, which needs
+extra plumbing on iOS (see the README).
+EOF
+}
+
+write_build_info() {
+    local dest="$1"
+    cat > "${dest}/build-info.json" <<EOF
+{
+  "name": "rustios",
+  "rust_version": "${RUST_VERSION}",
+  "rust_channel": "${RUST_CHANNEL}",
+  "build_triple": "${BUILD_TRIPLE}",
+  "host_triple": "${HOST_TRIPLE}",
+  "target": "${HOST_TRIPLE}",
+  "ios_deployment_target": "${IOS_DEPLOYMENT_TARGET}",
+  "llvm_targets": "${LLVM_TARGETS}",
+  "stage": ${STAGE},
+  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+}
+
+# Ad-hoc sign every Mach-O in the tree. iOS refuses to execute unsigned code;
+# an ad-hoc signature is enough once the app itself is signed.
+sign_tree() {
+    local dir="$1" file
+    require_cmd codesign
+    while IFS= read -r -d '' file; do
+        if file -b "${file}" | grep -q 'Mach-O'; then
+            codesign --force --sign - --timestamp=none "${file}" >/dev/null 2>&1 \
+                || warn "failed to sign ${file}"
+        fi
+    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' \) -print0)
+}
 
 # ---------------------------------------------------------------------------
 # fetch
 # ---------------------------------------------------------------------------
 
 fetch() {
-    require_tool git
-
-    local url="https://github.com/rust-lang/rust.git"
-    local needs_clone=1
+    require_cmd git
 
     if [[ -d "${RUST_SOURCE_DIR}/.git" ]]; then
         local current
-        current="$(git -C "${RUST_SOURCE_DIR}" describe --tags --exact-match 2>/dev/null || true)"
-        if [[ "${current}" == "${RUST_VERSION}" ]]; then
-            log "reusing Rust checkout at ${RUST_SOURCE_DIR} (${RUST_VERSION})"
-            needs_clone=0
-        elif [[ -n "${current}" ]]; then
-            log "replacing Rust checkout (${current} -> ${RUST_VERSION})"
+        current="$(git -C "${RUST_SOURCE_DIR}" describe --tags --exact-match 2>/dev/null \
+                   || git -C "${RUST_SOURCE_DIR}" rev-parse --short HEAD)"
+        if [[ "${current}" != "${RUST_VERSION}" ]]; then
+            warn "existing checkout is '${current}', expected '${RUST_VERSION}' - re-cloning"
             rm -rf "${RUST_SOURCE_DIR}"
-        else
-            log "reusing Rust checkout at ${RUST_SOURCE_DIR} (unknown revision)"
-            needs_clone=0
         fi
     fi
 
-    if [[ "${needs_clone}" -eq 1 ]]; then
+    if [[ ! -d "${RUST_SOURCE_DIR}/.git" ]]; then
         mkdir -p "$(dirname "${RUST_SOURCE_DIR}")"
-        log "cloning rust ${RUST_VERSION} (shallow)"
-        git clone --depth 1 --branch "${RUST_VERSION}" "${url}" "${RUST_SOURCE_DIR}"
+        log "cloning rust-lang/rust ${RUST_VERSION} (shallow)"
+        git clone --depth 1 --branch "${RUST_VERSION}" \
+            https://github.com/rust-lang/rust.git "${RUST_SOURCE_DIR}"
     fi
 
-    # Only these two submodules are required: src/llvm-project carries the
-    # rust-lang LLVM fork, library/backtrace is a std dependency.
-    log "updating required submodules (src/llvm-project, library/backtrace)"
-    if ! git -C "${RUST_SOURCE_DIR}" submodule update --init --depth 1 -- \
-            src/llvm-project library/backtrace; then
-        warn "shallow submodule fetch failed; retrying without --depth"
-        git -C "${RUST_SOURCE_DIR}" submodule update --init -- \
+    # bootstrap needs src/llvm-project (LLVM sources) and library/backtrace
+    # (a std dependency). Everything else is only needed for dist/docs.
+    log "updating required submodules"
+    git -C "${RUST_SOURCE_DIR}" submodule update --init --depth 1 -- \
+        src/llvm-project library/backtrace \
+        || git -C "${RUST_SOURCE_DIR}" submodule update --init -- \
             src/llvm-project library/backtrace
-    fi
 
     [[ -f "${RUST_SOURCE_DIR}/src/llvm-project/llvm/CMakeLists.txt" ]] \
-        || die "src/llvm-project is missing; submodule checkout failed"
+        || die "src/llvm-project is empty; submodule checkout failed"
     [[ -f "${RUST_SOURCE_DIR}/library/backtrace/Cargo.toml" ]] \
-        || die "library/backtrace is missing; submodule checkout failed"
+        || die "library/backtrace is empty; submodule checkout failed"
     [[ -f "${RUST_SOURCE_DIR}/x.py" ]] || die "x.py not found in ${RUST_SOURCE_DIR}"
 
-    log "rust sources ready: $(git -C "${RUST_SOURCE_DIR}" rev-parse --short HEAD)"
-}
-
-# ---------------------------------------------------------------------------
-# bootstrap patch: build a real iOS LLVM
-#
-# Upstream bootstrap forces CMAKE_SYSTEM_NAME=Darwin, CMAKE_OSX_SYSROOT=/
-# and an empty deployment target whenever it cross-builds LLVM for an Apple
-# mobile target. That is fine for compiler-rt but a *full* LLVM build then
-# compiles against "/" instead of the iPhoneOS SDK, so the resulting objects
-# are not iOS objects (or the build fails outright).
-#
-# rustios patches that block so that, when RUSTIOS_IOS_SDK is set, LLVM is
-# built with the proper CMake iOS toolchain settings. This mirrors the
-# LLVM-On-iOS approach of patching Swift's build system for iphoneos.
-# ---------------------------------------------------------------------------
-
-patch_bootstrap_llvm() {
-    local file="${RUST_SOURCE_DIR}/src/bootstrap/src/core/build_steps/llvm.rs"
-    [[ -f "${file}" ]] || { warn "bootstrap llvm.rs not found; skipping iOS LLVM patch"; return 0; }
-    require_tool python3
-
-    if ! python3 - "${file}" <<'PY'
-import pathlib
-import sys
-
-MARKER = "rustios: build a real iOS LLVM"
-path = pathlib.Path(sys.argv[1])
-src = path.read_text()
-
-if MARKER in src:
-    print("bootstrap already patched")
-    sys.exit(0)
-
-lines = src.splitlines(keepends=True)
-
-# Locate the `if !target.contains("darwin")` branch inside the Apple block.
-start = None
-for i, line in enumerate(lines):
-    if 'if !target.contains("darwin")' in line:
-        start = i
-        break
-
-if start is None:
-    sys.stderr.write("could not find the Apple-mobile block in llvm.rs\n")
-    sys.exit(3)
-
-# The three defines we want to replace live between `start` and the next
-# closing brace at the same indentation.
-indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
-end = None
-for i in range(start + 1, len(lines)):
-    if lines[i].rstrip("\n") == indent + "}":
-        end = i
-        break
-
-if end is None:
-    sys.stderr.write("could not find the end of the Apple-mobile block\n")
-    sys.exit(3)
-
-block = lines[start + 1 : end]
-sys_idx = sys_idx2 = dt_idx = None
-for offset, line in enumerate(block):
-    if 'cfg.define("CMAKE_SYSTEM_NAME", "Darwin")' in line and sys_idx is None:
-        sys_idx = offset
-    if 'cfg.define("CMAKE_OSX_SYSROOT", "/")' in line:
-        sys_idx2 = offset
-    if 'cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", "")' in line:
-        dt_idx = offset
-
-if sys_idx is None or sys_idx2 is None or dt_idx is None or not (sys_idx < sys_idx2 <= dt_idx):
-    sys.stderr.write("unexpected bootstrap LLVM layout; please update the rustios patch\n")
-    sys.exit(3)
-
-# Also drop the stale FIXME comment block directly above the statements.
-while sys_idx > 0:
-    prev = block[sys_idx - 1].strip()
-    if prev == "" or prev.startswith("//"):
-        sys_idx -= 1
-    else:
-        break
-
-# Only blank lines, comments and those three statements may be replaced.
-allowed = []
-for offset in range(sys_idx, dt_idx + 1):
-    line = block[offset].strip()
-    ok = (
-        line == ""
-        or line.startswith("//")
-        or 'cfg.define("CMAKE_SYSTEM_NAME", "Darwin")' in line
-        or 'cfg.define("CMAKE_OSX_SYSROOT", "/")' in line
-        or 'cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", "")' in line
-    )
-    if not ok:
-        sys.stderr.write(f"unexpected line in the block: {block[offset]!r}\n")
-        sys.exit(3)
-    allowed.append(offset)
-
-ind = indent + "    "  # indentation inside the `if !target.contains("darwin")` branch
-replacement = [
-    f"{ind}// {MARKER}.\n",
-    f"{ind}// Upstream forces CMAKE_SYSTEM_NAME=Darwin and an empty sysroot here,\n",
-    f"{ind}// which only works for compiler-rt. A full LLVM must be built against\n",
-    f"{ind}// the iPhoneOS SDK, otherwise the objects are not iOS objects.\n",
-    f'{ind}if let Ok(sdk) = std::env::var("RUSTIOS_IOS_SDK") {{\n',
-    f'{ind}    cfg.define("CMAKE_SYSTEM_NAME", "iOS");\n',
-    f'{ind}    cfg.define("CMAKE_OSX_SYSROOT", sdk);\n',
-    f'{ind}    cfg.define(\n',
-    f'{ind}        "CMAKE_OSX_DEPLOYMENT_TARGET",\n',
-    f'{ind}        std::env::var("RUSTIOS_IOS_DEPLOYMENT_TARGET")\n',
-    f'{ind}            .unwrap_or_else(|_| "16.0".to_string()),\n',
-    f'{ind}    );\n',
-    f'{ind}}} else {{\n',
-    f'{ind}    cfg.define("CMAKE_SYSTEM_NAME", "Darwin");\n',
-    f'{ind}    cfg.define("CMAKE_OSX_SYSROOT", "/");\n',
-    f'{ind}    cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", "");\n',
-    f'{ind}}}\n',
-]
-
-new_block = (
-    block[: sys_idx]
-    + replacement
-    + block[dt_idx + 1 :]
-)
-new_lines = lines[: start + 1] + new_block + lines[end:]
-
-path.write_text("".join(new_lines))
-print("patched bootstrap LLVM build for iOS")
-PY
-    then
-        warn "could not patch bootstrap's LLVM iOS settings (patch is valid for RUST_VERSION=${RUST_VERSION}); continuing"
-    fi
-
-    if grep -q "rustios: build a real iOS LLVM" "${file}"; then
-        log "bootstrap patched: LLVM for iOS is configured with the iPhoneOS SDK"
-    else
-        warn "bootstrap patch did not apply; the iOS LLVM build may fail"
-    fi
+    log "rust sources ready ($(git -C "${RUST_SOURCE_DIR}" rev-parse --short HEAD))"
 }
 
 # ---------------------------------------------------------------------------
@@ -342,48 +226,44 @@ PY
 # ---------------------------------------------------------------------------
 
 configure() {
-    [[ -d "${RUST_SOURCE_DIR}" ]] || die "missing ${RUST_SOURCE_DIR}; run 'fetch' first"
+    [[ -d "${RUST_SOURCE_DIR}" ]] || die "${RUST_SOURCE_DIR} does not exist; run 'fetch' first"
 
-    local config="${RUST_SOURCE_DIR}/bootstrap.toml"
-    local install_prefix="${WORK_DIR}/install"
-
-    local ccache_line="" jobs_line=""
+    local cfg="${RUST_SOURCE_DIR}/bootstrap.toml"
+    local jobs_line="" ccache_line=""
+    [[ -n "${JOBS}" ]] && jobs_line="jobs = ${JOBS}"
+    # bootstrap feeds `build.ccache` to RUSTC_WRAPPER and to LLVM's
+    # CMAKE_<LANG>_COMPILER_LAUNCHER, so sccache covers both rustc and LLVM.
     if command -v sccache >/dev/null 2>&1; then
         ccache_line='ccache = "sccache"'
-        log "sccache found: rustc + LLVM compilations will be cached"
     elif command -v ccache >/dev/null 2>&1; then
         ccache_line='ccache = "ccache"'
-        log "ccache found: rustc + LLVM compilations will be cached"
     fi
-    [[ -n "${JOBS}" ]] && jobs_line="jobs = ${JOBS}"
+    if [[ -n "${ccache_line}" ]]; then
+        log "using ${ccache_line#ccache = \"} for compiler caching"
+    fi
 
-    log "writing ${config}"
-    cat > "${config}" <<EOF
-# Generated by Scripts/build-rust-toolchain.sh -- do not edit by hand.
+    log "writing ${cfg}"
+    cat > "${cfg}" <<EOF
+# Generated by Scripts/build-rust-toolchain.sh - do not edit, re-run 'configure'.
 #
-# Cross-host bootstrap: the compiler is built *on* ${BUILD_TRIPLE}
-# and *for* ${HOST_TRIPLE} (the same platform LLVM-On-iOS targets).
-
+# build  : the macOS machine that does the work
+# host   : where the produced rustc runs
+# target : what that rustc compiles for
 [build]
 build = "${BUILD_TRIPLE}"
 host = ["${HOST_TRIPLE}"]
 target = ["${HOST_TRIPLE}"]
-build-dir = "${BUILD_DIR}"
+build-dir = "build"
 docs = false
 compiler-docs = false
 extended = false
-# Scripts/build-rust-toolchain.sh fetches only src/llvm-project and
-# library/backtrace; do not let x.py pull cargo/gcc/enzyme/rustc-perf as well.
-submodules = false
+submodules = true
 locked-deps = true
-# Sanitizer runtimes use compiler-rt's own (macOS-flavoured) CMake setup, which
-# the rustios LLVM patch intentionally bypasses. Build LLVM only.
-sanitizers = false
 ${jobs_line}
 ${ccache_line}
 
 [install]
-prefix = "${install_prefix}"
+prefix = "${WORK_DIR}/install"
 
 [rust]
 channel = "${RUST_CHANNEL}"
@@ -395,20 +275,20 @@ debuginfo-level-std = 0
 codegen-units = 16
 incremental = false
 download-rustc = false
-llvm-tools = false
-remap-debuginfo = false
+# Ship llvm-tools (llvm-ar, llvm-objcopy, ...) next to the compiler: they are
+# built as part of LLVM anyway, and are needed to produce archives on device.
+llvm-tools = true
 
 [llvm]
-# The LLVM linked into the iOS rustc must itself be built for iOS, so the
-# macOS CI LLVM cannot be used. Both LLVM copies (build host + iOS host) are
-# built locally into build/<triple>/llvm and cached by the CI workflow.
+# The LLVM that ends up inside the iOS rustc must be an iOS library, so the
+# prebuilt macOS LLVM cannot be downloaded.
 download-ci-llvm = false
 optimize = true
 assertions = false
 tests = false
 ninja = true
 targets = "${LLVM_TARGETS}"
-experimental-targets = "${LLVM_EXPERIMENTAL_TARGETS}"
+experimental-targets = ""
 link-shared = false
 static-libstdcpp = false
 libzstd = false
@@ -416,9 +296,9 @@ clang = false
 enable-warnings = false
 EOF
 
-    patch_bootstrap_llvm
-
-    log "bootstrap.toml written (host=${HOST_TRIPLE}, channel=${RUST_CHANNEL}, iOS ${IOS_DEPLOYMENT_TARGET})"
+    log "bootstrap.toml written (build=${BUILD_TRIPLE} host=${HOST_TRIPLE} iOS ${IOS_DEPLOYMENT_TARGET})"
+    printf '%s\n' "--- ${cfg} ---"
+    sed 's/^/    /' "${cfg}"
 }
 
 # ---------------------------------------------------------------------------
@@ -426,279 +306,29 @@ EOF
 # ---------------------------------------------------------------------------
 
 build() {
-    is_macos || die "'build' requires macOS (Xcode + iPhoneOS SDK)"
-    require_tool python3
-    require_tool xcrun
+    require_macos
+    require_cmd python3
+    require_cmd xcrun
 
-    [[ -f "${RUST_SOURCE_DIR}/bootstrap.toml" ]] || configure
+    [[ -f "${RUST_SOURCE_DIR}/bootstrap.toml" ]] || die "missing bootstrap.toml; run 'configure' first"
 
     local sdk
-    sdk="$(sdk_path)" || die "could not locate the iPhoneOS SDK (xcrun --sdk iphoneos)"
-    [[ -d "${sdk}" ]] || die "iPhoneOS SDK not found: ${sdk}"
+    sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+    [[ -n "${sdk}" ]] || die "could not find the iPhoneOS SDK"
+    log "iPhoneOS SDK: ${sdk}"
 
     export IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
-    # Read by the rustios bootstrap patch (LLVM for iOS).
-    export RUSTIOS_IOS_SDK="${sdk}"
-    export RUSTIOS_IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
-    # Deliberately do NOT export SDKROOT: bootstrap compiles host tools (LLVM,
-    # build scripts, ...) with the macOS SDK, and an inherited SDKROOT pointing
-    # at the iPhoneOS SDK would break those builds.
+    # rustc must not pick up the SDK for *host* (macOS) compilations, so
+    # SDKROOT is deliberately not exported. It queries xcrun itself when
+    # compiling for iOS.
 
-    if command -v sccache >/dev/null 2>&1; then
-        export SCCACHE_GHA_ENABLED="${SCCACHE_GHA_ENABLED:-true}"
-        export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-10G}"
+    local stage_args=(build --stage "${STAGE}")
+    if [[ -n "${JOBS}" ]]; then
+        stage_args+=(-j "${JOBS}")
     fi
 
-    log "iPhoneOS SDK: ${sdk}"
-    log "building rustc ${RUST_VERSION} for ${HOST_TRIPLE} (stage ${STAGE})"
-    log "cold build: LLVM x2 + rustc x2 + std; expect roughly 1.5-3h on a 3-core runner"
-
-    local xargs=(build "--stage" "${STAGE}")
-    [[ -n "${JOBS}" ]] && xargs+=("-j" "${JOBS}")
-    if [[ -n "${EXTRA_XARGS:-}" ]]; then
-        # shellcheck disable=SC2206
-        xargs+=(${EXTRA_XARGS})
-    fi
-
-    ( cd "${RUST_SOURCE_DIR}" && python3 ./x.py "${xargs[@]}" )
-}
-
-# ---------------------------------------------------------------------------
-# packaging
-# ---------------------------------------------------------------------------
-
-write_build_info() {
-    local out="$1" rust_sha llvm_sha built_at version
-    rust_sha="$(git -C "${RUST_SOURCE_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
-    llvm_sha="$(git -C "${RUST_SOURCE_DIR}/src/llvm-project" rev-parse HEAD 2>/dev/null || echo unknown)"
-    built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    version="$(rust_src_version)"
-
-    cat > "${out}" <<EOF
-{
-  "name": "rustios",
-  "rust_version": "${version}",
-  "rust_channel": "${RUST_CHANNEL}",
-  "rust_commit": "${rust_sha}",
-  "llvm_commit": "${llvm_sha}",
-  "build_triple": "${BUILD_TRIPLE}",
-  "host_triple": "${HOST_TRIPLE}",
-  "target_triple": "${HOST_TRIPLE}",
-  "ios_deployment_target": "${IOS_DEPLOYMENT_TARGET}",
-  "llvm_targets": "${LLVM_TARGETS}",
-  "stage": ${STAGE},
-  "built_at": "${built_at}"
-}
-EOF
-}
-
-write_usage_doc() {
-    local dest="$1" version
-    version="$(rust_src_version)"
-
-    cat > "${dest}/USAGE.md" <<EOF
-# RustToolchain for iOS (${PACKAGE_SUFFIX})
-
-Built from Rust ${version} (${RUST_CHANNEL}) by rustios.
-
-* host (where rustc runs): \`${HOST_TRIPLE}\`
-* target (what rustc compiles for): \`${HOST_TRIPLE}\`
-* iOS deployment target: \`${IOS_DEPLOYMENT_TARGET}\`
-* LLVM targets: \`${LLVM_TARGETS}\`
-
-## Layout
-
-\`\`\`
-RustToolchain/usr/bin/rustc
-RustToolchain/usr/bin/rustdoc
-RustToolchain/usr/lib/rustlib/${HOST_TRIPLE}/lib/*.rlib
-RustToolchain/usr/lib/rustlib/${HOST_TRIPLE}/codegen-backends/*.dylib
-RustToolchain/build-info.json
-\`\`\`
-
-## Usage on a device
-
-\`\`\`sh
-export RUST_DIR=/path/to/RustToolchain/usr
-export PATH="\$RUST_DIR/bin:\$PATH"
-
-rustc --edition 2021 -C opt-level=2 hello.rs -o hello
-\`\`\`
-
-The toolchain does not include cargo (see README). On device \`rustc\` needs a
-linker (\`ld\`/\`ld64\`) and an iPhoneOS SDK, exactly like the Swift toolchain
-produced by LLVM-On-iOS.
-
-Every Mach-O in this archive is ad-hoc signed (\`codesign -s -\`) so that
-\`dyld\`/\`dlopen\` accepts it on jailbroken / TrollStore setups. Re-sign with
-your own identity when you ship it inside an app.
-EOF
-}
-
-sign_tree() {
-    local dir="$1" file count=0
-    while IFS= read -r file; do
-        case "$(file -b "${file}" 2>/dev/null || true)" in
-            *Mach-O*)
-                if codesign --force --sign - --timestamp=none "${file}" >/dev/null 2>&1; then
-                    count=$((count + 1))
-                fi
-                ;;
-        esac
-    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.a' \))
-    [[ "${count}" -gt 0 ]] && log "ad-hoc signed ${count} Mach-O files"
-}
-
-package_toolchain() {
-    local sysroot out
-    sysroot="$(sysroot_dir)"
-
-    [[ -d "${sysroot}" ]] || die "missing build output ${sysroot}; run 'build' first"
-    [[ -x "${sysroot}/bin/rustc" ]] || die "missing ${sysroot}/bin/rustc"
-
-    log "assembling ${TOOLCHAIN_DIR}"
-    rm -rf "${TOOLCHAIN_DIR}"
-    mkdir -p "${TOOLCHAIN_DIR}/usr"
-    cp -a "${sysroot}/." "${TOOLCHAIN_DIR}/usr/"
-
-    # Build-only metadata that is useless on device.
-    find "${TOOLCHAIN_DIR}" -name '.rustc_info.json' -delete 2>/dev/null || true
-    find "${TOOLCHAIN_DIR}" -name '*.dSYM' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-
-    write_usage_doc "${TOOLCHAIN_DIR}"
-    write_build_info "${TOOLCHAIN_DIR}/build-info.json"
-
-    if [[ "${SIGN_TOOLCHAIN}" == "true" ]] && is_macos && command -v codesign >/dev/null 2>&1; then
-        sign_tree "${TOOLCHAIN_DIR}"
-    fi
-
-    out="${ARTIFACTS_DIR}/${PACKAGE_BASENAME}.tar.xz"
-    log "compressing ${out}"
-    compress "${WORK_DIR}" "RustToolchain" "${out}"
-    out="$( [[ -f "${out}" ]] && echo "${out}" || echo "${out%.xz}.tar.gz" )"
-    checksum "${out}"
-    log "toolchain: ${out} ($(human_size "${out}"))"
-}
-
-# ---------------------------------------------------------------------------
-# support libraries (LLVM-On-iOS' CoreCompilerSupportLibs analogue)
-# ---------------------------------------------------------------------------
-
-package_support_libs() {
-    local llvm libdir out_dir out
-    llvm="$(llvm_dir)"
-    libdir="$(sysroot_dir)/lib/rustlib/${HOST_TRIPLE}/lib"
-
-    [[ -d "${llvm}/lib" ]] || die "missing iOS LLVM at ${llvm}/lib; run 'build' first"
-    [[ -d "${libdir}" ]]   || die "missing std at ${libdir}"
-
-    out_dir="${WORK_DIR}/RustSupportLibs"
-    rm -rf "${out_dir}"
-    mkdir -p "${out_dir}/llvm/lib" "${out_dir}/rustlib/lib"
-
-    log "collecting iOS LLVM static libraries"
-    cp -a "${llvm}/lib/"*.a "${out_dir}/llvm/lib/" 2>/dev/null || true
-    cp -a "${llvm}/bin/llvm-config" "${out_dir}/llvm/" 2>/dev/null || true
-    cp -a "${libdir}/"*.rlib "${out_dir}/rustlib/lib/" 2>/dev/null || true
-    cp -a "$(sysroot_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends" \
-          "${out_dir}/rustlib/" 2>/dev/null || true
-
-    cat > "${out_dir}/README.md" <<EOF
-# RustSupportLibs (${PACKAGE_SUFFIX})
-
-Support libraries produced by rustios (analogue of LLVM-On-iOS'
-\`CoreCompilerSupportLibs\`).
-
-* \`llvm/lib/*.a\` - LLVM static libraries built for \`${HOST_TRIPLE}\`
-* \`llvm/llvm-config\` - llvm-config for \`${HOST_TRIPLE}\` (not runnable on macOS)
-* \`rustlib/lib/*.rlib\` - the Rust standard library for \`${HOST_TRIPLE}\`
-* \`rustlib/codegen-backends/*.dylib\` - codegen backends for \`${HOST_TRIPLE}\`
-
-They are useful when linking against \`Rust.xcframework\` manually, or when
-rebuilding parts of the toolchain from inside an iOS app.
-EOF
-
-    out="${ARTIFACTS_DIR}/RustSupportLibs-${PACKAGE_SUFFIX}-${RUST_VERSION}.tar.xz"
-    log "compressing ${out}"
-    compress "${WORK_DIR}" "RustSupportLibs" "${out}" 1
-    out="$( [[ -f "${out}" ]] && echo "${out}" || echo "${out%.xz}.tar.gz" )"
-    checksum "${out}"
-    log "support libs: ${out} ($(human_size "${out}"))"
-}
-
-# ---------------------------------------------------------------------------
-# xcframework (rustc as a static library that can be embedded in an iOS app)
-# ---------------------------------------------------------------------------
-
-build_xcframework() {
-    local stage1 ios_sysroot work rlib
-    stage1="$(stage1_dir)"
-    ios_sysroot="$(sysroot_dir)"
-    work="${WORK_DIR}/xcframework"
-
-    [[ -x "${stage1}/bin/rustc" ]] || die "missing host compiler at ${stage1}/bin/rustc"
-    [[ -d "${ios_sysroot}" ]]      || die "missing iOS sysroot at ${ios_sysroot}"
-
-    shopt -s nullglob
-    local driver_rlibs=(
-        "${ios_sysroot}"/lib/rustlib/"${HOST_TRIPLE}"/lib/librustc_driver-*.rlib
-        "${ios_sysroot}"/lib/librustc_driver-*.rlib
-    )
-    shopt -u nullglob
-    if [[ "${#driver_rlibs[@]}" -eq 0 ]]; then
-        # Layout differs between bootstrap versions; fall back to a search.
-        local found
-        found="$(find "${ios_sysroot}" -name 'librustc_driver-*.rlib' -print -quit 2>/dev/null || true)"
-        [[ -n "${found}" ]] && driver_rlibs=("${found}")
-    fi
-    [[ "${#driver_rlibs[@]}" -gt 0 ]] \
-        || die "librustc_driver rlib not found in ${ios_sysroot}; cannot build a driver library"
-    rlib="${driver_rlibs[0]}"
-
-    rm -rf "${work}"
-    mkdir -p "${work}/Headers" "${work}/sysroot/lib/rustlib"
-
-    # Merged sysroot: the stage1 rustc needs its macOS codegen backend, while
-    # std + rustc_private crates for the iOS target come from the freshly
-    # produced iOS sysroot.
-    ln -sfn "${stage1}/lib/rustlib/${BUILD_TRIPLE}" "${work}/sysroot/lib/rustlib/${BUILD_TRIPLE}"
-    ln -sfn "${ios_sysroot}/lib/rustlib/${HOST_TRIPLE}" "${work}/sysroot/lib/rustlib/${HOST_TRIPLE}"
-
-    cp -a "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs" "${work}/"
-    cp -a "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${work}/Headers/"
-
-    log "building librustc_driver static library for ${HOST_TRIPLE}"
-    RUSTC_BOOTSTRAP=1 \
-    RUSTIOS_VERSION="${RUST_VERSION}" \
-    IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
-        "${stage1}/bin/rustc" \
-            --edition 2021 \
-            --crate-name rustios_driver \
-            --crate-type staticlib \
-            --target "${HOST_TRIPLE}" \
-            --sysroot "${work}/sysroot" \
-            -L "dependency=$(dirname "${rlib}")" \
-            -C opt-level=3 \
-            -C debuginfo=0 \
-            -C panic=unwind \
-            -C lto=no \
-            -o "${work}/libRustCompiler.a" \
-            "${work}/rustios_driver.rs"
-
-    write_build_info "${work}/Headers/build-info.json"
-
-    log "creating Rust.xcframework"
-    xcodebuild -create-xcframework \
-        -library "${work}/libRustCompiler.a" \
-        -headers "${work}/Headers" \
-        -output "${work}/Rust.xcframework"
-
-    local out="${ARTIFACTS_DIR}/Rust.xcframework-${PACKAGE_SUFFIX}-${RUST_VERSION}.tar.xz"
-    log "compressing ${out}"
-    compress "${work}" "Rust.xcframework" "${out}" 1
-    out="$( [[ -f "${out}" ]] && echo "${out}" || echo "${out%.xz}.tar.gz" )"
-    checksum "${out}"
-    log "xcframework: ${out} ($(human_size "${out}"))"
+    log "running: python3 x.py ${stage_args[*]}  (this takes hours)"
+    ( cd "${RUST_SOURCE_DIR}" && python3 x.py "${stage_args[@]}" )
 }
 
 # ---------------------------------------------------------------------------
@@ -706,33 +336,200 @@ build_xcframework() {
 # ---------------------------------------------------------------------------
 
 verify() {
+    require_macos
     local sysroot rustc
-    sysroot="$(sysroot_dir)"
+    sysroot="$(stage_dir)"
     rustc="${sysroot}/bin/rustc"
 
-    [[ -x "${rustc}" ]] || die "missing ${rustc}"
+    [[ -x "${rustc}" ]] || die "missing ${rustc}; the build did not produce a compiler"
 
-    log "verifying ${rustc}"
+    log "checking ${rustc}"
+    file "${rustc}"
     file "${rustc}" | grep -q 'Mach-O 64-bit executable arm64' \
         || die "rustc is not an arm64 Mach-O executable"
-    lipo -archs "${rustc}" | grep -qw 'arm64' \
+    lipo -archs "${rustc}" | grep -qw arm64 \
         || die "rustc does not contain an arm64 slice"
 
     if command -v vtool >/dev/null 2>&1; then
-        log "LC_BUILD_VERSION of rustc:"
-        vtool -show-build "${rustc}" | sed 's/^/    /'
+        vtool -show-build "${rustc}"
         vtool -show-build "${rustc}" | grep -q 'platform IOS' \
             || die "rustc was not linked for the iOS platform"
+        vtool -show-build "${rustc}" | grep -q "minos ${IOS_DEPLOYMENT_TARGET}" \
+            || warn "deployment target is not ${IOS_DEPLOYMENT_TARGET}"
     fi
 
-    shopt -s nullglob
-    local std_rlibs=("${sysroot}/lib/rustlib/${HOST_TRIPLE}"/lib/libstd-*.rlib)
-    shopt -u nullglob
-    [[ "${#std_rlibs[@]}" -gt 0 ]] || die "std for ${HOST_TRIPLE} is missing"
-    [[ -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" ]] \
-        || die "codegen backends for ${HOST_TRIPLE} are missing"
+    [[ -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/lib" ]] \
+        || die "std for ${HOST_TRIPLE} is missing"
+    ls "${sysroot}/lib/rustlib/${HOST_TRIPLE}/lib"/libstd-*.rlib >/dev/null 2>&1 \
+        || die "libstd for ${HOST_TRIPLE} is missing"
 
-    log "rustc, std and codegen backends are valid iOS/arm64 artifacts"
+    log "rustc, std and codegen backends are iOS/arm64 artifacts"
+}
+
+# ---------------------------------------------------------------------------
+# package: RustToolchain (the compilers + std, i.e. SwiftToolchain.zip)
+# ---------------------------------------------------------------------------
+
+package() {
+    local stage dest tarball
+    stage="$(stage_dir)"
+    dest="${WORK_DIR}/${TOOLCHAIN_NAME}"
+
+    [[ -x "${stage}/bin/rustc" ]] || die "missing ${stage}/bin/rustc; run 'build' first"
+
+    log "assembling ${dest}"
+    rm -rf "${dest}"
+    mkdir -p "${dest}/usr"
+    cp -a "${stage}/bin" "${dest}/usr/"
+    cp -a "${stage}/lib" "${dest}/usr/"
+
+    # Never ship host-side leftovers.
+    if [[ "${BUILD_TRIPLE}" != "${HOST_TRIPLE}" ]]; then
+        rm -rf "${dest}/usr/lib/rustlib/${BUILD_TRIPLE}"
+    fi
+    find "${dest}" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
+
+    write_usage_doc "${dest}"
+    write_build_info "${dest}"
+
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+        log "ad-hoc signing Mach-O files"
+        sign_tree "${dest}/usr"
+    fi
+
+    tarball="${ARTIFACTS_DIR}/${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
+    log "creating ${tarball}"
+    tar_xz "${WORK_DIR}" "${TOOLCHAIN_NAME}" "${tarball}"
+    checksum "${tarball}"
+    log "toolchain: $(human_size "${tarball}")"
+
+    # A second archive with exactly the layout rustup/LLVM-On-iOS users
+    # expect (usr/bin + usr/lib at the top level).
+    local bare="${ARTIFACTS_DIR}/${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}-usr.tar.xz"
+    log "creating ${bare}"
+    ( cd "${dest}" && XZ_OPT="-T0 -6" tar -cJf "${bare}" usr )
+    checksum "${bare}"
+}
+
+# ---------------------------------------------------------------------------
+# support: RustSupportLibs (LLVM for iOS + std), LLVM-On-iOS' CoreCompilerSupportLibs
+# ---------------------------------------------------------------------------
+
+support() {
+    local llvm libdir dest tarball
+    llvm="$(llvm_dir)"
+    libdir="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/lib"
+    dest="${WORK_DIR}/${SUPPORT_NAME}"
+
+    [[ -d "${llvm}/lib" ]] || die "missing iOS LLVM at ${llvm}/lib; run 'build' first"
+    [[ -d "${libdir}" ]]   || die "missing std at ${libdir}; run 'build' first"
+
+    log "collecting iOS LLVM static libraries"
+    rm -rf "${dest}"
+    mkdir -p "${dest}/llvm/lib" "${dest}/rustlib"
+    cp -a "${llvm}/lib/"*.a "${dest}/llvm/lib/" 2>/dev/null || true
+    cp -a "${llvm}/bin/llvm-config" "${dest}/llvm/" 2>/dev/null || true
+    cp -a "${libdir}" "${dest}/rustlib/lib"
+
+    local backends
+    backends="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends"
+    [[ -d "${backends}" ]] && cp -a "${backends}" "${dest}/rustlib/"
+
+    cat > "${dest}/README.md" <<EOF
+# ${SUPPORT_NAME} (${PACKAGE_PREFIX})
+
+Support libraries for the rustios toolchain, i.e. the counterpart of
+LLVM-On-iOS' \`CoreCompilerSupportLibs\`.
+
+* \`llvm/lib/*.a\` - LLVM, built for ${HOST_TRIPLE}
+* \`llvm/llvm-config\` - llvm-config for ${HOST_TRIPLE}
+* \`rustlib/lib/*.rlib\` - core/std/alloc/... for ${HOST_TRIPLE}
+* \`rustlib/codegen-backends/\` - the LLVM codegen backend for ${HOST_TRIPLE}
+
+These are needed when linking \`${XCFRAMEWORK_NAME}\` into an app, or when
+building a custom rustc driver on the device.
+EOF
+
+    write_build_info "${dest}"
+
+    tarball="${ARTIFACTS_DIR}/${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
+    log "creating ${tarball}"
+    tar_xz "${WORK_DIR}" "${SUPPORT_NAME}" "${tarball}"
+    checksum "${tarball}"
+    log "support libraries: $(human_size "${tarball}")"
+}
+
+# ---------------------------------------------------------------------------
+# xcframework: rustc as a static library + C API (LLVM.xcframework analogue)
+# ---------------------------------------------------------------------------
+
+build_xcframework() {
+    require_macos
+    local stage1 stage2 out_dir merged
+    stage1="$(build_host_dir)"
+    stage2="$(stage_dir)"
+    out_dir="${WORK_DIR}/${XCFRAMEWORK_NAME}.build"
+    merged="${out_dir}/sysroot"
+
+    [[ "${STAGE}" -ge 2 ]] || die "the xcframework driver needs --stage 2 (stage1 cannot run on the build host)"
+    [[ -x "${stage1}/bin/rustc" ]] || die "missing ${stage1}/bin/rustc; run 'build' first"
+    [[ -d "${stage2}/lib/rustlib/${HOST_TRIPLE}/lib" ]] \
+        || die "missing std for ${HOST_TRIPLE}; run 'build' first"
+
+    log "building the rustios driver static library (rustc_private)"
+    rm -rf "${out_dir}"
+    mkdir -p "${out_dir}/include" "${merged}/lib/rustlib"
+
+    # The driver is compiled by the stage1 compiler (which runs on the build
+    # machine) for ${HOST_TRIPLE}, but it needs the *host* side of the stage1
+    # sysroot (codegen backend dylibs) and the *target* side of the stage2
+    # sysroot (std + rustc_private rlibs). Merge them into one sysroot.
+    cp -a "${stage1}/lib/"*.dylib "${merged}/lib/" 2>/dev/null || true
+    ln -sfn "${stage2}/lib/rustlib/${HOST_TRIPLE}" "${merged}/lib/rustlib/${HOST_TRIPLE}"
+    cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/include/"
+
+    RUSTC_BOOTSTRAP=1 \
+    RUSTIOS_VERSION="${RUST_VERSION}" \
+    IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+    "${stage1}/bin/rustc" \
+        --edition 2021 \
+        --crate-name rustios_driver \
+        --crate-type staticlib \
+        --target "${HOST_TRIPLE}" \
+        --sysroot "${merged}" \
+        -C opt-level=2 \
+        -C debuginfo=0 \
+        -L "dependency=${stage2}/lib/rustlib/${HOST_TRIPLE}/lib" \
+        -L "native=$(llvm_dir)/lib" \
+        -o "${out_dir}/libRustCompiler.a" \
+        "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"
+
+    [[ -f "${out_dir}/libRustCompiler.a" ]] || die "static library was not produced"
+
+    cat > "${out_dir}/build-info.json" <<EOF
+{
+  "name": "rustios",
+  "rust_version": "${RUST_VERSION}",
+  "crate": "rustios_driver",
+  "host_triple": "${HOST_TRIPLE}",
+  "target": "${HOST_TRIPLE}",
+  "ios_deployment_target": "${IOS_DEPLOYMENT_TARGET}",
+  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+    rm -rf "${out_dir}/${XCFRAMEWORK_NAME}"
+    log "creating ${XCFRAMEWORK_NAME}"
+    xcodebuild -create-xcframework \
+        -library "${out_dir}/libRustCompiler.a" \
+        -headers "${out_dir}/include" \
+        -output "${out_dir}/${XCFRAMEWORK_NAME}"
+
+    local a="${ARTIFACTS_DIR}/${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
+    log "creating ${a}"
+    tar_xz "${out_dir}" "${XCFRAMEWORK_NAME}" "${a}"
+    checksum "${a}"
+    log "xcframework: $(human_size "${a}")"
 }
 
 # ---------------------------------------------------------------------------
@@ -743,59 +540,79 @@ info() {
     cat <<EOF
 rustios build configuration
   rust version          : ${RUST_VERSION} (${RUST_CHANNEL})
+  iOS deployment target : ${IOS_DEPLOYMENT_TARGET}
   build triple          : ${BUILD_TRIPLE}
   host triple           : ${HOST_TRIPLE}
-  target triple         : ${HOST_TRIPLE}
-  iOS deployment target : ${IOS_DEPLOYMENT_TARGET}
-  LLVM targets          : ${LLVM_TARGETS}
+  target                : ${HOST_TRIPLE}
   stage                 : ${STAGE}
-  rust source           : ${RUST_SOURCE_DIR}
+  LLVM targets          : ${LLVM_TARGETS}
+  rust sources          : ${RUST_SOURCE_DIR}
   build dir             : ${BUILD_DIR}
-  artifacts             : ${ARTIFACTS_DIR}
-  package               : ${PACKAGE_BASENAME}
-  xcframework           : ${BUILD_XCFRAMEWORK}
+  work dir              : ${WORK_DIR}
+  artifacts dir         : ${ARTIFACTS_DIR}
+  package               : ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
 EOF
 }
 
 clean() {
-    log "removing ${WORK_DIR} and ${ARTIFACTS_DIR}"
-    rm -rf "${WORK_DIR}" "${ARTIFACTS_DIR}"
-    log "removing build output (${BUILD_DIR})"
-    rm -rf "${BUILD_DIR}"
+    log "removing build output, work dir and artifacts"
+    rm -rf "${BUILD_DIR}" "${WORK_DIR}" "${ARTIFACTS_DIR}"
 }
 
 clean_all() {
     clean
-    log "removing Rust checkout (${RUST_SOURCE_DIR})"
+    log "removing Rust sources"
     rm -rf "${RUST_SOURCE_DIR}"
 }
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+usage: $(basename "$0") <command>
 
-case "${1:-}" in
-    fetch)        fetch ;;
-    configure)    configure ;;
-    build)        build ;;
-    package)      package_toolchain ;;
-    support)      package_support_libs ;;
-    xcframework)  build_xcframework ;;
-    verify)       verify ;;
-    info)         info ;;
-    all)
-        fetch
-        configure
-        build
-        verify
-        package_toolchain
-        package_support_libs
-        if [[ "${BUILD_XCFRAMEWORK}" == "true" ]]; then
+commands:
+  fetch         clone rust ${RUST_VERSION} and the required submodules
+  configure     write bootstrap.toml (cross-compile rustc for ${HOST_TRIPLE})
+  build         run x.py build --stage ${STAGE}
+  verify        check that rustc/std really are iOS arm64 artifacts
+  package       create ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+  support       create ${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+  xcframework   create ${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+  all           fetch + configure + build + verify + package + support + xcframework
+  info          print the effective configuration
+  clean         remove build output, work dir and artifacts
+  clean-all     clean + remove the Rust checkout
+
+environment: RUST_VERSION, RUST_CHANNEL, IOS_DEPLOYMENT_TARGET, HOST_TRIPLE,
+             STAGE, LLVM_TARGETS, JOBS, RUST_SOURCE_DIR, BUILD_DIR, WORK_DIR,
+             ARTIFACTS_DIR
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    case "${cmd}" in
+        fetch)       fetch ;;
+        configure)   configure ;;
+        build)       build ;;
+        verify)      verify ;;
+        package)     package ;;
+        support)     support ;;
+        xcframework) build_xcframework ;;
+        all)
+            fetch
+            configure
+            build
+            verify
+            package
+            support
             build_xcframework
-        fi
-        ;;
-    clean)        clean ;;
-    clean-all)    clean_all ;;
-    ""|-h|--help|help) usage ;;
-    *) usage; die "unknown command: $1" ;;
-esac
+            ;;
+        info)        info ;;
+        clean)       clean ;;
+        clean-all)   clean_all ;;
+        ""|-h|--help|help) usage ;;
+        *) usage; die "unknown command: ${cmd}" ;;
+    esac
+}
+
+main "$@"

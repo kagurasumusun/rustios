@@ -1,18 +1,11 @@
-# Rust source checkout and out-of-tree build directory
+# Rust checkout (created by `make fetch`)
 /rust-source/
-/rust-build/
 
-# Local working directories / artifacts
+# Build output and packaging workspace
+/build/
 /work/
 /artifacts/
-/RustToolchain/
-/Rust.xcframework/
 
-# Archives
-*.tar.xz
-*.tar.gz
-*.zip
-*.xcframework
-
-# macOS
+# Editor / OS noise
 .DS_Store
+*.swp
