@@ -211,8 +211,8 @@ jobs:
         run: |
           set -o pipefail
           echo "===== verify =====" | tee -a build.log
-          Scripts/build-rust-toolchain.sh verify 2>&1 | tee -a build.log
-          rc=${PIPESTATUS[0]}
+          rc=0
+          Scripts/build-rust-toolchain.sh verify 2>&1 | tee -a build.log || rc=$?
           echo "verify exited with ${rc}" | tee -a build.log
           if [ "${rc}" -ne 0 ]; then
             for dir in rust-source/build/aarch64-apple-ios/stage2/bin \

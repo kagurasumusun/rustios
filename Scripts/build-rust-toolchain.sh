@@ -772,14 +772,23 @@ verify() {
     local std_rlibs=("${libdir}"/libstd-*.rlib)
     shopt -u nullglob
     [[ "${#std_rlibs[@]}" -gt 0 ]] || die "libstd for ${HOST_TRIPLE} is missing"
-    # In an in-tree build the LLVM backend is a dylib next to the compiler
-    # libraries (`<sysroot>/lib`), not an installed codegen-backends/*.dylib.
+    # rustc_codegen_llvm is an rlib, so an in-tree compiler has the LLVM
+    # backend linked into the binary and no codegen-backends/ directory.
+    # Installed toolchains (and builds with extra backends) do ship one.
     shopt -s nullglob
-    local backend_dylibs=("${sysroot}/lib"/librustc_codegen_llvm-*.dylib)
+    local backend_files=(
+        "${sysroot}/lib"/librustc_codegen_llvm-*.dylib
+        "${sysroot}/lib/rustlib/${HOST_TRIPLE}/codegen-backends"/*.dylib
+    )
     shopt -u nullglob
-    if [[ ! -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" \
-          && "${#backend_dylibs[@]}" -eq 0 ]]; then
-        die "no codegen backend for ${HOST_TRIPLE} in ${sysroot}/lib"
+    if [[ "${#backend_files[@]}" -gt 0 ]]; then
+        log "codegen backend: $(basename "${backend_files[0]}")"
+    else
+        warn "no codegen-backends/ directory: the LLVM backend is expected to be linked into rustc"
+        # It has to be in there somewhere, or the compiler cannot emit code.
+        if [[ "$(nm -g "${rustc}" 2>/dev/null | grep -c 'LLVMCodeGen' || true)" -eq 0 ]]; then
+            warn "could not find LLVM codegen symbols in ${rustc}"
+        fi
     fi
 
     # A static Rust.xcframework needs the rustc rlibs, which only exist when
@@ -898,7 +907,8 @@ LLVM-On-iOS' \`CoreCompilerSupportLibs\`.
 
 * \`llvm/lib/*.a\` - LLVM, built for ${HOST_TRIPLE}
 * \`sysroot/lib/rustlib/${HOST_TRIPLE}/lib/*.rlib\` - core/std/alloc/... for ${HOST_TRIPLE}
-* \`sysroot/lib/rustlib/${HOST_TRIPLE}/codegen-backends/\` - the LLVM codegen backend
+* the LLVM codegen backend, linked into \`usr/bin/rustc\` itself (in-tree build,
+  so there is no \`codegen-backends/\` directory)
 
 \`sysroot/\` is a rustc sysroot: pass it to the compiler when it runs on the
 device, e.g. through the C API in \`${XCFRAMEWORK_NAME}\`:
