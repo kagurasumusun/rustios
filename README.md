@@ -181,9 +181,14 @@ $ vtool -show-build rust-source/build/aarch64-apple-ios/stage2/bin/rustc
 | 対象 | 方法 |
 | --- | --- |
 | rustc / clang の各コンパイル | sccache（`SCCACHE_GHA_ENABLED=true`）。bootstrap の `build.ccache = "sccache"` により LLVM の CMake ビルドにも効く |
-| `rust-source`（Rust 本体 + サブモジュール） | `actions/cache` |
-| `rust-source/build/*/llvm`（macOS 用・iOS 用） | `actions/cache` |
-| `rust-source/build/cache`（stage0 のダウンロード） | `actions/cache` |
+| `rust-source`（Rust 本体 + サブモジュール） | `actions/cache`（`rust-src-*`） |
+| `rust-source/build/*/llvm`（macOS 用・iOS 用） | `actions/cache`（`rust-llvm-*`、stage 1 終了時と最後の 2 回保存） |
+| `rust-source/build/cache`（stage0 のダウンロード） | 同上 |
+
+ビルドは **stage 1**（最初の LLVM と stage1 rustc）と **stage 2**（最終的な
+iOS 用 rustc）に分かれていて、stage 1 の直後にもキャッシュを保存します。
+クリーンな状態からの stage 2 は GitHub の 6 時間制限に収まらないことがある
+ためで、途中で打ち切られても次の実行がその続きから始められます。
 
 `Scripts/build-rust-toolchain.sh` の設定を変えたときは、ワークフローの
 `CACHE_VERSION` / `LLVM_CACHE_VERSION` を上げてください。
