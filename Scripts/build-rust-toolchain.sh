@@ -1423,6 +1423,55 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# install-nyxian: install the Rust toolchain into nyxian's Shared resources
+#
+# The Swift counterpart (build-swift-toolchain.sh install-nyxian) unpacks
+# SwiftToolchain.zip into ${NYXIAN_SHARED_DIR}/SwiftToolchain; nyxian's Xcode
+# project ships the whole Shared/ folder inside the app as a folder reference.
+# Rust's on-device resource is the complete sysroot: the compiler
+# (RustToolchain.zip: bin/rustc, driver dylib, codegen backend, LLVM tools)
+# merged with std (RustStd.tar.xz: usr/lib/rustlib/${HOST_TRIPLE}/lib/*.rlib),
+# so a guest process can run Shared/RustToolchain/usr/bin/rustc with no
+# further setup - the same single-tree shape Shared/SwiftToolchain has.
+# ---------------------------------------------------------------------------
+install_nyxian() {
+    local zip std_tarball nyxian_shared dest tmp std_rlibs
+    zip="${ARTIFACTS_DIR}/${TOOLCHAIN_ZIP}"
+    std_tarball="${ARTIFACTS_DIR}/${STD_TARBALL}"
+    [[ -f "${zip}" ]] || die "missing ${zip}; run 'package' first"
+    [[ -f "${std_tarball}" ]] || die "missing ${std_tarball}; run 'std' first"
+    command -v unzip >/dev/null 2>&1 || die "missing required tool: unzip"
+
+    nyxian_shared="${NYXIAN_SHARED_DIR:-${REPO_ROOT}/../Shared}"
+    [[ -d "${nyxian_shared}" ]] \
+        || die "missing Nyxian Shared directory at ${nyxian_shared}; set NYXIAN_SHARED_DIR"
+    dest="${nyxian_shared}/${TOOLCHAIN_NAME}"
+
+    log "installing ${TOOLCHAIN_NAME} + ${STD_NAME} into ${nyxian_shared}"
+    rm -rf "${dest}"
+    # RustToolchain.zip contains ${TOOLCHAIN_NAME}/usr/... - same top-level
+    # shape SwiftToolchain.zip has, so it unpacks next to it.
+    unzip -q "${zip}" -d "${nyxian_shared}"
+
+    # Merge std into the toolchain tree (the zip deliberately lacks it; this
+    # is the documented "complete the toolchain" merge, done for nyxian).
+    tmp="${WORK_DIR}/nyxian-install"
+    rm -rf "${tmp}"
+    mkdir -p "${tmp}"
+    tar -xJf "${std_tarball}" -C "${tmp}"
+    cp -a "${tmp}/${STD_NAME}/usr/." "${dest}/usr/"
+    rm -rf "${tmp}"
+
+    [[ -x "${dest}/usr/bin/rustc" ]] || die "install-nyxian: missing ${dest}/usr/bin/rustc"
+    shopt -s nullglob
+    std_rlibs=("${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib"/libstd-*.rlib)
+    shopt -u nullglob
+    [[ "${#std_rlibs[@]}" -gt 0 ]] \
+        || die "install-nyxian: std did not merge into ${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib"
+    log "installed ${dest} (compiler + std, one sysroot; nyxian ships it as an app resource)"
+}
+
+# ---------------------------------------------------------------------------
 # support: RustSupportLibs (LLVM-On-iOS' CoreCompilerSupportLibs)
 #
 # CoreCompilerSupportLibs is a flat directory of the dylibs the embedded Swift
@@ -1967,10 +2016,14 @@ commands:
   configure     write bootstrap.toml (cross-compile rustc for ${HOST_TRIPLE})
   build         run x.py build --stage ${STAGE}
   verify        check that rustc/std really are iOS arm64 artifacts
+  verify-host   alias of 'verify' (LLVM-On-iOS' name)
   package       create ${TOOLCHAIN_ZIP} (compiler + LLVM tools, no std)
   std           create ${STD_TARBALL} (std, shipped apart)
   support       create ${SUPPORT_TARBALL} (runtime dylibs)
   xcframework   create ${XCFRAMEWORK_TARBALL} (static ${STATIC_COMPILER_LIB} + Headers)
+  install-nyxian
+                install compiler+std as one sysroot into nyxian's Shared/
+                resources (NYXIAN_SHARED_DIR, default ../Shared)
   all           fetch + configure + build + verify + package + std + support + xcframework
   info          print the effective configuration
   clean         remove build output, work dir and artifacts
@@ -1978,7 +2031,7 @@ commands:
 
 environment: RUST_VERSION, RUST_CHANNEL, IOS_DEPLOYMENT_TARGET, HOST_TRIPLE,
              STAGE, LLVM_TARGETS, JOBS, RUST_SOURCE_DIR, BUILD_DIR, WORK_DIR,
-             ARTIFACTS_DIR, RUSTIOS_BUILD_PHASE (host|target|all)
+             ARTIFACTS_DIR, NYXIAN_SHARED_DIR, RUSTIOS_BUILD_PHASE (host|target|all)
 
 'build' runs both phases by default: the stage1 compiler for this machine
 (needed to compile for iOS) and then the compiler that runs on iOS. Set
@@ -1997,6 +2050,10 @@ main() {
         std)         std ;;
         support)     support ;;
         xcframework) build_xcframework ;;
+        # nyxian interface (docs/nyxian.md): install compiler+std into
+        # nyxian's Shared/ resources; verify-host mirrors the Swift script.
+        install-nyxian) install_nyxian ;;
+        verify-host)    verify ;;
         all)
             fetch
             configure

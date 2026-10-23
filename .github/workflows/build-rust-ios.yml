@@ -17,7 +17,9 @@ name: build-rust-ios
 # Both jobs run on macOS, which is only the build environment: every shipped
 # binary is verified to be iOS/arm64 (see `verify`). Packaging follows
 # emexlab/LLVM-On-iOS, but - unlike the reference workflow - every artifact is
-# actually produced and uploaded (`if-no-files-found: error`).
+# actually produced and uploaded (`if-no-files-found: error`). Both jobs end
+# by verifying the nyxian interface (the root directories nyxian's Makefile
+# copies + an install-nyxian smoke test); see docs/nyxian.md.
 
 on:
   push:
@@ -218,6 +220,28 @@ jobs:
           Scripts/build-swift-toolchain.sh llvm-xcframework 2>&1 | tee -a swift.log
           echo "===== swift support =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh support 2>&1 | tee -a swift.log
+
+      # The nyxian contract (docs/nyxian.md): nyxian's Makefile cp -r's
+      # CoreCompilerSupportLibs/ and LLVM.xcframework/ out of the repository
+      # root, and `install-nyxian` unpacks Shared/SwiftToolchain (app
+      # resources). Both are smoke-tested here against a fake Shared/.
+      - name: Verify the nyxian interface (Swift side)
+        run: |-
+          set -euo pipefail
+          echo "===== nyxian dirs (swift) =====" | tee -a swift.log
+          make nyxian-swift-dirs 2>&1 | tee -a swift.log
+          test -d CoreCompilerSupportLibs
+          test -d LLVM.xcframework
+          ls CoreCompilerSupportLibs/lib_Compiler*.dylib >/dev/null
+          test -f LLVM.xcframework/Info.plist
+          echo "===== install-nyxian smoke (swift) =====" | tee -a swift.log
+          mkdir -p work/nyxian-smoke/Shared
+          NYXIAN_SHARED_DIR="$PWD/work/nyxian-smoke/Shared" \
+            make install-nyxian-swift-toolchain 2>&1 | tee -a swift.log
+          test -x work/nyxian-smoke/Shared/SwiftToolchain/usr/bin/swiftc
+          test -x work/nyxian-smoke/Shared/SwiftToolchain/usr/bin/swift-frontend
+          test -d work/nyxian-smoke/Shared/SwiftToolchain/usr/lib/swift
+          echo "nyxian interface OK (swift)" | tee -a swift.log
 
       - name: Upload Swift artifacts
         if: always()
@@ -465,6 +489,29 @@ jobs:
           set -o pipefail
           echo "===== xcframework =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee -a build.log
+
+      # The nyxian contract (docs/nyxian.md): the Rust counterparts of the
+      # directories nyxian copies (RustSupportLibs/, Rust.xcframework/) and
+      # `install-nyxian` for the merged compiler+std sysroot, smoke-tested
+      # against a fake Shared/.
+      - name: Verify the nyxian interface (Rust side)
+        run: |-
+          set -euo pipefail
+          echo "===== nyxian dirs (rust) =====" | tee -a build.log
+          make nyxian-rust-dirs 2>&1 | tee -a build.log
+          test -d RustSupportLibs
+          ls RustSupportLibs/librustc_driver-*.dylib >/dev/null
+          if [ "${BUILD_XCFRAMEWORK}" = "true" ]; then
+            test -d Rust.xcframework
+            test -f Rust.xcframework/Info.plist
+          fi
+          echo "===== install-nyxian smoke (rust) =====" | tee -a build.log
+          mkdir -p work/nyxian-smoke/Shared
+          NYXIAN_SHARED_DIR="$PWD/work/nyxian-smoke/Shared" \
+            make install-nyxian-rust-toolchain 2>&1 | tee -a build.log
+          test -x work/nyxian-smoke/Shared/RustToolchain/usr/bin/rustc
+          ls work/nyxian-smoke/Shared/RustToolchain/usr/lib/rustlib/aarch64-apple-ios/lib/libstd-*.rlib >/dev/null
+          echo "nyxian interface OK (rust)" | tee -a build.log
 
       - name: Upload RustToolchain + std + support libs
         if: always()

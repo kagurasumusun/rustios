@@ -9,6 +9,12 @@
 /work/
 /artifacts/
 
+# nyxian root directories (make nyxian-dirs; copies of work/ staging)
+/CoreCompilerSupportLibs/
+/LLVM.xcframework/
+/RustSupportLibs/
+/Rust.xcframework/
+
 # Editor / OS noise
 .DS_Store
 *.swp

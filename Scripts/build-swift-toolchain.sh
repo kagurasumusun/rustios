@@ -713,6 +713,41 @@ package_swift() {
     report_line "SwiftToolchain ${version}: $(human_size "${zip_file}") (zip, SwiftToolchain/usr)"
 }
 
+# ---------------------------------------------------------------------------
+# install-nyxian: unpack SwiftToolchain.zip into nyxian's Shared resources
+#
+# emexlab/nyxian - the on-device IDE this toolchain is built for - keeps the
+# toolchains it ships inside its Shared/ folder, which its Xcode project
+# bundles into the app as a folder reference (Shared -> app Resources). This
+# is LLVM-On-iOS' `install-nyxian` contract: unzip the packaged toolchain to
+# ${NYXIAN_SHARED_DIR}/SwiftToolchain/usr/...
+#
+# NYXIAN_SHARED_DIR defaults to ../Shared, i.e. the parent checkout's Shared/
+# when rustios sits inside nyxian (as a submodule or a sibling clone).
+# ---------------------------------------------------------------------------
+install_nyxian() {
+    local zip nyxian_shared dest
+    zip="${ARTIFACTS_DIR}/${SWIFT_TOOLCHAIN_NAME}.zip"
+    [[ -f "${zip}" ]] || die "missing ${zip}; run 'package' first"
+    command -v unzip >/dev/null 2>&1 || die "missing required tool: unzip"
+
+    nyxian_shared="${NYXIAN_SHARED_DIR:-${REPO_ROOT}/../Shared}"
+    [[ -d "${nyxian_shared}" ]] \
+        || die "missing Nyxian Shared directory at ${nyxian_shared}; set NYXIAN_SHARED_DIR"
+    dest="${nyxian_shared}/${SWIFT_TOOLCHAIN_NAME}"
+
+    log "installing ${SWIFT_TOOLCHAIN_NAME} into ${nyxian_shared}"
+    rm -rf "${dest}"
+    unzip -q "${zip}" -d "${nyxian_shared}"
+
+    # The same shape verify-host checks, at the installed location.
+    [[ -x "${dest}/usr/bin/swiftc" ]] || die "install-nyxian: missing ${dest}/usr/bin/swiftc"
+    [[ -x "${dest}/usr/bin/swift-frontend" ]] \
+        || die "install-nyxian: missing ${dest}/usr/bin/swift-frontend"
+    [[ -d "${dest}/usr/lib/swift" ]] || die "install-nyxian: missing ${dest}/usr/lib/swift"
+    log "installed ${dest} (nyxian ships it inside the app via its Shared folder reference)"
+}
+
 # SwiftLLVM.tar.xz: the LLVM both compilers link (rustios addition - the
 # relocatable installed shape of the shared LLVM, with the llvm-config shims).
 package_llvm() {
@@ -1037,13 +1072,16 @@ commands:
   llvm-xcframework  create ${LLVM_XCFRAMEWORK_NAME}.tar.xz (llvm.a + merged Headers)
   support           create ${SUPPORT_LIBS_NAME}.tar.xz (lib_Compiler*.dylib)
   verify            check that the Swift compiler and the LLVM are iOS/arm64
+  verify-host       alias of 'verify' (LLVM-On-iOS' name)
+  install-nyxian    unpack ${SWIFT_TOOLCHAIN_NAME}.zip into nyxian's Shared/
+                    resources (NYXIAN_SHARED_DIR, default ../Shared)
   all               fetch + llvm + install-llvm + package-llvm + swift + package
                     + llvm-xcframework + support + verify
   info              print the effective configuration
 
 environment: SWIFT_BRANCH, IOS_DEPLOYMENT_TARGET, LLVM_TARGETS, SWIFT_SOURCE_DIR,
              SWIFT_BUILD_ROOT, SWIFT_BUILD_SUBDIR, SWIFT_INSTALL_DIR, SWIFT_LLVM_DIR,
-             WORK_DIR, ARTIFACTS_DIR
+             WORK_DIR, ARTIFACTS_DIR, NYXIAN_SHARED_DIR
 
 'llvm' and 'swift' run the same build-script invocation (Swift 6.4 builds the
 LLVM trees and the compilers in one go) and then collect the LLVM or the Swift
@@ -1067,6 +1105,10 @@ main() {
         llvm-xcframework) llvm_xcframework ;;
         support)          support_libs ;;
         verify)           verify ;;
+        # nyxian interface (docs/nyxian.md): install into nyxian's Shared/
+        # resources; verify-host is LLVM-On-iOS' name for 'verify'.
+        install-nyxian)   install_nyxian ;;
+        verify-host)      verify ;;
         all)
             fetch
             build_swift all

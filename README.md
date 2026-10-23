@@ -153,6 +153,9 @@ make swift      # LLVM-On-iOS と同名の Swift 成果物: SwiftToolchain.zip /
 make build      # rustc のビルドだけ（SwiftLLVM が既にある場合）
 make package    # RustToolchain.zip / make std → RustStd.tar.xz
 make support    # RustSupportLibs.tar.xz / make xcframework → Rust.xcframework.tar.xz
+make nyxian-dirs    # nyxian がルートから cp -r する 4 ディレクトリを配置（all に含む）
+make install-nyxian # Shared/SwiftToolchain + Shared/RustToolchain（std 統合済み）を
+                    # nyxian の Shared/（NYXIAN_SHARED_DIR、既定 ../Shared）にインストール
 make info       # 現在の設定を表示（Swift 側 + Rust 側）
 ```
 
@@ -174,6 +177,23 @@ make RUST_LLVM_MODE=intree   # 比較用: rust-lang 版 LLVM を bootstrap に�
 | `STAGE` | `2` | bootstrap のステージ |
 | `LLVM_TARGETS` | `AArch64` | LLVM バックエンド。**Swift プリセットの `llvm-targets-to-build` と同値**に固定（`swift` モードでは共有 LLVM が既にこの構成、`intree` モードでは bootstrap が同じ構成でビルドする）。出荷コンパイラがコードを生成するのは arm64 のみ |
 | `JOBS` | CPU 数 | 並列度 |
+| `NYXIAN_SHARED_DIR` | `../Shared` | nyxian の `Shared/`（`install-nyxian` のインストール先。rustios が nyxian 内にあるときの既定） |
+
+---
+
+### nyxian での使い方
+
+rustios は [emexlab/nyxian](https://github.com/emexlab/nyxian)（stock iOS 上の
+オンデバイス IDE）に LLVM-On-iOS の代わりに組み込めるよう調整されています。
+既定の `make` は、nyxian の Makefile がルートから `cp -r` する
+`CoreCompilerSupportLibs/` と `LLVM.xcframework/`（LLVM-On-iOS と同じ
+インターフェース）に加え、Rust 対応物の `RustSupportLibs/` と
+`Rust.xcframework/` をリポジトリルートに置きます。
+`make install-nyxian` はツールチェーン本体を nyxian の `Shared/`
+（アプリにリソースとして同梱されるフォルダ）にインストールします —
+`Shared/SwiftToolchain`（LLVM-On-iOS と同一）と `Shared/RustToolchain`
+（コンパイラ + std を統合した単一 sysroot）。手順と Xcode プロジェクト側の
+接続は [docs/nyxian.md](docs/nyxian.md) を参照してください。
 
 ---
 
@@ -457,15 +477,16 @@ int rc = rustios_run(7, argv);   /* RUSTIOS_OK=0, RUSTIOS_FAILED=1, ... */
 ## ディレクトリ構成
 
 ```
-.github/workflows/build-rust-ios.yml      CI（swift ジョブ → build ジョブ + Release）
-Makefile                                  make all / llvm / swift / build / ...
+.github/workflows/build-rust-ios.yml      CI（swift ジョブ → build ジョブ + Release。末尾で nyxian インターフェースを検証）
+Makefile                                  make all / llvm / swift / build / nyxian-dirs / install-nyxian / ...
+docs/nyxian.md                            nyxian への組み込み方（消費インターフェースの調査結果つき）
 docs/parity.md                            Swift↔Rust の成果物・ビルドフラグ対応表（今回の中心）
 docs/llvm-sharing.md                      共有 LLVM の設計・バージョン対応表・未検証項目
 Scripts/build-swift-toolchain.sh          Swift 6.4 と LLVM 21.1.6（macOS/iOS）のビルド
 Scripts/swift-ios-toolchain-presets.ini   LLVM-On-iOS 相当の build-script プリセット
                                           （llvm-install-components はツール一覧の唯一の出所）
 Scripts/llvm-config-shim.py               再配置可能な llvm-config の生成
-Scripts/build-rust-toolchain.sh           rustc のビルド（fetch/configure/build/package/std/support/...）
+Scripts/build-rust-toolchain.sh           rustc のビルド（fetch/configure/build/package/std/support/install-nyxian/...）
 Scripts/rustios-driver/rustios_driver.rs  rustc を C API として公開する staticlib（rust.a）
 Scripts/rustios-driver/include/rustios.h  その C ヘッダ
 ```
@@ -478,4 +499,7 @@ rust-source/   Rust のチェックアウト（build/ 以下にビルド結果�
 work/          SwiftLLVM（共有 LLVM）、SwiftToolchain、RustToolchain、
                RustStd、RustSupportLibs、*.xcframework の作業ディレクトリ
 artifacts/     配布する SwiftToolchain.zip / *.tar.xz と SHA256SUMS.txt、REPORT.txt
+CoreCompilerSupportLibs/  LLVM.xcframework/  RustSupportLibs/  Rust.xcframework/
+               nyxian がルートから cp -r するディレクトリ（make nyxian-dirs が
+               work/ からコピー。LLVM-On-iOS のルート配置 + Rust 対応物）
 ```
