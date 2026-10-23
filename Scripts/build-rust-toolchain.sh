@@ -383,6 +383,13 @@ configure() {
 
     local cfg="${RUST_SOURCE_DIR}/bootstrap.toml"
     local jobs_line="" ccache_line=""
+    # bootstrap resolves build-dir relative to the source directory, so keep it
+    # relative when it is the default and absolute when it was overridden.
+    local build_dir_line="build"
+    if [[ "${BUILD_DIR}" != "${RUST_SOURCE_DIR}/build" ]]; then
+        build_dir_line="${BUILD_DIR}"
+    fi
+
     [[ -n "${JOBS}" ]] && jobs_line="jobs = ${JOBS}"
     # bootstrap feeds `build.ccache` to RUSTC_WRAPPER and to LLVM's
     # CMAKE_<LANG>_COMPILER_LAUNCHER, so sccache covers both rustc and LLVM.
@@ -406,7 +413,7 @@ configure() {
 build = "${BUILD_TRIPLE}"
 host = ["${HOST_TRIPLE}"]
 target = ["${HOST_TRIPLE}"]
-build-dir = "build"
+build-dir = "${build_dir_line}"
 docs = false
 compiler-docs = false
 extended = false
