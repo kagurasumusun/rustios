@@ -24,6 +24,25 @@ Rust 側のターゲット名は `aarch64-apple-ios` ですが、これは LLVM-
 `arm64-apple-ios16.0` と同じプラットフォームです（Apple の別名 arm64 = aarch64、
 `IPHONEOS_DEPLOYMENT_TARGET=16.0`）。
 
+### 「macOS 用」ではなく「iOS 用」です
+
+macOS は **ビルドを実行する環境** であって、成果物のターゲットではありません。
+iOS 用のコンパイラを作るには Xcode と iPhoneOS SDK が必要なので、ビルド自体は
+macOS 上で動きます（LLVM-On-iOS も `macos-latest` でビルドしています）。
+
+| | 何のため | 成果物に入るか |
+| --- | --- | --- |
+| ビルドマシン `aarch64-apple-darwin`（`x86_64-apple-darwin`） | Xcode / clang / CMake を動かす土台 | **入りません** |
+| ビルドマシン用 LLVM・std・stage1 rustc | ビルド中にだけ使う道具 | **入りません** |
+| iOS `aarch64-apple-ios` 用 LLVM | iOS で動く rustc に静的リンクされる | 入ります（iOS/arm64） |
+| iOS 用 rustc / rustdoc / std / codegen backend | デバイス上で動くコンパイラ本体 | 入ります（iOS/arm64） |
+
+そのため `verify` / `package` / `support` は、出荷ツリーに macOS の Mach-O が
+1 つでも混ざっていれば **失敗** します（`assert_ios_only`）。`vtool` で
+`platform IOS` を確認し、`file` で arm64 であることも確認します。
+ビルド途中の macOS 用成果物は `rust-source/build/aarch64-apple-darwin/` に
+ありますが、`artifacts/` には入りません。
+
 ---
 
 ## 成果物
@@ -35,7 +54,7 @@ Rust 側のターゲット名は `aarch64-apple-ios` ですが、これは LLVM-
 | --- | --- |
 | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | `RustToolchain/usr/{bin,lib}` — iOS で動く `rustc`, `rustdoc`, std, codegen backend |
 | `RustToolchain-iphoneos-arm64-<ver>-usr.tar.xz` | 同じものを `usr/` 直下に持つアーカイブ（`RUST_DIR` をそのまま展開したい場合用） |
-| `RustSupportLibs-iphoneos-arm64-<ver>.tar.xz` | iOS 向け LLVM 静的ライブラリと、`--sysroot` にそのまま渡せる `sysroot/`（std rlib + codegen backend） |
+| `RustSupportLibs-iphoneos-arm64-<ver>.tar.xz` | iOS 向け LLVM 静的ライブラリ（`llvm/lib/*.a`）と、`--sysroot` にそのまま渡せる `sysroot/`（std rlib + codegen backend）。`llvm-config` は macOS 用のビルドツールなので含めません |
 | `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `libRustCompiler.dylib`（C API）・コンパイラ dylib・`rustios.h` を収めた `Rust.xcframework` |
 | `SHA256SUMS.txt` | 上記の SHA-256 |
 

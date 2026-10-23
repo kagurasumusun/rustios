@@ -182,6 +182,38 @@ write_build_info() {
     } > "${dest}/build-info.json"
 }
 
+# assert_ios_only <directory> <label>: fail when the tree contains Mach-O
+# binaries that are not iOS/arm64.
+#
+# The build machine is a Mac, so it is easy to leak a macOS tool or dylib into
+# an artifact (LLVM's llvm-config, a host std, ...). Every shipped Mach-O must
+# be arm64 and - when vtool is available - claim `platform IOS`.
+assert_ios_only() {
+    local dir="$1" label="$2" file desc build_info
+    local bad=()
+    [[ -d "${dir}" ]] || return 0
+    while IFS= read -r -d '' file; do
+        desc="$(file -b "${file}" 2>/dev/null || true)"
+        [[ "${desc}" == *Mach-O* ]] || continue
+        if [[ "${desc}" != *"arm64"* ]]; then
+            bad+=("${file}: ${desc}")
+            continue
+        fi
+        if command -v vtool >/dev/null 2>&1; then
+            build_info="$(vtool -show-build "${file}" 2>/dev/null || true)"
+            if [[ -n "${build_info}" && "${build_info}" != *"platform IOS"* ]]; then
+                bad+=("${file}: $(printf '%s' "${build_info}" | sed -n 's/^ *platform //p' | sed -n 1p)")
+            fi
+        fi
+    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' \) -print0)
+
+    if [[ "${#bad[@]}" -gt 0 ]]; then
+        printf '  %s\n' "${bad[@]}" >&2
+        die "${label} contains non-iOS binaries; refusing to ship it"
+    fi
+    log "${label}: every Mach-O file is iOS/arm64"
+}
+
 # Ad-hoc sign every Mach-O in the tree. iOS refuses to execute unsigned code;
 # an ad-hoc signature is enough once the app itself is signed.
 sign_tree() {
@@ -559,6 +591,9 @@ verify() {
         warn "libstd-*.dylib is missing from ${sysroot}/lib; Rust.xcframework will fail"
     fi
 
+    assert_ios_only "${sysroot}/bin" "the iOS toolchain (bin)"
+    assert_ios_only "${sysroot}/lib" "the iOS toolchain (lib)"
+
     log "rustc, std and codegen backends are iOS/arm64 artifacts"
 }
 
@@ -584,6 +619,11 @@ package() {
         rm -rf "${dest}/usr/lib/rustlib/${BUILD_TRIPLE}"
     fi
     find "${dest}" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
+
+    # The build machine's std (macOS) can be linked into the *compiler's*
+    # sysroot by bootstrap; it must never be shipped.
+    assert_ios_only "${dest}/usr/bin" "RustToolchain (bin)"
+    assert_ios_only "${dest}/usr/lib" "RustToolchain (lib)"
 
     write_usage_doc "${dest}"
     write_build_info "${dest}"
@@ -629,9 +669,8 @@ support() {
     shopt -u nullglob
     [[ "${#archives[@]}" -gt 0 ]] || die "no static LLVM libraries in ${llvm}/lib"
     cp -a "${archives[@]}" "${dest}/llvm/lib/"
-    if [[ -f "${llvm}/bin/llvm-config" ]]; then
-        cp -a "${llvm}/bin/llvm-config" "${dest}/llvm/"
-    fi
+    # llvm-config is a *host* tool: for a cross build it is a macOS binary, so
+    # it does not belong in an iOS payload.
 
     # The sysroot layout is what `rustc --sysroot` expects, so an app that
     # embeds Rust.xcframework can compile user code with
@@ -645,7 +684,6 @@ Support libraries for the rustios toolchain, i.e. the counterpart of
 LLVM-On-iOS' \`CoreCompilerSupportLibs\`.
 
 * \`llvm/lib/*.a\` - LLVM, built for ${HOST_TRIPLE}
-* \`llvm/llvm-config\` - llvm-config for ${HOST_TRIPLE}
 * \`sysroot/lib/rustlib/${HOST_TRIPLE}/lib/*.rlib\` - core/std/alloc/... for ${HOST_TRIPLE}
 * \`sysroot/lib/rustlib/${HOST_TRIPLE}/codegen-backends/\` - the LLVM codegen backend
 
@@ -663,6 +701,8 @@ These are also needed when linking \`${XCFRAMEWORK_NAME}\` into an app.
 EOF
 
     write_build_info "${dest}"
+    assert_ios_only "${dest}/llvm" "RustSupportLibs (LLVM)"
+    assert_ios_only "${dest}/sysroot" "RustSupportLibs (sysroot)"
 
     if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
         log "ad-hoc signing the codegen backend"
@@ -943,18 +983,24 @@ build_xcframework() {
 info() {
     cat <<EOF
 rustios build configuration
-  rust version          : ${RUST_VERSION} (${RUST_CHANNEL})
-  iOS deployment target : ${IOS_DEPLOYMENT_TARGET}
-  build triple          : ${BUILD_TRIPLE}
-  host triple           : ${HOST_TRIPLE}
-  target                : ${HOST_TRIPLE}
-  stage                 : ${STAGE}
-  LLVM targets          : ${LLVM_TARGETS}
-  rust sources          : ${RUST_SOURCE_DIR}
-  build dir             : ${BUILD_DIR}
-  work dir              : ${WORK_DIR}
-  artifacts dir         : ${ARTIFACTS_DIR}
-  packages              : ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+
+  The product is an iOS toolchain. macOS is only the machine that runs the
+  build (Xcode + the iPhoneOS SDK are required for that); nothing built for
+  macOS is shipped.
+
+  rust version            : ${RUST_VERSION} (${RUST_CHANNEL})
+  iOS deployment target   : ${IOS_DEPLOYMENT_TARGET}
+  product runs on (host)  : ${HOST_TRIPLE} (iOS/arm64)
+  product compiles for    : ${HOST_TRIPLE} (iOS/arm64)
+  build machine (macOS)   : ${BUILD_TRIPLE} (not shipped)
+  stage                   : ${STAGE}
+  LLVM targets            : ${LLVM_TARGETS}
+  rust sources            : ${RUST_SOURCE_DIR}
+  build dir               : ${BUILD_DIR}
+  work dir                : ${WORK_DIR}
+  artifacts dir           : ${ARTIFACTS_DIR}
+  packages (all iOS/arm64):
+                          ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
                           ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}-usr.tar.xz
                           ${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
                           ${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz

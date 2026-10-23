@@ -2,7 +2,8 @@ name: build-rust-ios
 
 # Builds a Rust toolchain whose *host* is aarch64-apple-ios, i.e. a rustc that
 # runs on an iPhone (the same idea as emexlab/LLVM-On-iOS, which cross-builds
-# clang/Swift for iOS), and packages it the way LLVM-On-iOS does:
+# clang/Swift for iOS). The macOS runner is only the build environment; every
+# shipped binary is verified to be iOS/arm64. Packaging follows LLVM-On-iOS:
 #
 #   RustToolchain-iphoneos-arm64-<ver>.tar.xz      <- SwiftToolchain.zip
 #   RustSupportLibs-iphoneos-arm64-<ver>.tar.xz    <- CoreCompilerSupportLibs
@@ -63,7 +64,9 @@ env:
 
 jobs:
   build:
-    name: rustc for aarch64-apple-ios
+    # Everything this job produces is iOS/arm64 (see README: macOS is only the
+    # build environment). Non-iOS binaries make `verify`/`package` fail.
+    name: rustc for iOS (aarch64-apple-ios)
     # GitHub-hosted runners are limited to 6 hours per job.
     timeout-minutes: 360
     runs-on: macos-14
