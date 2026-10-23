@@ -238,6 +238,143 @@ fetch() {
 }
 
 # ---------------------------------------------------------------------------
+# bootstrap patch: build LLVM for iOS
+#
+# Upstream's `configure_cmake` overrides `CMAKE_SYSTEM_NAME` to `Darwin`, sets
+# the sysroot to `/` and clears the deployment target for every Apple mobile
+# target, because compiler-rt's CMake configuration assumes macOS. That is fine
+# for compiler-rt, but a full LLVM built that way is not an iOS library, and the
+# rustc that links it would not be an iOS executable.
+#
+# This patch makes the block conditional on `RUSTIOS_IOS_SDK` (exported by
+# `build`), so LLVM is configured with the iPhoneOS SDK and the deployment
+# target while everything else keeps the upstream behaviour.
+# ---------------------------------------------------------------------------
+
+patch_bootstrap_llvm() {
+    local file="${RUST_SOURCE_DIR}/src/bootstrap/src/core/build_steps/llvm.rs"
+    [[ -f "${file}" ]] || { warn "bootstrap llvm.rs not found; skipping iOS LLVM patch"; return 0; }
+    require_cmd python3
+
+    if ! python3 - "${file}" <<'PY'
+import pathlib
+import sys
+
+MARKER = "rustios: build a real iOS LLVM"
+path = pathlib.Path(sys.argv[1])
+src = path.read_text()
+
+if MARKER in src:
+    print("bootstrap already patched")
+    sys.exit(0)
+
+lines = src.splitlines(keepends=True)
+
+# Locate the `if !target.contains("darwin")` branch inside the Apple block.
+start = None
+for i, line in enumerate(lines):
+    if 'if !target.contains("darwin")' in line:
+        start = i
+        break
+
+if start is None:
+    sys.stderr.write("could not find the Apple-mobile block in llvm.rs\n")
+    sys.exit(3)
+
+# The three defines we want to replace live between `start` and the next
+# closing brace at the same indentation.
+indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+end = None
+for i in range(start + 1, len(lines)):
+    if lines[i].rstrip("\n") == indent + "}":
+        end = i
+        break
+
+if end is None:
+    sys.stderr.write("could not find the end of the Apple-mobile block\n")
+    sys.exit(3)
+
+block = lines[start + 1 : end]
+sys_idx = sys_idx2 = dt_idx = None
+for offset, line in enumerate(block):
+    if 'cfg.define("CMAKE_SYSTEM_NAME", "Darwin")' in line and sys_idx is None:
+        sys_idx = offset
+    if 'cfg.define("CMAKE_OSX_SYSROOT", "/")' in line:
+        sys_idx2 = offset
+    if 'cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", "")' in line:
+        dt_idx = offset
+
+if sys_idx is None or sys_idx2 is None or dt_idx is None or not (sys_idx < sys_idx2 <= dt_idx):
+    sys.stderr.write("unexpected bootstrap LLVM layout; please update the rustios patch\n")
+    sys.exit(3)
+
+# Also drop the stale FIXME comment block directly above the statements.
+while sys_idx > 0:
+    prev = block[sys_idx - 1].strip()
+    if prev == "" or prev.startswith("//"):
+        sys_idx -= 1
+    else:
+        break
+
+# Only blank lines, comments and those three statements may be replaced.
+allowed = []
+for offset in range(sys_idx, dt_idx + 1):
+    line = block[offset].strip()
+    ok = (
+        line == ""
+        or line.startswith("//")
+        or 'cfg.define("CMAKE_SYSTEM_NAME", "Darwin")' in line
+        or 'cfg.define("CMAKE_OSX_SYSROOT", "/")' in line
+        or 'cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", "")' in line
+    )
+    if not ok:
+        sys.stderr.write(f"unexpected line in the block: {block[offset]!r}\n")
+        sys.exit(3)
+    allowed.append(offset)
+
+ind = indent + "    "  # indentation inside the `if !target.contains("darwin")` branch
+replacement = [
+    f"{ind}// {MARKER}.\n",
+    f"{ind}// Upstream forces CMAKE_SYSTEM_NAME=Darwin and an empty sysroot here,\n",
+    f"{ind}// which only works for compiler-rt. A full LLVM must be built against\n",
+    f"{ind}// the iPhoneOS SDK, otherwise the objects are not iOS objects.\n",
+    f'{ind}if let Ok(sdk) = std::env::var("RUSTIOS_IOS_SDK") {{\n',
+    f'{ind}    cfg.define("CMAKE_SYSTEM_NAME", "iOS");\n',
+    f'{ind}    cfg.define("CMAKE_OSX_SYSROOT", sdk);\n',
+    f'{ind}    cfg.define(\n',
+    f'{ind}        "CMAKE_OSX_DEPLOYMENT_TARGET",\n',
+    f'{ind}        std::env::var("RUSTIOS_IOS_DEPLOYMENT_TARGET")\n',
+    f'{ind}            .unwrap_or_else(|_| "16.0".to_string()),\n',
+    f'{ind}    );\n',
+    f'{ind}}} else {{\n',
+    f'{ind}    cfg.define("CMAKE_SYSTEM_NAME", "Darwin");\n',
+    f'{ind}    cfg.define("CMAKE_OSX_SYSROOT", "/");\n',
+    f'{ind}    cfg.define("CMAKE_OSX_DEPLOYMENT_TARGET", "");\n',
+    f'{ind}}}\n',
+]
+
+new_block = (
+    block[: sys_idx]
+    + replacement
+    + block[dt_idx + 1 :]
+)
+new_lines = lines[: start + 1] + new_block + lines[end:]
+
+path.write_text("".join(new_lines))
+print("patched bootstrap LLVM build for iOS")
+PY
+    then
+        warn "could not patch bootstrap's LLVM iOS settings (patch is valid for RUST_VERSION=${RUST_VERSION}); continuing"
+    fi
+
+    if grep -q "rustios: build a real iOS LLVM" "${file}"; then
+        log "bootstrap patched: LLVM for iOS is configured with the iPhoneOS SDK"
+    else
+        warn "bootstrap patch did not apply; the iOS LLVM build may fail"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # configure
 # ---------------------------------------------------------------------------
 
@@ -315,6 +452,8 @@ EOF
     log "bootstrap.toml written (build=${BUILD_TRIPLE} host=${HOST_TRIPLE} iOS ${IOS_DEPLOYMENT_TARGET})"
     printf '%s\n' "--- ${cfg} ---"
     sed 's/^/    /' "${cfg}"
+
+    patch_bootstrap_llvm
 }
 
 # ---------------------------------------------------------------------------
@@ -334,6 +473,11 @@ build() {
     log "iPhoneOS SDK: ${sdk}"
 
     export IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
+    # Read by the bootstrap patch (see patch_bootstrap_llvm) when it configures
+    # LLVM for the iOS host: the full LLVM must be built against the iPhoneOS
+    # SDK, not against `/`.
+    export RUSTIOS_IOS_SDK="${sdk}"
+    export RUSTIOS_IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
     # rustc must not pick up the SDK for *host* (macOS) compilations, so
     # SDKROOT is deliberately not exported. It queries xcrun itself when
     # compiling for iOS.
