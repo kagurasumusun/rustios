@@ -62,7 +62,7 @@ extern "C" {
 #define RUSTIOS_ICE 101
 
 /*
- * Version of the embedded compiler, e.g. "1.99.1".
+ * Version of the embedded compiler, e.g. "1.94.0".
  *
  * The returned pointer refers to static storage and must not be freed.
  */

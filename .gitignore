@@ -1,6 +1,9 @@
 # Rust checkout (created by `make fetch`)
 /rust-source/
 
+# Swift checkout (created by `make llvm` / Scripts/build-swift-toolchain.sh fetch)
+/swift-source/
+
 # Build output and packaging workspace
 /build/
 /work/

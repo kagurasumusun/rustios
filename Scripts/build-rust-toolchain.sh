@@ -27,7 +27,13 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # ---------------------------------------------------------------------------
 
 # Rust release tag to build.
-RUST_VERSION="${RUST_VERSION:-1.99.1}"
+#
+# 1.94.0 is the release whose src/llvm-project is LLVM 21.1.x - the same
+# major.minor as the LLVM that Swift 6.4 is built from (21.1.6). bootstrap only
+# checks that an external LLVM is >= 20, so nothing enforces this; it is a
+# deliberate choice, recorded in docs/llvm-sharing.md. Do not bump this without
+# checking the LLVM version of the new tag.
+RUST_VERSION="${RUST_VERSION:-1.94.0}"
 
 # Release channel of that tag (stable/beta/nightly/dev).
 RUST_CHANNEL="${RUST_CHANNEL:-stable}"
@@ -44,6 +50,20 @@ STAGE="${STAGE:-2}"
 
 # LLVM backends. rustc only compiles for HOST_TRIPLE, so AArch64 is enough.
 LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
+
+# Which LLVM the Rust compiler links against:
+#
+#   swift  (default) the LLVM that Scripts/build-swift-toolchain.sh built for
+#                    Swift, consumed through a generated llvm-config. rustc
+#                    links the very same static libraries as swift-frontend;
+#                    no rust-lang/llvm-project build happens at all.
+#   intree           build rust-lang/llvm-project inside bootstrap (the
+#                    pre-shared-LLVM behaviour, kept as a fallback).
+#
+# In `swift` mode the trees must exist first:
+#   Scripts/build-swift-toolchain.sh fetch llvm
+RUST_LLVM_MODE="${RUST_LLVM_MODE:-swift}"
+SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${REPO_ROOT}/work/SwiftLLVM}"
 
 # Where things live.
 RUST_SOURCE_DIR="${RUST_SOURCE_DIR:-${REPO_ROOT}/rust-source}"
@@ -90,6 +110,47 @@ BUILD_TRIPLE="${BUILD_TRIPLE:-$(detect_build_triple)}"
 stage_dir()   { echo "${BUILD_DIR}/${HOST_TRIPLE}/stage${STAGE}"; }
 llvm_dir()    { echo "${BUILD_DIR}/${HOST_TRIPLE}/llvm"; }
 build_host_dir() { echo "${BUILD_DIR}/${BUILD_TRIPLE}/stage1"; }
+
+# llvm-config of the LLVM the Rust compiler links, for the given target.
+# In `swift` mode these are the relocatable shims written by
+# Scripts/build-swift-toolchain.sh; in `intree` mode bootstrap's own build.
+llvm_config_for() {
+    local target="$1"
+    if [[ "${RUST_LLVM_MODE}" == "swift" ]]; then
+        case "${target}" in
+            "${BUILD_TRIPLE}") echo "${SWIFT_LLVM_DIR}/macosx/bin/llvm-config" ;;
+            "${HOST_TRIPLE}")  echo "${SWIFT_LLVM_DIR}/ios/bin/llvm-config" ;;
+            *) die "no Swift LLVM configured for ${target}" ;;
+        esac
+    fi
+}
+
+# Directory holding the iOS LLVM static libraries that are shipped/linked.
+llvm_lib_dir() {
+    if [[ "${RUST_LLVM_MODE}" == "swift" ]]; then
+        echo "${SWIFT_LLVM_DIR}/ios/lib"
+    else
+        echo "$(llvm_dir)/lib"
+    fi
+}
+
+# True when the Rust compiler must build its own LLVM.
+llvm_is_in_tree() { [[ "${RUST_LLVM_MODE}" != "swift" ]]; }
+
+# Human-readable description of the LLVM that is linked (recorded in
+# build-info.json and the report).
+llvm_description() {
+    local config version="unknown"
+    if llvm_is_in_tree; then
+        echo "rust-lang/llvm-project (in-tree)"
+        return
+    fi
+    config="$(llvm_config_for "${HOST_TRIPLE}")"
+    if [[ -x "${config}" ]]; then
+        version="$("${config}" --version 2>/dev/null || echo unknown)"
+    fi
+    echo "swiftlang/llvm-project ${version} (shared with Swift)"
+}
 
 # `shasum -a 256` writes "hash  path"; we run it from the artifacts dir so
 # the manifest contains plain file names.
@@ -163,6 +224,7 @@ write_build_info() {
         '"target": "'${HOST_TRIPLE}'"'
         '"ios_deployment_target": "'${IOS_DEPLOYMENT_TARGET}'"'
         '"llvm_targets": "'${LLVM_TARGETS}'"'
+        '"llvm_source": "'"$(llvm_description)"'"'
         '"stage": '${STAGE}
         '"built_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"'
     )
@@ -253,16 +315,22 @@ fetch() {
             https://github.com/rust-lang/rust.git "${RUST_SOURCE_DIR}"
     fi
 
-    # bootstrap needs src/llvm-project (LLVM sources) and library/backtrace
-    # (a std dependency). Everything else is only needed for dist/docs.
-    log "updating required submodules"
-    git -C "${RUST_SOURCE_DIR}" submodule update --init --depth 1 -- \
-        src/llvm-project library/backtrace \
-        || git -C "${RUST_SOURCE_DIR}" submodule update --init -- \
-            src/llvm-project library/backtrace
+    # bootstrap needs library/backtrace (a std dependency) and, when it builds
+    # LLVM itself, src/llvm-project. With the Swift LLVM nothing ever
+    # configures src/llvm-project, so it is not checked out at all - that is
+    # the ~1.5 GB the shared LLVM saves before the build even starts.
+    local needed=(library/backtrace)
+    if llvm_is_in_tree; then
+        needed=(src/llvm-project library/backtrace)
+    fi
+    log "updating required submodules: ${needed[*]}"
+    git -C "${RUST_SOURCE_DIR}" submodule update --init --depth 1 -- "${needed[@]}" \
+        || git -C "${RUST_SOURCE_DIR}" submodule update --init -- "${needed[@]}"
 
-    [[ -f "${RUST_SOURCE_DIR}/src/llvm-project/llvm/CMakeLists.txt" ]] \
-        || die "src/llvm-project is empty; submodule checkout failed"
+    if llvm_is_in_tree; then
+        [[ -f "${RUST_SOURCE_DIR}/src/llvm-project/llvm/CMakeLists.txt" ]] \
+            || die "src/llvm-project is empty; submodule checkout failed"
+    fi
     [[ -f "${RUST_SOURCE_DIR}/library/backtrace/Cargo.toml" ]] \
         || die "library/backtrace is empty; submodule checkout failed"
     [[ -f "${RUST_SOURCE_DIR}/x.py" ]] || die "x.py not found in ${RUST_SOURCE_DIR}"
@@ -514,6 +582,54 @@ configure() {
         log "using ${ccache_tool} for compiler caching"
     fi
 
+    # The LLVM that the Rust compiler links. In `swift` mode bootstrap must
+    # not build LLVM at all: a `llvm-config` in `[target.*]` makes every LLVM
+    # step resolve to that installation (config.rs: prebuilt_llvm_config()
+    # returns it as "already built"), so src/llvm-project is never configured
+    # and no Rust-specific LLVM is produced.
+    local llvm_section="" llvm_tools_line="llvm-tools = true"
+    if [[ "${RUST_LLVM_MODE}" == "swift" ]]; then
+        # The Swift LLVM is built for arm64 macOS; linking it into an x86_64
+        # rustc would produce a corrupt binary, so reject that combination
+        # instead of failing deep inside the link step.
+        [[ "${BUILD_TRIPLE}" == "aarch64-apple-darwin" ]] \
+            || die "the shared Swift LLVM is arm64 macOS only (build machine is ${BUILD_TRIPLE}); use RUST_LLVM_MODE=intree"
+        local host_llvm_config ios_llvm_config
+        host_llvm_config="$(llvm_config_for "${BUILD_TRIPLE}")"
+        ios_llvm_config="$(llvm_config_for "${HOST_TRIPLE}")"
+        [[ -x "${host_llvm_config}" ]] \
+            || die "missing ${host_llvm_config}; run 'Scripts/build-swift-toolchain.sh llvm' first"
+        [[ -x "${ios_llvm_config}" ]] \
+            || die "missing ${ios_llvm_config}; run 'Scripts/build-swift-toolchain.sh llvm' first"
+        # A quoted heredoc (no expansion, no command substitution) with the
+        # values filled in afterwards: the comments below mention bootstrap
+        # options in backticks, which an unquoted heredoc would execute.
+        llvm_section="$(sed \
+            -e "s|@BUILD_TRIPLE@|${BUILD_TRIPLE}|g" \
+            -e "s|@HOST_TRIPLE@|${HOST_TRIPLE}|g" \
+            -e "s|@HOST_LLVM_CONFIG@|${host_llvm_config}|g" \
+            -e "s|@IOS_LLVM_CONFIG@|${ios_llvm_config}|g" <<'LLVMCFG'
+
+# rustios: the LLVM that Swift is built against owns this build.
+# `llvm-has-rust-patches = false` tells bootstrap that these are not
+# rust-lang/llvm-project's patched sources, so LLVM_RUSTLLVM is not set and
+# rustc's wrappers compile against the plain upstream API.
+[target."@BUILD_TRIPLE@"]
+llvm-config = "@HOST_LLVM_CONFIG@"
+llvm-has-rust-patches = false
+
+[target."@HOST_TRIPLE@"]
+llvm-config = "@IOS_LLVM_CONFIG@"
+llvm-has-rust-patches = false
+LLVMCFG
+)"
+        # An external LLVM ships none of the llvm-tools, and `Assemble` would
+        # try to install every one of them; the tools we need (llvm-ar, ...)
+        # are shipped by build-swift-toolchain.sh instead.
+        llvm_tools_line="llvm-tools = false"
+        log "LLVM for Rust: the Swift LLVM (${SWIFT_LLVM_DIR})"
+    fi
+
     log "writing ${cfg}"
     cat > "${cfg}" <<EOF
 # Generated by Scripts/build-rust-toolchain.sh - do not edit, re-run 'configure'.
@@ -529,12 +645,13 @@ build-dir = "${build_dir_line}"
 docs = false
 compiler-docs = false
 extended = false
-# fetch only clones src/llvm-project and library/backtrace; do not let x.py
-# pull cargo/gcc/enzyme/rustc-perf as well (it also keeps the build offline).
+# rustios fetches exactly the submodules the build needs (library/backtrace,
+# and src/llvm-project only in intree mode); x.py must not pull cargo, gcc,
+# enzyme or rustc-perf as well.
 submodules = false
 locked-deps = true
-# Sanitizer runtimes use compiler-rt's own (macOS-flavoured) CMake setup, which
-# the rustios LLVM patch deliberately bypasses. Build LLVM only.
+# Sanitizer runtimes need compiler-rt built for the target, which this
+# toolchain does not ship.
 sanitizers = false
 ${jobs_line}
 ${ccache_line}
@@ -552,9 +669,11 @@ debuginfo-level-std = 0
 codegen-units = 16
 incremental = false
 download-rustc = false
-# Ship llvm-tools (llvm-ar, llvm-objcopy, ...) next to the compiler: they are
-# built as part of LLVM anyway, and are needed to produce archives on device.
-llvm-tools = true
+# Ship llvm-tools (llvm-ar, llvm-objcopy, ...) next to the compiler when LLVM
+# is built in-tree: they are built as part of LLVM anyway and are needed to
+# produce archives on device. With an external LLVM they are shipped by
+# build-swift-toolchain.sh (ios/bin/), so bootstrap must not look for them.
+${llvm_tools_line}
 
 [llvm]
 # The LLVM that ends up inside the iOS rustc must be an iOS library, so the
@@ -571,13 +690,20 @@ static-libstdcpp = false
 libzstd = false
 clang = false
 enable-warnings = false
+${llvm_section}
 EOF
 
     log "bootstrap.toml written (build=${BUILD_TRIPLE} host=${HOST_TRIPLE} iOS ${IOS_DEPLOYMENT_TARGET})"
     printf '%s\n' "--- ${cfg} ---"
     sed 's/^/    /' "${cfg}"
 
-    patch_bootstrap_llvm
+    if llvm_is_in_tree; then
+        # The patch changes how bootstrap configures its own LLVM build; with
+        # an external LLVM that code never runs.
+        patch_bootstrap_llvm
+    else
+        log "skipping the in-tree LLVM patch (LLVM comes from Swift)"
+    fi
     patch_bootstrap_rustc_artifacts
 }
 
@@ -731,6 +857,109 @@ merge_target_std() {
 }
 
 # ---------------------------------------------------------------------------
+# verify_llvm_source: prove which LLVM the Rust compiler was built against
+#
+# "We pointed bootstrap at another LLVM" is not evidence that rustc used it.
+# This collects the evidence that the *build* did:
+#
+#   1. bootstrap.toml hands bootstrap an llvm-config in the Swift LLVM tree;
+#   2. bootstrap never configured or built its own LLVM (no build tree, no
+#      LLVM cache entry for this build);
+#   3. rustc_llvm's build script reported libraries from the Swift LLVM tree -
+#      that output is what cargo turns into the link line of rustc_llvm, i.e.
+#      exactly the LLVM that ends up inside the compiler.
+# ---------------------------------------------------------------------------
+
+verify_llvm_source() {
+    local cfg="${RUST_SOURCE_DIR}/bootstrap.toml"
+    local evidence="" failures=0
+    local ios_config host_config
+
+    if [[ "${RUST_LLVM_MODE}" != "swift" ]]; then
+        log "LLVM source: in-tree rust-lang/llvm-project (RUST_LLVM_MODE=${RUST_LLVM_MODE})"
+        report_line "rust LLVM: in-tree rust-lang/llvm-project (not the Swift LLVM)"
+        return 0
+    fi
+
+    ios_config="$(llvm_config_for "${HOST_TRIPLE}")"
+    host_config="$(llvm_config_for "${BUILD_TRIPLE}")"
+
+    # 1. configuration
+    if grep -q "llvm-config = \"${ios_config}\"" "${cfg}" 2>/dev/null; then
+        log "bootstrap.toml: ${HOST_TRIPLE} uses ${ios_config}"
+        evidence+="bootstrap.toml [target.\"${HOST_TRIPLE}\"] llvm-config = ${ios_config}"$'\n'
+    else
+        warn "bootstrap.toml does not point ${HOST_TRIPLE} at ${ios_config}"
+        failures=$((failures + 1))
+    fi
+    if grep -q "llvm-config = \"${host_config}\"" "${cfg}" 2>/dev/null; then
+        log "bootstrap.toml: ${BUILD_TRIPLE} uses ${host_config}"
+        evidence+="bootstrap.toml [target.\"${BUILD_TRIPLE}\"] llvm-config = ${host_config}"$'\n'
+    else
+        warn "bootstrap.toml does not point ${BUILD_TRIPLE} at ${host_config}"
+        failures=$((failures + 1))
+    fi
+
+    # 2. no in-tree LLVM build
+    local build_trees=()
+    local d
+    for d in "${BUILD_DIR}/${BUILD_TRIPLE}/llvm/build" "${BUILD_DIR}/${HOST_TRIPLE}/llvm/build"; do
+        if [[ -d "${d}" ]]; then
+            build_trees+=("${d}")
+        fi
+    done
+    if [[ "${#build_trees[@]}" -eq 0 ]]; then
+        log "no in-tree LLVM build tree in ${BUILD_DIR} (bootstrap never configured LLVM)"
+        evidence+="no in-tree LLVM build tree under ${BUILD_DIR}"$'\n'
+    else
+        warn "bootstrap built its own LLVM: ${build_trees[*]}"
+        failures=$((failures + 1))
+    fi
+
+    # 3. what rustc_llvm was actually compiled and linked against
+    local outputs=() out hits=0
+    shopt -s nullglob
+    while IFS= read -r out; do
+        outputs+=("${out}")
+    done < <(find "${BUILD_DIR}" -type f -name output -path '*rustc_llvm*' 2>/dev/null)
+    shopt -u nullglob
+
+    for out in "${outputs[@]}"; do
+        if grep -q "${SWIFT_LLVM_DIR}" "${out}" 2>/dev/null; then
+            hits=$((hits + 1))
+            local line
+            while IFS= read -r line; do
+                log "  rustc_llvm: ${line}"
+                evidence+="rustc_llvm(${out#"${BUILD_DIR}/"}): ${line}"$'\n'
+            done < <(grep -E 'rustc-link-search|rerun-if-changed=.*llvm-config' "${out}" \
+                     | head -4 | sed 's/^cargo://')
+        fi
+    done
+
+    if [[ "${hits}" -gt 0 ]]; then
+        log "rustc_llvm links ${hits} LLVM(s) from ${SWIFT_LLVM_DIR}"
+    elif [[ "${#outputs[@]}" -eq 0 ]]; then
+        warn "no rustc_llvm build script output found under ${BUILD_DIR}"
+        failures=$((failures + 1))
+    else
+        warn "rustc_llvm build script output does not mention ${SWIFT_LLVM_DIR}"
+        failures=$((failures + 1))
+    fi
+
+    local version
+    version="$("${ios_config}" --version 2>/dev/null || echo unknown)"
+    if [[ "${failures}" -ne 0 ]]; then
+        report_line "rust LLVM: **could not verify** that the Swift LLVM ${version} was used (${failures} checks failed)"
+    else
+        report_line "rust LLVM: Swift LLVM ${version} (${SWIFT_LLVM_DIR}), confirmed via bootstrap.toml and rustc_llvm's build script"
+    fi
+    if [[ "${failures}" -ne 0 ]]; then
+        die "the Rust compiler was not verified to use the Swift LLVM"
+    fi
+    log "the Rust compiler was built against the Swift LLVM (${version})"
+}
+
+# ---------------------------------------------------------------------------
 # verify
 # ---------------------------------------------------------------------------
 
@@ -744,6 +973,7 @@ verify() {
     rustc="${sysroot}/bin/rustc"
 
     merge_target_std
+    verify_llvm_source
 
     [[ -x "${rustc}" ]] || die "missing ${rustc}; the build did not produce a compiler"
 
@@ -872,12 +1102,12 @@ package() {
 # ---------------------------------------------------------------------------
 
 support() {
-    local llvm rustlib dest tarball
-    llvm="$(llvm_dir)"
+    local llvm_lib rustlib dest tarball
+    llvm_lib="$(llvm_lib_dir)"
     rustlib="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}"
     dest="${WORK_DIR}/${SUPPORT_NAME}"
 
-    [[ -d "${llvm}/lib" ]] || die "missing iOS LLVM at ${llvm}/lib; run 'build' first"
+    [[ -d "${llvm_lib}" ]] || die "missing iOS LLVM libraries at ${llvm_lib}; run 'build' and the Swift LLVM steps first"
 
     merge_target_std
     [[ -d "${rustlib}/lib" ]] || die "missing std at ${rustlib}/lib; run 'build' first"
@@ -887,9 +1117,9 @@ support() {
     mkdir -p "${dest}/llvm/lib" "${dest}/sysroot/lib/rustlib"
 
     shopt -s nullglob
-    local archives=("${llvm}/lib/"*.a)
+    local archives=("${llvm_lib}/"*.a)
     shopt -u nullglob
-    [[ "${#archives[@]}" -gt 0 ]] || die "no static LLVM libraries in ${llvm}/lib"
+    [[ "${#archives[@]}" -gt 0 ]] || die "no static LLVM libraries in ${llvm_lib}"
     cp -a "${archives[@]}" "${dest}/llvm/lib/"
     # llvm-config is a *host* tool: for a cross build it is a macOS binary, so
     # it does not belong in an iOS payload.
@@ -1132,7 +1362,7 @@ report_line() {
 # one file plus the system libraries.
 bundle_llvm() {
     local lib="$1" llvm merged archives=() log_file
-    llvm="$(llvm_dir)/lib"
+    llvm="$(llvm_lib_dir)"
     if [[ ! -d "${llvm}" ]]; then
         warn "no iOS LLVM at ${llvm}; $(basename "${lib}") will need LLVM linked separately"
         report_line "xcframework: LLVM **not** bundled (missing ${llvm})"
@@ -1370,6 +1600,8 @@ rustios build configuration
   build machine (macOS)   : ${BUILD_TRIPLE} (not shipped)
   stage                   : ${STAGE}
   LLVM targets            : ${LLVM_TARGETS}
+  LLVM for rustc          : $(llvm_description) [RUST_LLVM_MODE=${RUST_LLVM_MODE}]
+  LLVM for rustc (config) : $(if llvm_is_in_tree; then echo "built by bootstrap"; else echo "${SWIFT_LLVM_DIR}/{macosx,ios}/bin/llvm-config"; fi)
   rust sources            : ${RUST_SOURCE_DIR}
   build dir               : ${BUILD_DIR}
   work dir                : ${WORK_DIR}
