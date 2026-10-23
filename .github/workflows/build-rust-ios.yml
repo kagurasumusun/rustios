@@ -410,6 +410,41 @@ jobs:
             --body-file swift-report.md --edit-last --create-if-none
 
   # ---------------------------------------------------------------------------
+  # Rust source prefetch
+  # ---------------------------------------------------------------------------
+  # Fetching Rust + library/backtrace is only git I/O; it neither needs Xcode
+  # nor the Swift LLVM. Do it on a free Ubuntu runner in parallel with the
+  # hours-long Swift job, so the macOS Rust job can restore this exact cache as
+  # soon as it receives SwiftLLVM.tar.xz. `fetch` intentionally has no macOS
+  # requirement (only configure/build/package require Xcode).
+  prefetch-rust:
+    name: Warm Rust source cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore Rust sources
+        id: cache-rust-src
+        uses: actions/cache/restore@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
+      - name: Fetch Rust sources
+        if: steps.cache-rust-src.outputs.cache-hit != 'true'
+        run: Scripts/build-rust-toolchain.sh fetch
+
+      - name: Save Rust sources
+        if: steps.cache-rust-src.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
+  # ---------------------------------------------------------------------------
   # rustc, linked against the Swift LLVM
   # ---------------------------------------------------------------------------
   build:

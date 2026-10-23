@@ -351,7 +351,7 @@ $ vtool -show-build rust-source/build/aarch64-apple-ios/stage2/bin/rustc
 | 対象 | 方法 |
 | --- | --- |
 | `swift-source`（Swift + llvm-project ほか sibling リポジトリ） | `actions/cache`（`swift-src-*`）。リリースごとに不変 |
-| `rust-source`（Rust 本体 + `library/backtrace`） | `actions/cache`（`rust-src-*`） |
+| `rust-source`（Rust 本体 + `library/backtrace`） | `actions/cache`（`rust-src-*`）。Ubuntu の `prefetch-rust` ジョブが Swift ビルドと並列に温める |
 | Swift の完成済み配布物 | `actions/cache`（`swift-artifacts-*`）。Swift リリース・iOS バージョン・ビルドスクリプト/プリセットのハッシュが同じなら**再ビルドせず**に復元 |
 | Rust の完成済み配布物 | `actions/cache`（`rust-artifacts-*`）。Rust/Swift LLVM バージョン・stage・iOS バージョン・関連スクリプトのハッシュが同じなら**再ビルドせず**に復元 |
 | 共有 LLVM（ビルド済み） | `swift` ジョブ → `build` ジョブへ **artifact**（`SwiftLLVM.tar.xz`）で受け渡し（Rust 成果物キャッシュ miss 時だけダウンロード） |
