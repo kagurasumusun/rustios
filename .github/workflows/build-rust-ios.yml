@@ -74,7 +74,7 @@ jobs:
     # GitHub-hosted runners are limited to 6 hours per job; this one is the
     # long pole (LLVM for macOS and iOS, then the iOS Swift compiler).
     timeout-minutes: 355
-    runs-on: macos-14
+    runs-on: macos-latest
     outputs:
       llvm_version: ${{ steps.versions.outputs.llvm_version }}
       swift_version: ${{ steps.versions.outputs.swift_version }}
@@ -156,9 +156,11 @@ jobs:
           path: swift-source
           key: swift-src-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}
 
-      # LLVM for macOS (the compiler that does the work) and for iOS (the one
-      # that is shipped and that rustc links against).
-      - name: Build LLVM (macOS + iOS)
+      # Swift 6.4's build-script builds the two LLVM trees (macOS: the compiler
+      # that does the work, iOS: the one that is shipped and that rustc links
+      # against) and the two Swift compilers in one invocation; see
+      # Scripts/build-swift-toolchain.sh. ~4 hours on a 3-core runner.
+      - name: Build Swift + LLVM for iOS
         run: |-
           set -o pipefail
           echo "===== swift llvm =====" | tee -a swift.log
@@ -187,11 +189,11 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      - name: Build the iOS Swift compiler
+      - name: Collect the iOS Swift compiler
         run: |-
           set -o pipefail
-          echo "===== swift swift =====" | tee -a swift.log
-          Scripts/build-swift-toolchain.sh swift 2>&1 | tee -a swift.log
+          echo "===== swift install-swift =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh install-swift 2>&1 | tee -a swift.log
 
       - name: Verify the Swift toolchain
         run: |-
@@ -283,7 +285,7 @@ jobs:
     # environment). Non-iOS binaries make `verify`/`package` fail.
     needs: swift
     timeout-minutes: 300
-    runs-on: macos-14
+    runs-on: macos-latest
     outputs:
       rust_version: ${{ steps.version.outputs.rust_version }}
 

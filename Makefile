@@ -83,9 +83,10 @@ llvm:
 		echo "RUST_LLVM_MODE=$(RUST_LLVM_MODE): bootstrap builds LLVM itself"; \
 	fi
 
-# The full iOS Swift toolchain (a compiler, not just the LLVM).
+# The full iOS Swift toolchain (a compiler, not just the LLVM). `llvm` has
+# already run the build; this only collects the compiler.
 swift: llvm
-	$(SWIFT_SCRIPT) swift && $(SWIFT_SCRIPT) verify && $(SWIFT_SCRIPT) package
+	$(SWIFT_SCRIPT) install-swift && $(SWIFT_SCRIPT) verify && $(SWIFT_SCRIPT) package
 
 fetch:
 	$(SCRIPT) fetch

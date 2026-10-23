@@ -102,7 +102,7 @@ gh workflow run build-rust-ios.yml -f rust_version=1.94.0 -f ios_deployment_targ
 git tag v1.94.0 && git push origin v1.94.0
 ```
 
-ワークフローは `macos-14`（Apple Silicon）で、2 つのジョブに分かれています。
+ワークフローは `macos-latest`（Apple Silicon）で、2 つのジョブに分かれています。
 
 1. `swift` — Swift 6.4 と LLVM 21.1.6 を iOS 向けにビルドし、`SwiftLLVM` /
    `SwiftToolchain` / `LLVM.xcframework` を artifact として上げる（約 4 時間）

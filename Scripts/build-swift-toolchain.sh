@@ -106,7 +106,8 @@ swift_dir() {
 llvm_version() {
     local f="${SWIFT_WORKSPACE_DIR}/llvm-project/cmake/Modules/LLVMVersion.cmake"
     if [[ -f "${f}" ]]; then
-        sed -n 's/.*set(LLVM_VERSION_\(MAJOR\|MINOR\|PATCH\) \([0-9]*\)).*/\2/p' "${f}" \
+        # -E: BSD sed (macOS) does not support \| in a basic regex.
+        sed -n -E 's/.*set\(LLVM_VERSION_(MAJOR|MINOR|PATCH) ([0-9]+)\).*/\2/p' "${f}" \
             | head -3 | paste -sd. -
         return
     fi
@@ -249,13 +250,18 @@ build_swift() {
     sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
     [[ -d "${sdk}" ]] || die "could not find the iPhoneOS SDK"
 
-    local args=(--preset-file="${SWIFT_PRESET_FILE}" --preset="${SWIFT_CROSS_PRESET}")
     case "${phase}" in
-        llvm)  args+=(--skip-build-swift) ;;
-        swift) args+=(--skip-build-llvm) ;;
-        all)   ;;
-        *)     die "unknown build phase: ${phase} (llvm|swift|all)" ;;
+        llvm|swift|all) ;;
+        *) die "unknown build phase: ${phase} (llvm|swift|all)" ;;
     esac
+
+    # Swift 6.4's build-script expands the preset *before* it parses the
+    # product switches, so `--skip-build-swift` / `--skip-build-llvm` cannot be
+    # combined with `--preset` (they are rejected as unknown arguments). Both
+    # LLVM trees and both compilers are therefore built by one invocation; the
+    # build directory is incremental, so calling this again after a completed
+    # build is cheap. `phase` only decides what is *installed* afterwards.
+    local args=(--preset-file="${SWIFT_PRESET_FILE}" --preset="${SWIFT_CROSS_PRESET}")
 
     refresh_cmark_cache
 
@@ -704,6 +710,7 @@ commands:
   fetch             clone swift ${SWIFT_BRANCH} and its sibling repositories (llvm-project, ...)
   llvm              build LLVM + Clang for macOS and iOS (needed by both compilers)
   swift             build the Swift compiler for iOS and collect it in ${SWIFT_INSTALL_DIR}
+  install-swift     collect the iOS Swift compiler (after a build)
   install-llvm      write the relocatable LLVM trees used by the Rust build
   package           create ${SWIFT_TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-<ver>.tar.xz
   package-llvm      create SwiftLLVM-${PACKAGE_PREFIX}-<llvm>.tar.xz
@@ -716,8 +723,10 @@ environment: SWIFT_BRANCH, IOS_DEPLOYMENT_TARGET, LLVM_TARGETS, SWIFT_SOURCE_DIR
              SWIFT_BUILD_ROOT, SWIFT_BUILD_SUBDIR, SWIFT_INSTALL_DIR, SWIFT_LLVM_DIR,
              WORK_DIR, ARTIFACTS_DIR
 
-'build' is split into 'llvm' and 'swift' so that the LLVM artifacts (which the
-Rust compiler needs) are available before the long Swift compiler build starts.
+'llvm' and 'swift' run the same build-script invocation (Swift 6.4 builds the
+LLVM trees and the compilers in one go) and then collect the LLVM or the Swift
+compiler respectively. CI calls 'llvm' first and 'install-swift' afterwards, so
+the shared LLVM artifact exists before the Swift toolchain is packaged.
 EOF
 }
 
@@ -725,8 +734,11 @@ main() {
     local cmd="${1:-}"
     case "${cmd}" in
         fetch)            fetch ;;
+        # both build the same thing (see build_swift); the name says what is
+        # collected afterwards
         llvm)             build_swift llvm; install_llvm ;;
-        swift)            build_swift swift; install_swift ;;
+        swift)            build_swift swift; install_llvm; install_swift ;;
+        install-swift)    install_swift ;;
         install-llvm)     install_llvm ;;
         package)          package_swift ;;
         package-llvm)     package_llvm ;;
