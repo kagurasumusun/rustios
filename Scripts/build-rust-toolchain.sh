@@ -189,7 +189,7 @@ write_build_info() {
 # an artifact (LLVM's llvm-config, a host std, ...). Every shipped Mach-O must
 # be arm64 and - when vtool is available - claim `platform IOS`.
 assert_ios_only() {
-    local dir="$1" label="$2" file desc build_info
+    local dir="$1" label="$2" exclude="${3:-}" file desc build_info
     local bad=()
     [[ -d "${dir}" ]] || return 0
     while IFS= read -r -d '' file; do
@@ -205,7 +205,8 @@ assert_ios_only() {
                 bad+=("${file}: $(printf '%s' "${build_info}" | sed -n 's/^ *platform //p' | sed -n 1p)")
             fi
         fi
-    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' \) -print0)
+    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' \) \
+                  ${exclude:+-not -path "${dir}/${exclude}/*"} -print0)
 
     if [[ "${#bad[@]}" -gt 0 ]]; then
         printf '  %s\n' "${bad[@]}" >&2
@@ -592,7 +593,10 @@ verify() {
     fi
 
     assert_ios_only "${sysroot}/bin" "the iOS toolchain (bin)"
-    assert_ios_only "${sysroot}/lib" "the iOS toolchain (lib)"
+    # bootstrap links the build machine's std (macOS) into the compiler
+    # sysroot; packaging deletes it, so it is not part of the product.
+    assert_ios_only "${sysroot}/lib" "the iOS toolchain (lib)" \
+        "rustlib/${BUILD_TRIPLE}"
 
     log "rustc, std and codegen backends are iOS/arm64 artifacts"
 }
