@@ -63,9 +63,10 @@ STAGE="${STAGE:-2}"
 # an LLVM with the same target set. In `swift` mode the value is inert
 # (bootstrap does not build LLVM; the shared LLVM reports its own targets via
 # llvm-config --targets-built); in `intree` mode it makes bootstrap's LLVM
-# match the Swift one. AArch64 is what rustc emits; ARM and X86 are required
-# by compiler-rt's embedded builtins.
-LLVM_TARGETS="${LLVM_TARGETS:-AArch64;ARM;X86}"
+# match the Swift one. AArch64 is the only backend the shipped compilers
+# emit code for; compiler-rt's macho_embedded builtins (the sole ARM/X86
+# consumer) are skipped by the Swift side's codegen-probe patch.
+LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
 
 # Which LLVM the Rust compiler links against:
 #

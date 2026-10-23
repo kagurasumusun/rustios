@@ -140,7 +140,7 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 | --- | --- | --- |
 | `[llvm] download-ci-llvm` | `false` | 配布 LLVM は macOS 用で、iOS 用 rustc には使えない |
 | `[llvm] link-shared` | `false` | 静的ライブラリをリンク（`LLVM_LINK_SHARED` を立てない） |
-| `[llvm] targets` | `AArch64;ARM;X86` | **Swift プリセットの `llvm-targets-to-build` と同値**（parity.md §2）。外部 LLVM を使う `swift` モードでは未使用（bootstrap が LLVM をビルドしないため）だが、`intree` モードでは同じ構成の LLVM をビルドし、`build-info.json` には共有 LLVM の `--targets-built` が記録される |
+| `[llvm] targets` | `AArch64` | **Swift プリセットの `llvm-targets-to-build` と同値**（parity.md §2）。外部 LLVM を使う `swift` モードでは未使用（bootstrap が LLVM をビルドしないため）だが、`intree` モードでは同じ構成の LLVM をビルドし、`build-info.json` には共有 LLVM の `--targets-built` が記録される |
 | `[rust] llvm-tools` | `false` | 外部 LLVM に llvm-tools は無い。必要な `llvm-ar` 等は `SwiftLLVM/ios/bin` に同梱 |
 | `[build] build` | `aarch64-apple-darwin` | ビルドマシン |
 | `[target."aarch64-apple-darwin"]` | `llvm-config = <SwiftLLVM>/macosx/bin/llvm-config` | stage1 rustc（macOS で動く）用 |
@@ -158,15 +158,29 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 `nyxian_iphoneos_arm64_crosscompiler` を元にしたプリセットで、LLVM を 2 回
 ビルドします（同じソース、同じターゲット構成）。
 
-`llvm-targets-to-build=AArch64;ARM;X86` です。rustc と iOS の Swift が使うのは
-AArch64 だけですが、compiler-rt は runtimes の一部として `macho_embedded` 向け
-builtins を armv6m / armv7m / armv7em（ARM）と i386 / x86_64（X86）について
-ビルドします。ARM バックエンドが登録する `-arm-add-build-attributes` を clang が
-使うため、ARM を外すとそのステップが
+`llvm-targets-to-build=AArch64` です。出荷するコンパイラがコードを生成する
+のは arm64-apple-ios（デバイス）と arm64-apple-darwin（ビルドホスト）だけ
+なので、必要なバックエンドは AArch64 のみです。LLVM 既定の全ターゲットでは
+1 回のビルドが 6 時間のジョブ上限に収まらないため（実測 約 5 時間 45 分で
+タイムアウト）、絞っています。
+
+ARM/X86 バックエンドを必要としていたのは compiler-rt の `macho_embedded`
+builtins（armv6m / armv7m / armv7em / armv7 / armv8m.main / armv8.1m.main と
+i386 / x86_64 のベアメタル用ライブラリで、本リポジトリの成果物はどれも
+使いません）だけです。この Gate は `COMPILER_RT_SUPPORTED_ARCH` に armv\* が
+含まれるかで開閉しますが、同リストはホストのリンカ由来のため、AArch64 単独
+ビルドでも開いてしまい、実際に生成されたライブラリのコンパイルが
+`unable to create target: "thumbv6m-apple-unknown-macho"` /
 `Unknown command line argument '-arm-add-build-attributes'` で失敗します
-（CI で確認）。反対に LLVM 既定の全ターゲットでは 1 回のビルドが 6 時間の
-ジョブ上限に収まらなかったため（実測 約 5 時間 45 分でタイムアウト）、
-必要な 3 つに絞っています。
+（両方とも CI で確認）。そこで `build-swift-toolchain.sh` の fetch は
+`patch_compiler_rt_macho_embedded` でこの Gate に「ビルド中の clang が
+armv6m / i386 のコードを本当に生成できるか」のプローブ（-c コンパイル）を
+追加します。生成できない構成（AArch64 単独）では macho_embedded のみ
+スキップされ、ツールチェーンが出荷する arm64/arm64e のプラットフォーム
+builtins（`clang_rt.builtins*_ios/_iossim/_osx`）は影響を受けません
+（AArch64 単独でも正常にビルドされることを CI ログで確認済み）。全ターゲット
+ビルド（LLVM-On-iOS 相当）ではプローブが成功するため、 upstream と完全に
+同じ挙動です。
 
 | 出力 | 用途 |
 | --- | --- |
@@ -233,8 +247,8 @@ shim は呼ばれるたびに `<prefix>/llvm-config.log` に引数を記録し�
 
 | ファイル | 変更 |
 | --- | --- |
-| `Scripts/build-swift-toolchain.sh` | Swift 6.4 + LLVM 21.1.6 を iOS 向けにビルドし、`SwiftLLVM/{macosx,ios}` と `SwiftToolchain` を作る。パッケージは LLVM-On-iOS と同名（`SwiftToolchain.zip`、`LLVM.xcframework`（llvm.a は libswift\*/libclang\*/liblld\*/libLLVM\*/cmark の結合、Headers は同順の結合）、`CoreCompilerSupportLibs`） |
-| `Scripts/swift-ios-toolchain-presets.ini` | LLVM-On-iOS 相当のプリセット（RTTI 有効、iOS 16.0）。`llvm-targets-to-build=AArch64;ARM;X86` と ZLIB/TERMINFO OFF のみ意図的差分（parity.md §3）。`llvm-install-components` 行は両ツールチェーンのツール一覧の唯一の出所 |
+| `Scripts/build-swift-toolchain.sh` | Swift 6.4 + LLVM 21.1.6 を iOS 向けにビルドし、`SwiftLLVM/{macosx,ios}` と `SwiftToolchain` を作る。パッケージは LLVM-On-iOS と同名（`SwiftToolchain.zip`、`LLVM.xcframework`（llvm.a は libswift\*/libclang\*/liblld\*/libLLVM\*/cmark の結合、Headers は同順の結合）、`CoreCompilerSupportLibs`）。fetch 時のソースパッチは lld Mach-O・swift CMakeLists に加え `patch_compiler_rt_macho_embedded`（AArch64 単独ビルド用、§3） |
+| `Scripts/swift-ios-toolchain-presets.ini` | LLVM-On-iOS 相当のプリセット（RTTI 有効、iOS 16.0）。`llvm-targets-to-build=AArch64` と ZLIB/TERMINFO OFF のみ意図的差分（parity.md §3）。`llvm-install-components` 行は両ツールチェーンのツール一覧の唯一の出所 |
 | `Scripts/llvm-config-shim.py` | 再配置可能な `llvm-config` の生成 |
 | `Scripts/build-rust-toolchain.sh` | `RUST_LLVM_MODE=swift`（既定）。`bootstrap.toml` に `[target.*] llvm-config` と `llvm-has-rust-patches=false` を書き、`src/llvm-project` を fetch せず、`llvm-tools=false`、`[llvm] targets` はプリセットと同値。`verify` で LLVM の出所を証明。パッケージは Swift 側と 1 対 1（`RustToolchain.zip`（LLVM ツール同梱）、`Rust.xcframework`（`rust.a`）、`RustSupportLibs`、`RustStd`） |
 | `.github/workflows/build-rust-ios.yml` | `swift` ジョブ（Swift + LLVM）→ `build` ジョブ（Rust）の 2 段構成。LLVM のキャッシュを廃止し、`SwiftLLVM.tar.xz` artifact で受け渡す |

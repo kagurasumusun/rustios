@@ -73,9 +73,12 @@ SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${WORK_DIR}/SwiftLLVM}"
 # LLVM backends. Must match `llvm-targets-to-build` in the preset; the Rust
 # side ([llvm] targets in bootstrap.toml) uses the same value, so that both
 # compilers are built against an LLVM with an identical target set. AArch64 is
-# what the shipped compilers use; ARM and X86 are required by compiler-rt's
-# embedded builtins (see the preset).
-LLVM_TARGETS="${LLVM_TARGETS:-AArch64;ARM;X86}"
+# the only backend the shipped compilers emit code for (arm64-apple-ios on
+# device, arm64-apple-darwin on the build host). The sole ARM/X86 consumer was
+# compiler-rt's macho_embedded builtins; patch_compiler_rt_macho_embedded
+# (below) makes them skip cleanly when those backends are absent, and LLVM's
+# full target set does not fit the 6 h CI limit anyway (see the preset).
+LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
 
 # Artifact names - exactly the ones emexlab/LLVM-On-iOS ships (plus the
 # rustios-only SwiftLLVM tree). No platform/version suffixes: the versions are
@@ -254,6 +257,7 @@ fetch() {
 
     patch_lld_macho
     patch_swift_cmake_triple
+    patch_compiler_rt_macho_embedded
 
     log "swift ${SWIFT_BRANCH} ($(swift_commit)), llvm-project $(llvm_commit), LLVM $(llvm_version)"
 }
@@ -316,6 +320,85 @@ if count == 0:
     sys.exit(1)
 path.write_text(new)
 print("patched swift CMakeLists.txt: SWIFT_HOST_TRIPLE -> CMAKE_Swift_COMPILER_TARGET")
+PY
+}
+
+# compiler-rt's "macho_embedded" builtins (armv6m/armv7m/armv7em/armv7/
+# armv8m.main/armv8.1m.main, i386, x86_64 - bare-metal/embedded libraries no
+# rustios artifact uses) are gated on COMPILER_RT_SUPPORTED_ARCH listing an
+# armv* arch. That list is seeded from the *host linker's* capabilities and
+# reaches the builtins sub-build through the runtimes passthrough cache, so
+# the gate opens even when the LLVM being built has no ARM backend
+# (llvm-targets-to-build=AArch64), and every macho_embedded object then fails
+# with the just-built clang - both errors observed in CI:
+#   error: unable to create target: 'No available targets are compatible with
+#          triple "thumbv6m-apple-unknown-macho"'
+#   clang (LLVM option parsing): Unknown command line argument
+#          '-arm-add-build-attributes'
+# The upstream comment on the gate calls it a "hacky opt-out. If you can't
+# target both intel and arm architectures we bail here"; this patch implements
+# that intent by probing real codegen (-c instantiates a backend, unlike the
+# arch tests, which the builtins sub-build runs compile-only) for one arch per
+# backend family these libraries need. All-target builds (emexlab/LLVM-On-iOS)
+# pass the probes and behave exactly as upstream; the arm64/arm64e platform
+# builtins the toolchains do ship (clang_rt.builtins*_osx/_ios/_iossim) are
+# untouched - CI showed them building fine with an AArch64-only LLVM.
+patch_compiler_rt_macho_embedded() {
+    local file="${SWIFT_WORKSPACE_DIR}/llvm-project/compiler-rt/cmake/Modules/CompilerRTDarwinUtils.cmake"
+    [[ -f "${file}" ]] || die "missing ${file}; cannot apply the macho_embedded probe patch"
+    if grep -q "rustios_macho_embedded_ok" "${file}"; then
+        return 0
+    fi
+    python3 - "${file}" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+anchor = '  if(COMPILER_RT_SUPPORTED_ARCH MATCHES ".*armv.*")\n'
+if text.count(anchor) != 1:
+    sys.stderr.write("macho_embedded gate anchor not found in CompilerRTDarwinUtils.cmake\n")
+    sys.exit(1)
+probe = '''  # rustios: probe real codegen before configuring the macho_embedded
+  # builtins - see patch_compiler_rt_macho_embedded in
+  # Scripts/build-swift-toolchain.sh. The gate below keys off
+  # COMPILER_RT_SUPPORTED_ARCH, which can list armv* even when the LLVM being
+  # built has no ARM backend; the library builds then fail with the just-built
+  # clang. Bail out (as the "hacky opt-out" comment intends) unless the
+  # compiler can actually emit code for both backend families these libraries
+  # need (ARM and X86).
+  set(rustios_macho_embedded_ok TRUE)
+  set(rustios_probe_sysroot)
+  if(DARWIN_osx_SYSROOT)
+    set(rustios_probe_sysroot -isysroot "${DARWIN_osx_SYSROOT}")
+  endif()
+  foreach(rustios_probe_arch armv6m i386)
+    if(rustios_probe_arch STREQUAL "armv6m")
+      set(rustios_probe_flags -arch armv6m -mfloat-abi=soft)
+    else()
+      set(rustios_probe_flags -arch i386 -march=pentium)
+    endif()
+    set(rustios_probe_src
+        "${CMAKE_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/rustios_macho_embedded_probe.c")
+    file(WRITE "${rustios_probe_src}"
+         "int rustios_macho_embedded_probe(void) { return 0; }")
+    execute_process(
+      COMMAND "${CMAKE_C_COMPILER}" -target arm64-apple-darwin
+              ${rustios_probe_flags} ${rustios_probe_sysroot}
+              -ffreestanding -w
+              -c "${rustios_probe_src}" -o "${rustios_probe_src}.o"
+      RESULT_VARIABLE rustios_probe_result
+      OUTPUT_QUIET ERROR_QUIET)
+    if(NOT rustios_probe_result EQUAL 0)
+      set(rustios_macho_embedded_ok FALSE)
+      message(STATUS "rustios: the compiler being built cannot emit "
+                     "${rustios_probe_arch} code (restricted "
+                     "llvm-targets-to-build); skipping macho_embedded builtins")
+      break()
+    endif()
+  endforeach()
+'''
+gate = '  if(COMPILER_RT_SUPPORTED_ARCH MATCHES ".*armv.*" AND rustios_macho_embedded_ok)\n'
+path.write_text(text.replace(anchor, probe + gate, 1))
+print("patched compiler-rt: macho_embedded builtins probe real codegen first")
 PY
 }
 

@@ -43,9 +43,10 @@ RUST_LLVM_MODE        ?= swift
 SWIFT_BRANCH          ?= swift-6.4.0-RELEASE
 STAGE                 ?= 2
 # Same target set as `llvm-targets-to-build` in the Swift preset: both
-# compilers are built against an LLVM with identical backends (AArch64 for
-# the shipped code, ARM/X86 for compiler-rt's embedded builtins).
-LLVM_TARGETS          ?= AArch64;ARM;X86
+# compilers are built against an LLVM with identical backends. AArch64 is the
+# only backend the shipped code emits; compiler-rt's macho_embedded builtins
+# (the sole ARM/X86 consumer) are skipped by the Swift side's probe patch.
+LLVM_TARGETS          ?= AArch64
 JOBS                  ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 BUILD_XCFRAMEWORK     ?= true
 

@@ -172,7 +172,7 @@ make RUST_LLVM_MODE=intree   # 比較用: rust-lang 版 LLVM を bootstrap に�
 | `OS_VER` / `IOS_DEPLOYMENT_TARGET` | `16.0` | iOS deployment target（LLVM-On-iOS と同じ） |
 | `HOST_TRIPLE` | `aarch64-apple-ios` | 生成する rustc が動くプラットフォーム |
 | `STAGE` | `2` | bootstrap のステージ |
-| `LLVM_TARGETS` | `AArch64;ARM;X86` | LLVM バックエンド。**Swift プリセットの `llvm-targets-to-build` と同値**に固定（`swift` モードでは共有 LLVM が既にこの構成、`intree` モードでは bootstrap が同じ構成でビルドする） |
+| `LLVM_TARGETS` | `AArch64` | LLVM バックエンド。**Swift プリセットの `llvm-targets-to-build` と同値**に固定（`swift` モードでは共有 LLVM が既にこの構成、`intree` モードでは bootstrap が同じ構成でビルドする）。出荷コンパイラがコードを生成するのは arm64 のみ |
 | `JOBS` | CPU 数 | 並列度 |
 
 ---
@@ -442,11 +442,15 @@ int rc = rustios_run(7, argv);   /* RUSTIOS_OK=0, RUSTIOS_FAILED=1, ... */
   macOS 用と iOS 用の 2 スライスにビルドするため）。コールドビルドは
   GitHub Actions の 6 時間制限に収まらないことがあるので、キャッシュを
   温めてから実行してください。
-* `LLVM_TARGETS` は既定で `AArch64;ARM;X86`（Swift プリセットと同値）です。
+* `LLVM_TARGETS` は既定で `AArch64`（Swift プリセットと同値）です。
   共有 LLVM を使う既定構成では、この値を変えることはできません（LLVM は
   Swift のビルドが決めるため）。変えたければプリセットの
-  `llvm-targets-to-build` と一緒に変えてください（ARM/X86 を外すと
-  compiler-rt の builtins ビルドが失敗します: docs/parity.md §3）。
+  `llvm-targets-to-build` と一緒に変えてください。ARM/X86 バックエンドを
+  必要とするのは compiler-rt の macho_embedded builtins（どの成果物も使わない
+  ベアメタル用ライブラリ）だけで、fetch 時のパッチ
+  （`patch_compiler_rt_macho_embedded`）が実際のコード生成をプローブして
+  バックエンドが無い構成ではスキップするため、AArch64 単独でビルドできます
+  （詳細: docs/parity.md §3）。
 
 ---
 

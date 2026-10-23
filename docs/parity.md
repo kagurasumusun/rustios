@@ -67,7 +67,7 @@ Swift 側は LLVM-On-iOS の `nyxian_iphoneos_arm64_crosscompiler` プリセッ�
 | --- | --- | --- | --- |
 | LLVM ソース | swiftlang/llvm-project（`swift-6.4.0-RELEASE` の update-checkout） | `[target.*] llvm-config = SwiftLLVM/{macosx,ios}/bin/llvm-config`（同じビルド成果物） | ✅ 同一ビルド |
 | LLVM バージョン | 21.1.6 | 要件 ≥ 20（bootstrap のチェック）、実際は 21.1.6（`build-info.json` に記録） | ✅ |
-| LLVM ターゲット | `llvm-targets-to-build=AArch64;ARM;X86` | `[llvm] targets = "AArch64;ARM;X86"`（intree モード時のみ実効。swift モードでは `--targets-built` が同じ値を報告し `build-info.json` に記録） | ✅ 同値 |
+| LLVM ターゲット | `llvm-targets-to-build=AArch64` | `[llvm] targets = "AArch64"`（intree モード時のみ実効。swift モードでは `--targets-built` が同じ値を報告し `build-info.json` に記録） | ✅ 同値 |
 | ビルドタイプ | `release` | `[llvm] optimize = true`、`[rust] optimize = true` | ✅ |
 | アサーション | `no-assertions` 系 + `LLVM_ENABLE_ASSERTIONS=OFF` | `[llvm] assertions = false`（debug-assertions も off） | ✅ |
 | RTTI | `LLVM_ENABLE_RTTI=ON` | `llvm-config --has-rtti` = YES を rustc_llvm が採用（`--cxxflags` に `-fno-rtti` が混ざらない） | ✅ 共有 LLVM により強制一致 |
@@ -103,7 +103,7 @@ Swift 側のビルドは LLVM-On-iOS と同一を目標としますが、次の 
 
 | 差分 | LLVM-On-iOS | rustios | 理由（根拠） |
 | --- | --- | --- | --- |
-| `llvm-targets-to-build` | 指定なし（LLVM 既定 = 全ターゲット） | `AArch64;ARM;X86` | 全ターゲットは GitHub  hosted macOS ランナーの 6 時間制限に収まらない（実測 約 5 h 45 m でタイムアウト）。AArch64 単独は compiler-rt の macho_embedded builtins（armv6m/armv7m/armv7em, i386/x86_64）が ARM/X86 バックエンドを要求して失敗（CI で `Unknown command line argument '-arm-add-build-attributes'` を確認）。出荷コンパイラが狙うのは arm64-apple-ios のみで、3 ターゲットで機能は変わらない |
+| `llvm-targets-to-build` | 指定なし（LLVM 既定 = 全ターゲット） | `AArch64` | 全ターゲットは GitHub  hosted macOS ランナーの 6 時間制限に収まらない（実測 約 5 h 45 m でタイムアウト）。出荷コンパイラがコードを生成するのは arm64-apple-ios / arm64-apple-darwin のみで、AArch64 単独で機能は変わらない。ARM/X86 バックエンドを要求していた compiler-rt の macho_embedded builtins（armv6m〜armv8.1m, i386/x86_64 のベアメタル用ライブラリ。どの成果物も使わない）は、fetch 時のパッチ `patch_compiler_rt_macho_embedded` が実際のコード生成をプローブしてスキップする（AArch64 単独での旧失敗 `unable to create target: "thumbv6m-apple-unknown-macho"` / `Unknown command line argument '-arm-add-build-attributes'` はともに CI で確認済み。arm64/arm64e のプラットフォーム builtins は AArch64 単独でも正常にビルドされることを同じ CI ログで確認済み）。結果として `SwiftToolchain/usr/lib/clang/21/lib/darwin/macho_embedded/` は LLVM-On-iOS より欠けるが、iOS arm64 のユーザー空間リンクはプラットフォーム builtins（`clang_rt.builtins*_ios` 等）で行われ、影響はない |
 | `-DLLVM_ENABLE_ZLIB=OFF` | 指定なし（既定 ON） | OFF | rustc_llvm/build.rs はクロスビルド時 `--system-libs` を**リンクしない**（"Don't link system libs if cross-compiling"）。zlib ON の LLVM アーカイブは libz シンボルが未解決のまま iOS rustc のリンクに渡る。Rust 公式 bootstrap 自体も apple-ios の in-tree LLVM で `LLVM_ENABLE_ZLIB=OFF` を強制している（llvm.rs: "Zlib fails to link properly"） |
 | `-DLLVM_ENABLE_TERMINFO=OFF` | 指定なし（既定 ON） | OFF | 同上。terminfo/curses 系シンボルが iOS リンクで未解決になるのを防ぐ |
 
