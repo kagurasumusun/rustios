@@ -43,6 +43,9 @@ on:
 
 permissions:
   contents: write
+  # The build reports its outcome (and the reason for a failure) as a PR
+  # comment, because the job logs are not reachable from everywhere.
+  pull-requests: write
 
 concurrency:
   group: build-rust-ios-${{ github.ref }}
@@ -167,13 +170,19 @@ jobs:
           key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
 
       - name: Configure bootstrap
-        run: Scripts/build-rust-toolchain.sh configure
+        run: |
+          set -o pipefail
+          echo "===== configure =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh configure 2>&1 | tee -a build.log
 
       # Build in two stages and cache in between: whichever LLVM stage 1
       # needs is already expensive on a cold runner, and a stage-2 timeout
       # (the job is limited to 6 h) must not throw it away.
       - name: Build stage 1
-        run: STAGE=1 Scripts/build-rust-toolchain.sh build
+        run: |
+          set -o pipefail
+          echo "===== build stage 1 =====" | tee -a build.log
+          STAGE=1 Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
 
       - name: Save LLVM build trees (after stage 1)
         if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
@@ -187,20 +196,35 @@ jobs:
           key: rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}-stage1
 
       - name: Build stage 2 (final rustc)
-        run: Scripts/build-rust-toolchain.sh build
+        run: |
+          set -o pipefail
+          echo "===== build stage 2 =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
 
       - name: Verify artifacts
-        run: Scripts/build-rust-toolchain.sh verify
+        run: |
+          set -o pipefail
+          echo "===== verify =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh verify 2>&1 | tee -a build.log
 
       - name: Package RustToolchain
-        run: Scripts/build-rust-toolchain.sh package
+        run: |
+          set -o pipefail
+          echo "===== package =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh package 2>&1 | tee -a build.log
 
       - name: Package support libraries
-        run: Scripts/build-rust-toolchain.sh support
+        run: |
+          set -o pipefail
+          echo "===== support =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh support 2>&1 | tee -a build.log
 
       - name: Build Rust.xcframework
         if: env.BUILD_XCFRAMEWORK == 'true'
-        run: Scripts/build-rust-toolchain.sh xcframework
+        run: |
+          set -o pipefail
+          echo "===== xcframework =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee -a build.log
 
       - name: Upload RustToolchain + support libraries
         if: always()
@@ -229,6 +253,7 @@ jobs:
         with:
           name: rustios-logs-${{ env.RUST_VERSION }}
           path: |
+            build.log
             rust-source/build/*.log
             rust-source/build/**/*.log
           if-no-files-found: ignore
@@ -246,6 +271,53 @@ jobs:
             rust-source/build/x86_64-apple-darwin/llvm
             rust-source/build/aarch64-apple-ios/llvm
           key: rust-llvm-${{ env.CACHE_VERSION }}-${{ env.LLVM_CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}-stage2
+
+      # Job logs are only downloadable from GitHub's blob storage, which is not
+      # reachable from every environment; a PR comment with the tail of
+      # build.log is. It is edited in place on every run, so the PR never fills
+      # up with bot comments.
+      - name: Report to pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### rustios build: ${JOB_STATUS}"
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "| artifact | size |"
+              echo "| --- | --- |"
+              for f in artifacts/*.tar.xz; do
+                if [ -e "$f" ]; then
+                  echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+                fi
+              done
+              echo
+              echo "SHA-256:"
+              echo
+              echo '```'
+              cat artifacts/SHA256SUMS.txt 2>/dev/null || echo "(no checksums)"
+              echo '```'
+            else
+              echo "Build failed. Tail of build.log:"
+              echo
+              echo '```'
+              if [ -s build.log ]; then
+                tail -c 50000 build.log | tail -n 300
+              else
+                echo "(build.log is empty - the failure happened before the first command)"
+              fi
+              echo '```'
+            fi
+          } > report.md
+          gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" \
+            --body-file report.md --edit-last --create-if-none
 
       - name: Summary
         if: always()
