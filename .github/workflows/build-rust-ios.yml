@@ -58,7 +58,9 @@ env:
   BUILD_XCFRAMEWORK: ${{ github.event.inputs.build_xcframework || 'true' }}
   # Bump these to invalidate the caches below (e.g. after changing configure).
   CACHE_VERSION: "1"
-  LLVM_CACHE_VERSION: "1"
+  # Bump when the LLVM/CMake configuration changes, so a stale LLVM tree is
+  # never restored (bootstrap trusts the build stamps inside it).
+  LLVM_CACHE_VERSION: "2"
   # Never export SDKROOT: the build host is macOS, only the iOS compilation
   # should see the iPhoneOS SDK (the script handles that itself).
   CARGO_INCREMENTAL: "0"
@@ -186,7 +188,7 @@ jobs:
 
       - name: Save LLVM build trees (after stage 1)
         continue-on-error: true
-        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: |
@@ -264,7 +266,7 @@ jobs:
       # run (ninja/cmake pick up where they left off).
       - name: Save LLVM build trees (final)
         continue-on-error: true
-        if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: |
