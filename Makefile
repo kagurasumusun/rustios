@@ -81,7 +81,9 @@ package: verify
 support: package
 	$(SCRIPT) support
 
-xcframework: support
+# The xcframework only needs the built toolchain (stage1 rustc + stage2 sysroot),
+# not the packaged support libraries.
+xcframework: verify
 	$(SCRIPT) xcframework
 
 info:

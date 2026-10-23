@@ -1,10 +1,15 @@
 //! rustios driver: exposes the Rust compiler through a small C ABI so that an
 //! iOS app can embed `rustc` as a library.
 //!
-//! This crate is compiled as a `staticlib` for `aarch64-apple-ios` and then
-//! wrapped into `Rust.xcframework` (see `Scripts/build-rust-toolchain.sh`).
-//! It is the rustios counterpart of the `LLVM.xcframework` produced by
+//! This crate is compiled as a `cdylib` for `aarch64-apple-ios` and wrapped
+//! into `Rust.xcframework` (see `Scripts/build-rust-toolchain.sh`). It is the
+//! rustios counterpart of the `LLVM.xcframework` produced by
 //! emexlab/LLVM-On-iOS.
+//!
+//! The result is dynamic: rustc cannot be archived into a static library
+//! because upstream declares `rustc_driver` as `crate-type = ["dylib"]`. The
+//! framework therefore contains this shim plus the `rustc_driver` and `std`
+//! dylibs it loads, and all of them have to be embedded in the app.
 //!
 //! The C interface lives in `include/rustios.h`.
 //!
@@ -16,7 +21,8 @@
 
 extern crate rustc_driver;
 
-use std::ffi::{CStr, CString, c_char, c_int};
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 

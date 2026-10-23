@@ -149,31 +149,47 @@ extra plumbing on iOS (see the README).
 EOF
 }
 
+# write_build_info <directory> [extra "key": value lines...]
 write_build_info() {
     local dest="$1"
-    cat > "${dest}/build-info.json" <<EOF
-{
-  "name": "rustios",
-  "rust_version": "${RUST_VERSION}",
-  "rust_channel": "${RUST_CHANNEL}",
-  "build_triple": "${BUILD_TRIPLE}",
-  "host_triple": "${HOST_TRIPLE}",
-  "target": "${HOST_TRIPLE}",
-  "ios_deployment_target": "${IOS_DEPLOYMENT_TARGET}",
-  "llvm_targets": "${LLVM_TARGETS}",
-  "stage": ${STAGE},
-  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
+    shift
+
+    local entries=(
+        '"name": "rustios"'
+        '"rust_version": "'${RUST_VERSION}'"'
+        '"rust_channel": "'${RUST_CHANNEL}'"'
+        '"build_triple": "'${BUILD_TRIPLE}'"'
+        '"host_triple": "'${HOST_TRIPLE}'"'
+        '"target": "'${HOST_TRIPLE}'"'
+        '"ios_deployment_target": "'${IOS_DEPLOYMENT_TARGET}'"'
+        '"llvm_targets": "'${LLVM_TARGETS}'"'
+        '"stage": '${STAGE}
+        '"built_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"'
+    )
+    local entry first=1
+
+    {
+        printf '{\n'
+        for entry in "${entries[@]}" "$@"; do
+            if [[ "${first}" -eq 1 ]]; then
+                first=0
+            else
+                printf ',\n'
+            fi
+            printf '  %s' "${entry}"
+        done
+        printf '\n}\n'
+    } > "${dest}/build-info.json"
 }
 
 # Ad-hoc sign every Mach-O in the tree. iOS refuses to execute unsigned code;
 # an ad-hoc signature is enough once the app itself is signed.
 sign_tree() {
-    local dir="$1" file
+    local dir="$1" file desc
     require_cmd codesign
     while IFS= read -r -d '' file; do
-        if file -b "${file}" | grep -q 'Mach-O'; then
+        desc="$(file -b "${file}" 2>/dev/null || true)"
+        if [[ "${desc}" == *Mach-O* ]]; then
             codesign --force --sign - --timestamp=none "${file}" >/dev/null 2>&1 \
                 || warn "failed to sign ${file}"
         fi
@@ -337,7 +353,7 @@ build() {
 
 verify() {
     require_macos
-    local sysroot rustc
+    local sysroot rustc desc archs build_info
     sysroot="$(stage_dir)"
     rustc="${sysroot}/bin/rustc"
 
@@ -345,23 +361,44 @@ verify() {
 
     log "checking ${rustc}"
     file "${rustc}"
-    file "${rustc}" | grep -q 'Mach-O 64-bit executable arm64' \
-        || die "rustc is not an arm64 Mach-O executable"
-    lipo -archs "${rustc}" | grep -qw arm64 \
-        || die "rustc does not contain an arm64 slice"
+    desc="$(file -b "${rustc}")"
+    [[ "${desc}" == *"Mach-O 64-bit executable arm64"* ]] \
+        || die "rustc is not an arm64 Mach-O executable: ${desc}"
+    archs="$(lipo -archs "${rustc}")"
+    [[ " ${archs} " == *" arm64 "* ]] \
+        || die "rustc does not contain an arm64 slice (lipo: ${archs})"
 
     if command -v vtool >/dev/null 2>&1; then
-        vtool -show-build "${rustc}"
-        vtool -show-build "${rustc}" | grep -q 'platform IOS' \
+        build_info="$(vtool -show-build "${rustc}")"
+        printf '%s\n' "${build_info}"
+        [[ "${build_info}" == *"platform IOS"* ]] \
             || die "rustc was not linked for the iOS platform"
-        vtool -show-build "${rustc}" | grep -q "minos ${IOS_DEPLOYMENT_TARGET}" \
+        [[ "${build_info}" == *"minos ${IOS_DEPLOYMENT_TARGET}"* ]] \
             || warn "deployment target is not ${IOS_DEPLOYMENT_TARGET}"
     fi
 
-    [[ -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/lib" ]] \
-        || die "std for ${HOST_TRIPLE} is missing"
-    ls "${sysroot}/lib/rustlib/${HOST_TRIPLE}/lib"/libstd-*.rlib >/dev/null 2>&1 \
-        || die "libstd for ${HOST_TRIPLE} is missing"
+    local libdir
+    libdir="${sysroot}/lib/rustlib/${HOST_TRIPLE}/lib"
+    [[ -d "${libdir}" ]] || die "std for ${HOST_TRIPLE} is missing (${libdir})"
+    shopt -s nullglob
+    local std_rlibs=("${libdir}"/libstd-*.rlib)
+    shopt -u nullglob
+    [[ "${#std_rlibs[@]}" -gt 0 ]] || die "libstd for ${HOST_TRIPLE} is missing"
+    [[ -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" ]] \
+        || die "codegen backends for ${HOST_TRIPLE} are missing"
+
+    # bootstrap keeps the Rust dylibs the compiler itself links against in
+    # <sysroot>/lib, the target's std rlibs in <sysroot>/lib/rustlib/<host>/lib.
+    shopt -s nullglob
+    local compiler_dylibs=("${sysroot}/lib"/librustc_driver-*.dylib)
+    local std_dylibs=("${sysroot}/lib"/libstd-*.dylib)
+    shopt -u nullglob
+    if [[ "${#compiler_dylibs[@]}" -eq 0 ]]; then
+        warn "librustc_driver-*.dylib is missing from ${sysroot}/lib; Rust.xcframework will fail"
+    fi
+    if [[ "${#std_dylibs[@]}" -eq 0 ]]; then
+        warn "libstd-*.dylib is missing from ${sysroot}/lib; Rust.xcframework will fail"
+    fi
 
     log "rustc, std and codegen backends are iOS/arm64 artifacts"
 }
@@ -416,24 +453,31 @@ package() {
 # ---------------------------------------------------------------------------
 
 support() {
-    local llvm libdir dest tarball
+    local llvm rustlib dest tarball
     llvm="$(llvm_dir)"
-    libdir="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/lib"
+    rustlib="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}"
     dest="${WORK_DIR}/${SUPPORT_NAME}"
 
     [[ -d "${llvm}/lib" ]] || die "missing iOS LLVM at ${llvm}/lib; run 'build' first"
-    [[ -d "${libdir}" ]]   || die "missing std at ${libdir}; run 'build' first"
+    [[ -d "${rustlib}/lib" ]] || die "missing std at ${rustlib}/lib; run 'build' first"
 
     log "collecting iOS LLVM static libraries"
     rm -rf "${dest}"
-    mkdir -p "${dest}/llvm/lib" "${dest}/rustlib"
-    cp -a "${llvm}/lib/"*.a "${dest}/llvm/lib/" 2>/dev/null || true
-    cp -a "${llvm}/bin/llvm-config" "${dest}/llvm/" 2>/dev/null || true
-    cp -a "${libdir}" "${dest}/rustlib/lib"
+    mkdir -p "${dest}/llvm/lib" "${dest}/sysroot/lib/rustlib"
 
-    local backends
-    backends="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends"
-    [[ -d "${backends}" ]] && cp -a "${backends}" "${dest}/rustlib/"
+    shopt -s nullglob
+    local archives=("${llvm}/lib/"*.a)
+    shopt -u nullglob
+    [[ "${#archives[@]}" -gt 0 ]] || die "no static LLVM libraries in ${llvm}/lib"
+    cp -a "${archives[@]}" "${dest}/llvm/lib/"
+    if [[ -f "${llvm}/bin/llvm-config" ]]; then
+        cp -a "${llvm}/bin/llvm-config" "${dest}/llvm/"
+    fi
+
+    # The sysroot layout is what `rustc --sysroot` expects, so an app that
+    # embeds Rust.xcframework can compile user code with
+    # `--sysroot=<RustSupportLibs>/sysroot`.
+    cp -a "${rustlib}" "${dest}/sysroot/lib/rustlib/${HOST_TRIPLE}"
 
     cat > "${dest}/README.md" <<EOF
 # ${SUPPORT_NAME} (${PACKAGE_PREFIX})
@@ -443,14 +487,28 @@ LLVM-On-iOS' \`CoreCompilerSupportLibs\`.
 
 * \`llvm/lib/*.a\` - LLVM, built for ${HOST_TRIPLE}
 * \`llvm/llvm-config\` - llvm-config for ${HOST_TRIPLE}
-* \`rustlib/lib/*.rlib\` - core/std/alloc/... for ${HOST_TRIPLE}
-* \`rustlib/codegen-backends/\` - the LLVM codegen backend for ${HOST_TRIPLE}
+* \`sysroot/lib/rustlib/${HOST_TRIPLE}/lib/*.rlib\` - core/std/alloc/... for ${HOST_TRIPLE}
+* \`sysroot/lib/rustlib/${HOST_TRIPLE}/codegen-backends/\` - the LLVM codegen backend
 
-These are needed when linking \`${XCFRAMEWORK_NAME}\` into an app, or when
-building a custom rustc driver on the device.
+\`sysroot/\` is a rustc sysroot: pass it to the compiler when it runs on the
+device, e.g. through the C API in \`${XCFRAMEWORK_NAME}\`:
+
+\`\`\`c
+const char *argv[] = {
+    "rustc", "--sysroot", "/path/to/${SUPPORT_NAME}/sysroot",
+    "--emit=obj", "hello.rs", "-o", "hello.o",
+};
+\`\`\`
+
+These are also needed when linking \`${XCFRAMEWORK_NAME}\` into an app.
 EOF
 
     write_build_info "${dest}"
+
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+        log "ad-hoc signing the codegen backend"
+        sign_tree "${dest}/sysroot"
+    fi
 
     tarball="${ARTIFACTS_DIR}/${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
     log "creating ${tarball}"
@@ -460,76 +518,263 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# xcframework: rustc as a static library + C API (LLVM.xcframework analogue)
+# xcframework: Rust.xcframework (LLVM-On-iOS' LLVM.xcframework)
+#
+# rustc cannot be turned into a static archive: `rustc_driver` is declared as
+# `crate-type = ["dylib"]` in rust-lang/rust and no platform distributes a
+# static `librustc_driver.a`. The xcframework therefore contains a dynamic
+# library slice: the rustios C API shim, linked against the compiler dylib,
+# next to the compiler/runtime dylibs it loads at runtime.
 # ---------------------------------------------------------------------------
+
+# is_ios_dylib <file>: true for an arm64 Mach-O dylib linked for iOS.
+is_ios_dylib() {
+    local candidate="$1" desc build_info
+    desc="$(file -b "${candidate}" 2>/dev/null || true)"
+    [[ "${desc}" == *"Mach-O 64-bit dynamically linked shared library arm64"* ]] \
+        || return 1
+    if command -v vtool >/dev/null 2>&1; then
+        # A macOS dylib is also arm64; only the platform tells them apart.
+        # Capture the output instead of piping into `grep -q`, which would
+        # SIGPIPE vtool and fail the pipeline under `set -o pipefail`.
+        build_info="$(vtool -show-build "${candidate}" 2>/dev/null || true)"
+        [[ "${build_info}" == *"platform IOS"* ]] || return 1
+    fi
+    return 0
+}
+
+# find_ios_dylib <result-var> <prefix...>: store the first arm64 iOS dylib
+# called <prefix>-*.dylib (or <prefix>.dylib) found in the build tree.
+find_ios_dylib() {
+    local result_var="$1" prefix dir candidate
+    local matches
+    shift
+    for prefix in "$@"; do
+        for dir in "${XCFRAMEWORK_SEARCH_DIRS[@]}"; do
+            if [[ ! -d "${dir}" ]]; then
+                continue
+            fi
+            # nullglob drops unmatched *patterns*; a fully quoted name is a
+            # literal and would survive, so test it explicitly.
+            shopt -s nullglob
+            matches=("${dir}/${prefix}-"*.dylib)
+            shopt -u nullglob
+            if [[ -f "${dir}/${prefix}.dylib" ]]; then
+                matches+=("${dir}/${prefix}.dylib")
+            fi
+            # macOS ships bash 3.2, where an empty "${matches[@]}" is an
+            # unbound variable under `set -u`.
+            if [[ "${#matches[@]}" -gt 0 ]]; then
+                for candidate in "${matches[@]}"; do
+                    if is_ios_dylib "${candidate}"; then
+                        printf -v "${result_var}" '%s' "${candidate}"
+                        return 0
+                    fi
+                done
+            fi
+        done
+    done
+    return 1
+}
+
+# make_relocatable <directory>: rewrite the dylibs in <directory> so that they
+# can be shipped together in one folder inside an app bundle.
+#
+#  * every dylib gets an `@rpath/<name>` install name,
+#  * every dependency on another dylib in the same directory becomes
+#    `@rpath/<name>` (bootstrap links against absolute build paths),
+#  * every dylib gets a `@loader_path` rpath so that transitive dependencies
+#    resolve to its siblings instead of the original build tree.
+make_relocatable() {
+    local dir="$1" file dep base
+    if ! command -v install_name_tool >/dev/null 2>&1 || ! command -v otool >/dev/null 2>&1; then
+        warn "install_name_tool/otool not found; leaving the dylibs as built"
+        return 0
+    fi
+
+    shopt -s nullglob
+    local dylibs=("${dir}"/*.dylib)
+    shopt -u nullglob
+    for file in "${dylibs[@]}"; do
+        base="$(basename "${file}")"
+        install_name_tool -id "@rpath/${base}" "${file}" 2>/dev/null || true
+    done
+
+    for file in "${dylibs[@]}"; do
+        while IFS= read -r dep; do
+            if [[ -z "${dep}" || "${dep}" == "@rpath/"* || "${dep}" == "@loader_path/"* ]]; then
+                continue
+            fi
+            base="$(basename "${dep}")"
+            if [[ -f "${dir}/${base}" ]]; then
+                install_name_tool -change "${dep}" "@rpath/${base}" "${file}" \
+                    || warn "could not rewrite ${dep} in $(basename "${file}")"
+            fi
+        done < <(otool -L "${file}" | awk 'NR > 1 { print $1 }')
+        install_name_tool -add_rpath "@loader_path" "${file}" >/dev/null 2>&1 || true
+    done
+}
+
+# write_xcframework_plist <path> <slice-id> <library> <has-headers>
+write_xcframework_plist() {
+    local plist="$1" slice_id="$2" library="$3" has_headers="$4"
+    local headers_entry=""
+    if [[ "${has_headers}" == "true" ]]; then
+        headers_entry='
+            <key>HeadersPath</key>
+            <string>Headers</string>'
+    fi
+    cat > "${plist}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>AvailableLibraries</key>
+    <array>
+        <dict>
+            <key>LibraryIdentifier</key>
+            <string>${slice_id}</string>
+            <key>LibraryPath</key>
+            <string>${library}</string>${headers_entry}
+            <key>SupportedArchitectures</key>
+            <array>
+                <string>arm64</string>
+            </array>
+            <key>SupportedPlatform</key>
+            <string>ios</string>
+        </dict>
+    </array>
+    <key>CFBundlePackageType</key>
+    <string>XFWK</string>
+    <key>XCFrameworkFormatVersion</key>
+    <string>1.0</string>
+</dict>
+</plist>
+EOF
+}
 
 build_xcframework() {
     require_macos
-    local stage1 stage2 out_dir merged
+    local stage1 stage2 libdir out_dir merged xcfw slice
+    local runtime_driver runtime_std library has_headers="false" c_api="false"
+    local desc archs build_info
     stage1="$(build_host_dir)"
     stage2="$(stage_dir)"
+    libdir="${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
     out_dir="${WORK_DIR}/${XCFRAMEWORK_NAME}.build"
+    xcfw="${out_dir}/${XCFRAMEWORK_NAME}"
     merged="${out_dir}/sysroot"
 
-    [[ "${STAGE}" -ge 2 ]] || die "the xcframework driver needs --stage 2 (stage1 cannot run on the build host)"
+    [[ "${STAGE}" -ge 2 ]] || die "the xcframework needs --stage 2 output (STAGE=${STAGE})"
     [[ -x "${stage1}/bin/rustc" ]] || die "missing ${stage1}/bin/rustc; run 'build' first"
-    [[ -d "${stage2}/lib/rustlib/${HOST_TRIPLE}/lib" ]] \
-        || die "missing std for ${HOST_TRIPLE}; run 'build' first"
+    [[ -d "${libdir}" ]] || die "missing ${libdir}; run 'build' first"
 
-    log "building the rustios driver static library (rustc_private)"
+    # rustc_driver is a dylib crate, so the compiler ships as a dylib.
+    # bootstrap puts it in <sysroot>/lib (the stage2 compiler's own libdir);
+    # the other entries are fallbacks for different bootstrap versions.
+    XCFRAMEWORK_SEARCH_DIRS=(
+        "${stage2}/lib"
+        "${libdir}"
+        "${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
+        "${stage1}/lib"
+    )
+    find_ios_dylib runtime_driver librustc_driver \
+        || die "no librustc_driver-*.dylib for ${HOST_TRIPLE} (searched: ${XCFRAMEWORK_SEARCH_DIRS[*]})"
+    find_ios_dylib runtime_std libstd \
+        || die "no libstd-*.dylib for ${HOST_TRIPLE} (searched: ${XCFRAMEWORK_SEARCH_DIRS[*]})"
+    log "compiler dylib: ${runtime_driver}"
+
+    log "assembling ${out_dir}"
     rm -rf "${out_dir}"
-    mkdir -p "${out_dir}/include" "${merged}/lib/rustlib"
+    mkdir -p "${out_dir}/lib" "${merged}/lib/rustlib"
 
-    # The driver is compiled by the stage1 compiler (which runs on the build
-    # machine) for ${HOST_TRIPLE}, but it needs the *host* side of the stage1
-    # sysroot (codegen backend dylibs) and the *target* side of the stage2
-    # sysroot (std + rustc_private rlibs). Merge them into one sysroot.
-    cp -a "${stage1}/lib/"*.dylib "${merged}/lib/" 2>/dev/null || true
+    # Compile the C shim with the stage1 compiler: it runs on the build machine
+    # but emits iOS/arm64 code. The sysroot is merged because the codegen
+    # backends are the stage1 (build machine) ones while rustc_driver/std for
+    # the target come from stage2.
+    if [[ "${BUILD_TRIPLE}" != "${HOST_TRIPLE}" && -d "${stage1}/lib/rustlib/${BUILD_TRIPLE}" ]]; then
+        ln -sfn "${stage1}/lib/rustlib/${BUILD_TRIPLE}" "${merged}/lib/rustlib/${BUILD_TRIPLE}"
+    fi
     ln -sfn "${stage2}/lib/rustlib/${HOST_TRIPLE}" "${merged}/lib/rustlib/${HOST_TRIPLE}"
-    cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/include/"
 
-    RUSTC_BOOTSTRAP=1 \
-    RUSTIOS_VERSION="${RUST_VERSION}" \
-    IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
-    "${stage1}/bin/rustc" \
-        --edition 2021 \
-        --crate-name rustios_driver \
-        --crate-type staticlib \
-        --target "${HOST_TRIPLE}" \
-        --sysroot "${merged}" \
-        -C opt-level=2 \
-        -C debuginfo=0 \
-        -L "dependency=${stage2}/lib/rustlib/${HOST_TRIPLE}/lib" \
-        -L "native=$(llvm_dir)/lib" \
-        -o "${out_dir}/libRustCompiler.a" \
-        "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"
+    log "building the rustios C API (rustc_private)"
+    if RUSTC_BOOTSTRAP=1 \
+       RUSTIOS_VERSION="${RUST_VERSION}" \
+       IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+       "${stage1}/bin/rustc" \
+            --edition 2021 \
+            --crate-name rustios_driver \
+            --crate-type cdylib \
+            --target "${HOST_TRIPLE}" \
+            --sysroot "${merged}" \
+            -C opt-level=2 \
+            -C debuginfo=0 \
+            -C prefer-dynamic \
+            -C "link-arg=-Wl,-install_name,@rpath/libRustCompiler.dylib" \
+            -C "link-arg=-Wl,-rpath,@loader_path" \
+            -L "dependency=${stage2}/lib" \
+            -L "dependency=${libdir}" \
+            -L "native=$(llvm_dir)/lib" \
+            -o "${out_dir}/lib/libRustCompiler.dylib" \
+            "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"; then
+        c_api="true"
+        library="libRustCompiler.dylib"
+        has_headers="true"
+        mkdir -p "${out_dir}/Headers"
+        cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
+    else
+        warn "could not build the rustc_private C API for ${HOST_TRIPLE}"
+        warn "shipping the compiler dylib itself as the framework library"
+        # Keep the original file name: the install_name inside the dylib
+        # (@rpath/librustc_driver-<hash>.dylib) has to stay resolvable.
+        library="$(basename "${runtime_driver}")"
+        cp "${runtime_driver}" "${out_dir}/lib/${library}"
+    fi
 
-    [[ -f "${out_dir}/libRustCompiler.a" ]] || die "static library was not produced"
+    # Everything the library loads at runtime has to sit next to it.
+    cp -f "${runtime_driver}" "${out_dir}/lib/"
+    cp -f "${runtime_std}" "${out_dir}/lib/"
+    make_relocatable "${out_dir}/lib"
 
-    cat > "${out_dir}/build-info.json" <<EOF
-{
-  "name": "rustios",
-  "rust_version": "${RUST_VERSION}",
-  "crate": "rustios_driver",
-  "host_triple": "${HOST_TRIPLE}",
-  "target": "${HOST_TRIPLE}",
-  "ios_deployment_target": "${IOS_DEPLOYMENT_TARGET}",
-  "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
+    local extra=('"c_api": '"${c_api}" '"library": "dynamic"')
+    write_build_info "${out_dir}" "${extra[@]}"
 
-    rm -rf "${out_dir}/${XCFRAMEWORK_NAME}"
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+        sign_tree "${out_dir}/lib"
+    fi
+
     log "creating ${XCFRAMEWORK_NAME}"
-    xcodebuild -create-xcframework \
-        -library "${out_dir}/libRustCompiler.a" \
-        -headers "${out_dir}/include" \
-        -output "${out_dir}/${XCFRAMEWORK_NAME}"
+    rm -rf "${xcfw}"
+    slice="${xcfw}/ios-arm64"
+    mkdir -p "${slice}"
+    cp -a "${out_dir}/lib/." "${slice}/"
+    if [[ "${has_headers}" == "true" ]]; then
+        cp -a "${out_dir}/Headers" "${slice}/"
+    fi
+    write_xcframework_plist "${xcfw}/Info.plist" "ios-arm64" "${library}" "${has_headers}"
+
+    # Validate the slice the same way the toolchain is validated.
+    desc="$(file -b "${slice}/${library}")"
+    [[ "${desc}" == *"Mach-O 64-bit dynamically linked shared library arm64"* ]] \
+        || die "${library} is not an arm64 dylib: ${desc}"
+    archs="$(lipo -archs "${slice}/${library}")"
+    [[ " ${archs} " == *" arm64 "* ]] || die "${library} has no arm64 slice: ${archs}"
+    if command -v vtool >/dev/null 2>&1; then
+        build_info="$(vtool -show-build "${slice}/${library}")"
+        [[ "${build_info}" == *"platform IOS"* ]] \
+            || die "${library} was not linked for iOS"
+        [[ "${build_info}" == *"minos ${IOS_DEPLOYMENT_TARGET}"* ]] \
+            || warn "${library} deployment target is not ${IOS_DEPLOYMENT_TARGET}"
+    fi
+    if [[ "${has_headers}" == "true" ]]; then
+        [[ -f "${slice}/Headers/rustios.h" ]] || die "Headers/rustios.h is missing"
+    fi
 
     local a="${ARTIFACTS_DIR}/${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
     log "creating ${a}"
     tar_xz "${out_dir}" "${XCFRAMEWORK_NAME}" "${a}"
     checksum "${a}"
-    log "xcframework: $(human_size "${a}")"
+    log "xcframework: $(human_size "${a}") (c_api=${c_api}, library=${library})"
 }
 
 # ---------------------------------------------------------------------------
@@ -550,7 +795,10 @@ rustios build configuration
   build dir             : ${BUILD_DIR}
   work dir              : ${WORK_DIR}
   artifacts dir         : ${ARTIFACTS_DIR}
-  package               : ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+  packages              : ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+                          ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}-usr.tar.xz
+                          ${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+                          ${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
 EOF
 }
 

@@ -81,7 +81,7 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
           python3 --version
-          cmake --version | head -n1
+          cmake --version | sed -n 1p
           ninja --version
           df -h /
           Scripts/build-rust-toolchain.sh info
@@ -187,12 +187,12 @@ jobs:
           retention-days: 90
 
       - name: Upload Rust.xcframework
-        if: always()
+        if: always() && env.BUILD_XCFRAMEWORK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: rustios-xcframework-${{ env.RUST_VERSION }}
           path: artifacts/Rust.xcframework-*.tar.xz
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
 
       - name: Upload build logs

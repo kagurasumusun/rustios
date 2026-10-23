@@ -24,12 +24,23 @@
  *         return rc;
  *     }
  *
- * When linking, use the static library from Rust.xcframework together with
- * the support libraries shipped in RustSupportLibs (LLVM for iOS) and the
- * iOS system libraries (libc++, libSystem), e.g.:
+ * The library is dynamic: rustc is only available as a dylib ("rustc_driver"
+ * is a dylib crate upstream), so the framework slice contains three dylibs
+ * that all have to be embedded in the app and signed:
  *
- *     clang main.c Rust.xcframework/ios-arm64/libRustCompiler.a \
- *           -ISupportLibs -LSupportLibs/llvm/lib -lLLVM... -lc++ -lSystem
+ *     Rust.xcframework/ios-arm64/libRustCompiler.dylib    <- this API
+ *     Rust.xcframework/ios-arm64/librustc_driver-*.dylib  <- the compiler
+ *     Rust.xcframework/ios-arm64/libstd-*.dylib           <- its runtime
+ *
+ * Linking by hand:
+ *
+ *     clang main.c -IRust.xcframework/ios-arm64/Headers \
+ *           -LRust.xcframework/ios-arm64 -lRustCompiler \
+ *           -Wl,-rpath,@executable_path/Frameworks
+ *
+ * In Xcode, add the three dylibs to a "Copy Files" phase that writes into
+ * "Frameworks" and enable "Code Sign On Copy" (or use "Embed & Sign"); the
+ * rpath above is where iOS looks by default.
  */
 #ifndef RUSTIOS_H
 #define RUSTIOS_H

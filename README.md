@@ -15,7 +15,7 @@
 | | LLVM-On-iOS | rustios |
 | --- | --- | --- |
 | ツールチェーン本体 | `SwiftToolchain.zip` | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` |
-| アプリに組み込む静的ライブラリ | `LLVM.xcframework`（`llvm.a` + headers） | `Rust.xcframework`（`librustc_driver` + C API） |
+| アプリに組み込むライブラリ | `LLVM.xcframework`（`llvm.a` + headers） | `Rust.xcframework`（C API + コンパイラ dylib） |
 | サポートライブラリ | `CoreCompilerSupportLibs` | `RustSupportLibs-iphoneos-arm64-<ver>.tar.xz` |
 | ターゲット | `arm64-apple-ios16.0` | `aarch64-apple-ios`（deployment target 16.0） |
 | 生成方法 | `build-script --preset=nyxian_iphoneos_arm64_crosscompiler` | `x.py build --stage 2`（クロスホスト） |
@@ -35,14 +35,22 @@ Rust 側のターゲット名は `aarch64-apple-ios` ですが、これは LLVM-
 | --- | --- |
 | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | `RustToolchain/usr/{bin,lib}` — iOS で動く `rustc`, `rustdoc`, std, codegen backend |
 | `RustToolchain-iphoneos-arm64-<ver>-usr.tar.xz` | 同じものを `usr/` 直下に持つアーカイブ（`RUST_DIR` をそのまま展開したい場合用） |
-| `RustSupportLibs-iphoneos-arm64-<ver>.tar.xz` | iOS 向け LLVM 静的ライブラリ、std rlib、codegen backend |
-| `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `librustc_driver` を静的ライブラリ化した `Rust.xcframework` + `rustios.h` |
+| `RustSupportLibs-iphoneos-arm64-<ver>.tar.xz` | iOS 向け LLVM 静的ライブラリと、`--sysroot` にそのまま渡せる `sysroot/`（std rlib + codegen backend） |
+| `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `libRustCompiler.dylib`（C API）・コンパイラ dylib・`rustios.h` を収めた `Rust.xcframework` |
 | `SHA256SUMS.txt` | 上記の SHA-256 |
 
 `Rust.xcframework` は `rustc_private`（コンパイラ内部 API）に依存するため、
 Rust のバージョンに強く依存します。ビルドに失敗した場合はワークフローが
 失敗として扱われ、**中途半端な成果物が配布されることはありません**
 （アップロードは `if-no-files-found: error`）。
+
+LLVM-On-iOS の `LLVM.xcframework` は `libtool -static` で作った `llvm.a` を
+含みますが、rustc は静的ライブラリにできません。上流の Rust は
+`rustc_driver` を `crate-type = ["dylib"]` として定義しており、どの
+プラットフォームにも `librustc_driver.a` は存在しないためです。そこで
+`Rust.xcframework` は **動的ライブラリのスライス** になり、C API の
+`libRustCompiler.dylib` と、それが実行時に読み込む
+`librustc_driver-*.dylib` / `libstd-*.dylib` を同じスライスに同梱します。
 
 ---
 
@@ -201,6 +209,37 @@ jailbreak / TrollStore 環境や、Nyxian のような IDE の中では、その
 同梱の Mach-O はすべて ad-hoc 署名（`codesign -s -`）済みです。アプリに
 組み込む場合は、アプリ本体の署名に合わせて再署名してください。
 
+### アプリから rustc を呼ぶ（`Rust.xcframework`）
+
+```sh
+tar -xJf Rust.xcframework-iphoneos-arm64-1.99.1.tar.xz
+ls Rust.xcframework/ios-arm64
+# Headers/  libRustCompiler.dylib  librustc_driver-<hash>.dylib  libstd-<hash>.dylib
+```
+
+`Headers/rustios.h` の `rustios_run()` に `rustc` と同じ引数を渡します。
+`libRustCompiler.dylib` は `@rpath` でコンパイラ dylib を探すので、3 つの
+dylib をすべてアプリの `Frameworks/` に置き、署名してください（Xcode なら
+"Embed & Sign"、手動なら `-Wl,-rpath,@executable_path/Frameworks`）。
+
+コンパイル対象の std は `RustSupportLibs` の `sysroot/` にあります。アプリに
+同梱して `--sysroot` で渡してください（`rustc` がデバイス上で動くには、
+リンカと iPhoneOS SDK も必要です）。
+
+```c
+#include <rustios.h>
+
+const char *argv[] = {
+    "rustc", "--sysroot", "/path/to/RustSupportLibs/sysroot",
+    "--emit=obj", "hello.rs", "-o", "hello.o",
+};
+int rc = rustios_run(7, argv);   /* RUSTIOS_OK=0, RUSTIOS_FAILED=1, ... */
+```
+
+`rustios_run()` は同期・非再入です。rustc はグローバル状態を持つため、
+同時に複数スレッドから呼ばないでください。ICE でプロセスが壊れる可能性が
+あるので、`RUSTIOS_ICE`（101）が返ったら以降の呼び出しは避けてください。
+
 ---
 
 ## 制約
@@ -212,6 +251,13 @@ jailbreak / TrollStore 環境や、Nyxian のような IDE の中では、その
   およびリンカ・SDK が存在することが必要です。
 * `Rust.xcframework` は `rustc_private` を使うため、Rust のバージョン間で
   互換性がありません。`build-info.json` のバージョンと合わせて使ってください。
+* `Rust.xcframework` は動的ライブラリです（`rustc_driver` が dylib のため）。
+  アプリには 3 つの dylib すべてを `Frameworks/` に埋め込み、署名してから
+  使います。Xcode の Runpath Search Paths に `@executable_path/Frameworks`
+  （既定値）が必要です。コード生成バックエンド（`RustSupportLibs/sysroot`）
+  も同じ `@rpath` で `librustc_driver` を探します。C API のビルドに失敗した
+  場合、スクリプトは警告を出してコンパイラ dylib 自体をスライスのライブラリ
+  として収めます（`build-info.json` の `"c_api": false`）。
 * ビルドには macOS ランナーと 1 時間以上の時間が必要です（LLVM を 2 回
   ビルドするため）。コールドビルドは GitHub Actions の 6 時間制限に
   収まらないことがあるので、キャッシュを温めてから実行してください。
@@ -226,7 +272,7 @@ jailbreak / TrollStore 環境や、Nyxian のような IDE の中では、その
 .github/workflows/build-rust-ios.yml   CI（ビルド + キャッシュ + Release）
 Makefile                               make all / fetch / configure / build / ...
 Scripts/build-rust-toolchain.sh        ビルド本体（fetch/configure/build/package/...）
-Scripts/rustios-driver/rustios_driver.rs   rustc を C API として公開する staticlib
+Scripts/rustios-driver/rustios_driver.rs   rustc を C API として公開する cdylib
 Scripts/rustios-driver/include/rustios.h   その C ヘッダ
 ```
 
