@@ -19,6 +19,32 @@ Rust 側から見ると「LLVM を自分でビルドする代わりに、Swift �
 
 ---
 
+## 0. 成果物の構成（Swift 側と揃える）
+
+Swift 側（LLVM-On-iOS）は「コンパイラ」「LLVM」「サポートライブラリ」が別々の
+成果物です。Rust 側も同じ形にそろえ、**std をツールチェーンから分離**しました。
+
+| Swift (LLVM-On-iOS) | rustios | 中身 |
+| --- | --- | --- |
+| `SwiftToolchain.zip` | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | コンパイラ本体（`rustc` / `rustdoc` / codegen backend / `librustc_driver*.dylib`）。**std を含まない** |
+| （対応物なし） | `RustStd-iphoneos-arm64-<ver>.tar.xz` | **std のみ**（`RustStd/usr/lib/rustlib/aarch64-apple-ios/lib/*.rlib`） |
+| `LLVM.xcframework` | `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `libRustCompiler.a` + `Headers/rustios.h` |
+| `LLVM.xcframework` | `SwiftLLVM-iphoneos-arm64-21.1.6.tar.xz` / `LLVM.xcframework-…` | **共有 LLVM**（Swift ジョブが生成。Rust 側はコピーを持たない） |
+
+以前の `RustSupportLibs`（LLVM のコピー + std）は廃止しました。LLVM は Swift の
+成果物をそのまま使うので Rust 用の複製は不要で、std は `RustStd` に移しました。
+
+`RustStd` は `RustToolchain/usr` にそのまま重ねられるので、
+
+```sh
+tar -xJf RustToolchain-iphoneos-arm64-<ver>.tar.xz
+tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した sysroot になる
+```
+
+あるいは分けたまま `rustc --sysroot="$PWD/RustStd/usr" ...` と渡せます。
+
+---
+
 ## 1. バージョンの対応関係
 
 | 項目 | 値 | 根拠 |
@@ -204,6 +230,7 @@ shim は呼ばれるたびに `<prefix>/llvm-config.log` に引数を記録し�
 | `Scripts/build-rust-toolchain.sh` | `RUST_LLVM_MODE=swift` を追加。`bootstrap.toml` に `[target.*] llvm-config` と `llvm-has-rust-patches=false` を書き、`src/llvm-project` を fetch せず、`llvm-tools=false` にし、`verify` で LLVM の出所を証明する。既定 `RUST_VERSION=1.94.0` |
 | `.github/workflows/build-rust-ios.yml` | `swift` ジョブ（Swift + LLVM）→ `build` ジョブ（Rust）の 2 段構成。LLVM のキャッシュを廃止し、`SwiftLLVM` artifact で受け渡す |
 | `Makefile` | `make llvm` / `make swift` を追加、`RUST_VERSION=1.94.0`、`RUST_LLVM_MODE=swift` |
+| `Scripts/build-rust-toolchain.sh`（パッケージ） | `RustSupportLibs` を廃止し、`RustToolchain`（コンパイラのみ）と `RustStd`（std のみ）に分割 |
 
 Rust のビルドで LLVM 用に残っているのは次の 2 つだけで、どちらも
 「LLVM を作らない」方向の変更です。

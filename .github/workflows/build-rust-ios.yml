@@ -435,11 +435,13 @@ jobs:
           echo "===== package =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh package 2>&1 | tee -a build.log
 
-      - name: Package support libraries
+      # std is packaged separately from the compiler (the largest part of the
+      # payload, and the part a device often does not need at all).
+      - name: Package std
         run: |-
           set -o pipefail
-          echo "===== support =====" | tee -a build.log
-          Scripts/build-rust-toolchain.sh support 2>&1 | tee -a build.log
+          echo "===== std =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh std 2>&1 | tee -a build.log
 
       - name: Build Rust.xcframework
         if: env.BUILD_XCFRAMEWORK == 'true'
@@ -448,14 +450,14 @@ jobs:
           echo "===== xcframework =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee -a build.log
 
-      - name: Upload RustToolchain + support libraries
+      - name: Upload RustToolchain + std
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rustios-toolchain-${{ env.RUST_VERSION }}
           path: |-
             artifacts/RustToolchain-*.tar.xz
-            artifacts/RustSupportLibs-*.tar.xz
+            artifacts/RustStd-*.tar.xz
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 90
@@ -602,7 +604,7 @@ jobs:
           * \`SwiftToolchain-*.tar.xz\` - the Swift compiler that runs on iOS
           * \`SwiftLLVM-*.tar.xz\` - the shared LLVM (macOS + iOS static libraries)
           * \`LLVM.xcframework-*.tar.xz\` - \`llvm.a\` + headers for iOS apps
-          * \`RustToolchain-*.tar.xz\` - rustc/rustdoc/std that run on iOS
-          * \`RustSupportLibs-*.tar.xz\` - LLVM + std for iOS
+          * \`RustToolchain-*.tar.xz\` - rustc/rustdoc that run on iOS (no std)
+          * \`RustStd-*.tar.xz\` - std for iOS, shipped separately
           * \`Rust.xcframework-*.tar.xz\` - the compiler as a static library with a C API"
           fi

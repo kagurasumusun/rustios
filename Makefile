@@ -10,7 +10,7 @@
 #     make build      # x.py build --stage 2 (host = target = aarch64-apple-ios)
 #     make verify     # check the produced rustc/std are iOS arm64 artifacts
 #     make package    # RustToolchain-iphoneos-arm64-<ver>.tar.xz
-#     make support    # RustSupportLibs-iphoneos-arm64-<ver>.tar.xz
+#     make std        # RustStd-iphoneos-arm64-<ver>.tar.xz (std, apart from the compiler)
 #     make xcframework  # Rust.xcframework-iphoneos-arm64-<ver>.tar.xz
 #     make clean / clean-all
 #
@@ -59,16 +59,15 @@ SCRIPT := $(CURDIR)/Scripts/build-rust-toolchain.sh
 SWIFT_SCRIPT := $(CURDIR)/Scripts/build-swift-toolchain.sh
 
 TOOLCHAIN_TARBALL := $(ARTIFACTS_DIR)/RustToolchain-$(PACKAGE_PREFIX)-$(RUST_VERSION).tar.xz
-USR_TARBALL       := $(ARTIFACTS_DIR)/RustToolchain-$(PACKAGE_PREFIX)-$(RUST_VERSION)-usr.tar.xz
-SUPPORT_TARBALL   := $(ARTIFACTS_DIR)/RustSupportLibs-$(PACKAGE_PREFIX)-$(RUST_VERSION).tar.xz
+STD_TARBALL       := $(ARTIFACTS_DIR)/RustStd-$(PACKAGE_PREFIX)-$(RUST_VERSION).tar.xz
 XCFRAMEWORK_TARBALL := $(ARTIFACTS_DIR)/Rust.xcframework-$(PACKAGE_PREFIX)-$(RUST_VERSION).tar.xz
 
 # Serial execution: every step feeds into the next one.
 .NOTPARALLEL:
 
-.PHONY: all llvm swift fetch configure build verify package support xcframework info clean clean-all
+.PHONY: all llvm swift fetch configure build verify package std xcframework info clean clean-all
 
-all: llvm fetch configure build verify package support
+all: llvm fetch configure build verify package std
 	@if [ "$(BUILD_XCFRAMEWORK)" = "true" ]; then $(SCRIPT) xcframework; fi
 	@echo
 	@echo "rustios: artifacts in $(ARTIFACTS_DIR)"
@@ -103,11 +102,11 @@ verify: build
 package: verify
 	$(SCRIPT) package
 
-support: package
-	$(SCRIPT) support
+std: package
+	$(SCRIPT) std
 
 # The xcframework only needs the built toolchain (stage1 rustc + stage2 sysroot),
-# not the packaged support libraries.
+# not the packaged std archive.
 xcframework: verify
 	$(SCRIPT) xcframework
 

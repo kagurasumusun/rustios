@@ -75,9 +75,19 @@ ARTIFACTS_DIR="${ARTIFACTS_DIR:-${REPO_ROOT}/artifacts}"
 JOBS="${JOBS:-}"
 
 # Package naming, mirroring LLVM-On-iOS' SwiftToolchain.zip / LLVM.xcframework.
+#
+#   RustToolchain  <- SwiftToolchain.zip   the compiler itself, no std
+#   RustStd        <- (no counterpart)     std for the target, shipped apart
+#   Rust.xcframework <- LLVM.xcframework   the compiler as a static library
+#
+# std is deliberately *not* inside the toolchain: it is the largest part of the
+# payload, it is the only part that changes when a user rebuilds user code, and
+# an app that embeds Rust.xcframework often never needs it on the device at
+# all. Swift's toolchain is split the same way (compiler + CoreCompilerSupport-
+# Libs + LLVM).
 PACKAGE_PREFIX="iphoneos-arm64"
 TOOLCHAIN_NAME="RustToolchain"
-SUPPORT_NAME="RustSupportLibs"
+STD_NAME="RustStd"
 XCFRAMEWORK_NAME="Rust.xcframework"
 
 # ---------------------------------------------------------------------------
@@ -185,14 +195,21 @@ target **iOS ${IOS_DEPLOYMENT_TARGET}**, from Rust ${RUST_VERSION}
 This is the rustios counterpart of LLVM-On-iOS' Swift toolchain: the compiler
 itself runs on the device.
 
-## Install
+The compiler is shipped without std; std is in
+\`${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz\`. Extract both and merge them
+(the second one is the missing \`lib/rustlib/${HOST_TRIPLE}/lib\` subtree):
 
 \`\`\`sh
 tar -xJf ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+tar -xJf ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz -C ${TOOLCHAIN_NAME}
+
 # on the device / inside your app container:
 export RUST_DIR="\$PWD/${TOOLCHAIN_NAME}/usr"
 export PATH="\$RUST_DIR/bin:\$PATH"
 \`\`\`
+
+Or keep them separate and pass \`--sysroot=\"\$PWD/${STD_NAME}/usr\"\` to every
+invocation.
 
 ## Use
 
@@ -1045,7 +1062,7 @@ verify() {
 }
 
 # ---------------------------------------------------------------------------
-# package: RustToolchain (the compilers + std, i.e. SwiftToolchain.zip)
+# package: RustToolchain (the compiler alone, i.e. SwiftToolchain.zip)
 # ---------------------------------------------------------------------------
 
 package() {
@@ -1055,7 +1072,7 @@ package() {
 
     [[ -x "${stage}/bin/rustc" ]] || die "missing ${stage}/bin/rustc; run 'build' first"
 
-    # The toolchain is only usable on the device if its sysroot carries std.
+    # Fills in the codegen backend (and std, which is removed again below).
     merge_target_std
 
     log "assembling ${dest}"
@@ -1064,16 +1081,24 @@ package() {
     cp -a "${stage}/bin" "${dest}/usr/"
     cp -a "${stage}/lib" "${dest}/usr/"
 
+    # std is a separate artifact (RustStd); so are the rustc rlibs, which are
+    # only needed to link Rust.xcframework. What remains is what `rustc` needs
+    # to run: the binary, its driver dylib and the codegen backend.
+    rm -rf "${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib"
+
     # Never ship host-side leftovers.
     if [[ "${BUILD_TRIPLE}" != "${HOST_TRIPLE}" ]]; then
         rm -rf "${dest}/usr/lib/rustlib/${BUILD_TRIPLE}"
     fi
     find "${dest}" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
 
-    # The build machine's std (macOS) can be linked into the *compiler's*
-    # sysroot by bootstrap; it must never be shipped.
     assert_ios_only "${dest}/usr/bin" "RustToolchain (bin)"
     assert_ios_only "${dest}/usr/lib" "RustToolchain (lib)"
+
+    shopt -s nullglob
+    local leaked=("${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib/"*.rlib)
+    shopt -u nullglob
+    [[ "${#leaked[@]}" -eq 0 ]] || die "std leaked into ${dest}; it belongs in ${STD_NAME}"
 
     write_usage_doc "${dest}"
     write_build_info "${dest}"
@@ -1088,85 +1113,69 @@ package() {
     tar_xz "${WORK_DIR}" "${TOOLCHAIN_NAME}" "${tarball}"
     checksum "${tarball}"
     log "toolchain: $(human_size "${tarball}")"
-
-    # A second archive with exactly the layout rustup/LLVM-On-iOS users
-    # expect (usr/bin + usr/lib at the top level).
-    local bare="${ARTIFACTS_DIR}/${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}-usr.tar.xz"
-    log "creating ${bare}"
-    ( cd "${dest}" && XZ_OPT="-T0 -6" tar -cJf "${bare}" usr )
-    checksum "${bare}"
+    report_line "RustToolchain: $(human_size "${tarball}") (compiler only, no std)"
 }
 
 # ---------------------------------------------------------------------------
-# support: RustSupportLibs (LLVM for iOS + std), LLVM-On-iOS' CoreCompilerSupportLibs
+# std: RustStd (std for the target, shipped apart from the compiler)
 # ---------------------------------------------------------------------------
 
-support() {
-    local llvm_lib rustlib dest tarball
-    llvm_lib="$(llvm_lib_dir)"
-    rustlib="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}"
-    dest="${WORK_DIR}/${SUPPORT_NAME}"
+std() {
+    local src dest tarball
+    src="$(build_host_dir)/lib/rustlib/${HOST_TRIPLE}/lib"
+    dest="${WORK_DIR}/${STD_NAME}"
 
-    [[ -d "${llvm_lib}" ]] || die "missing iOS LLVM libraries at ${llvm_lib}; run 'build' and the Swift LLVM steps first"
+    [[ -d "${src}" ]] || die "missing std at ${src}; run 'build' first"
 
-    merge_target_std
-    [[ -d "${rustlib}/lib" ]] || die "missing std at ${rustlib}/lib; run 'build' first"
-
-    log "collecting iOS LLVM static libraries"
+    log "collecting std for ${HOST_TRIPLE}"
     rm -rf "${dest}"
-    mkdir -p "${dest}/llvm/lib" "${dest}/sysroot/lib/rustlib"
+    mkdir -p "${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib"
+    cp -a "${src}/." "${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib/"
 
     shopt -s nullglob
-    local archives=("${llvm_lib}/"*.a)
+    local std_rlibs=("${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib"/libstd-*.rlib)
     shopt -u nullglob
-    [[ "${#archives[@]}" -gt 0 ]] || die "no static LLVM libraries in ${llvm_lib}"
-    cp -a "${archives[@]}" "${dest}/llvm/lib/"
-    # llvm-config is a *host* tool: for a cross build it is a macOS binary, so
-    # it does not belong in an iOS payload.
-
-    # The sysroot layout is what `rustc --sysroot` expects, so an app that
-    # embeds Rust.xcframework can compile user code with
-    # `--sysroot=<RustSupportLibs>/sysroot`.
-    cp -a "${rustlib}" "${dest}/sysroot/lib/rustlib/${HOST_TRIPLE}"
+    [[ "${#std_rlibs[@]}" -gt 0 ]] || die "no libstd in ${src}"
 
     cat > "${dest}/README.md" <<EOF
-# ${SUPPORT_NAME} (${PACKAGE_PREFIX})
+# ${STD_NAME} (${PACKAGE_PREFIX})
 
-Support libraries for the rustios toolchain, i.e. the counterpart of
-LLVM-On-iOS' \`CoreCompilerSupportLibs\`.
+The Rust standard library for ${HOST_TRIPLE} (iOS ${IOS_DEPLOYMENT_TARGET}),
+built by rustios' stage1 compiler from Rust ${RUST_VERSION}.
 
-* \`llvm/lib/*.a\` - LLVM, built for ${HOST_TRIPLE}
-* \`sysroot/lib/rustlib/${HOST_TRIPLE}/lib/*.rlib\` - core/std/alloc/... for ${HOST_TRIPLE}
-* the LLVM codegen backend, linked into \`usr/bin/rustc\` itself (in-tree build,
-  so there is no \`codegen-backends/\` directory)
+It is shipped separately from ${TOOLCHAIN_NAME} because it is the largest part
+of the payload and the only part that a program links against.
 
-\`sysroot/\` is a rustc sysroot: pass it to the compiler when it runs on the
-device, e.g. through the C API in \`${XCFRAMEWORK_NAME}\`:
+## Layout
 
-\`\`\`c
-const char *argv[] = {
-    "rustc", "--sysroot", "/path/to/${SUPPORT_NAME}/sysroot",
-    "--emit=obj", "hello.rs", "-o", "hello.o",
-};
+\`\`\`
+${STD_NAME}/usr/lib/rustlib/${HOST_TRIPLE}/lib/*.rlib
 \`\`\`
 
-These are also needed when linking \`${XCFRAMEWORK_NAME}\` into an app.
+That is exactly the subtree \`${TOOLCHAIN_NAME}/usr\` is missing, so there are two
+ways to use it:
+
+\`\`\`sh
+# 1. complete the toolchain (one merged sysroot)
+tar -xJf ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+tar -xJf ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz -C ${TOOLCHAIN_NAME}
+
+# 2. keep them apart and point rustc at it
+rustc --sysroot=\"\$PWD/${STD_NAME}/usr\" --emit=obj hello.rs -o hello.o
+\`\`\`
+
+\`${XCFRAMEWORK_NAME}\` does not need this archive: the compiler library is
+linked on the build machine from the rustc rlibs, not from std.
 EOF
 
     write_build_info "${dest}"
-    assert_ios_only "${dest}/llvm" "RustSupportLibs (LLVM)"
-    assert_ios_only "${dest}/sysroot" "RustSupportLibs (sysroot)"
 
-    if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
-        log "ad-hoc signing the codegen backend"
-        sign_tree "${dest}/sysroot"
-    fi
-
-    tarball="${ARTIFACTS_DIR}/${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
+    tarball="${ARTIFACTS_DIR}/${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
     log "creating ${tarball}"
-    tar_xz "${WORK_DIR}" "${SUPPORT_NAME}" "${tarball}"
+    tar_xz "${WORK_DIR}" "${STD_NAME}" "${tarball}"
     checksum "${tarball}"
-    log "support libraries: $(human_size "${tarball}")"
+    log "std: $(human_size "${tarball}")"
+    report_line "RustStd: $(human_size "${tarball}") (${#std_rlibs[@]} std rlibs for ${HOST_TRIPLE})"
 }
 
 # ---------------------------------------------------------------------------
@@ -1391,7 +1400,7 @@ bundle_llvm() {
         cp "${lib}" "${merged}"
         if ! ar -q "${merged}" "${archives[@]}" >>"${log_file}" 2>&1; then
             warn "ar could not merge the archives; shipping $(basename "${lib}") without LLVM"
-            report_line "xcframework: LLVM merge **failed**; link \`RustSupportLibs/llvm/lib/*.a\` too"
+            report_line "xcframework: LLVM merge **failed**; link \`SwiftLLVM/ios/lib/*.a\` too"
             rm -f "${merged}"
             return 0
         fi
@@ -1608,8 +1617,7 @@ rustios build configuration
   artifacts dir           : ${ARTIFACTS_DIR}
   packages (all iOS/arm64):
                           ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-                          ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}-usr.tar.xz
-                          ${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+                          ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
                           ${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
 EOF
 }
@@ -1634,10 +1642,10 @@ commands:
   configure     write bootstrap.toml (cross-compile rustc for ${HOST_TRIPLE})
   build         run x.py build --stage ${STAGE}
   verify        check that rustc/std really are iOS arm64 artifacts
-  package       create ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-  support       create ${SUPPORT_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+  package       create ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz (compiler only)
+  std           create ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz (std, shipped apart)
   xcframework   create ${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-  all           fetch + configure + build + verify + package + support + xcframework
+  all           fetch + configure + build + verify + package + std + xcframework
   info          print the effective configuration
   clean         remove build output, work dir and artifacts
   clean-all     clean + remove the Rust checkout
@@ -1660,7 +1668,7 @@ main() {
         build)       build ;;
         verify)      verify ;;
         package)     package ;;
-        support)     support ;;
+        std)         std ;;
         xcframework) build_xcframework ;;
         all)
             fetch
@@ -1668,7 +1676,7 @@ main() {
             build
             verify
             package
-            support
+            std
             build_xcframework
             ;;
         info)        info ;;

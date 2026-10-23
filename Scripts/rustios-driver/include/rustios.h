@@ -41,9 +41,9 @@
  * Embedded Content" (Do Not Embed) and add `-lc++ -lSystem` to the other
  * linker flags.
  *
- * The embedded compiler still needs a sysroot with the target's std and the
- * codegen backend at runtime: ship `RustSupportLibs/sysroot` and pass
- * `--sysroot=<...>` in the argument list.
+ * The embedded compiler still needs a sysroot with the target's std at
+ * runtime: ship `RustStd/usr` (and the `codegen-backends` directory from
+ * `RustToolchain/usr`) and pass `--sysroot=<...>` in the argument list.
  */
 #ifndef RUSTIOS_H
 #define RUSTIOS_H
