@@ -86,14 +86,20 @@ jobs:
       - name: Show environment
         run: |-
           set -euo pipefail
-          uname -a
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
-          python3 --version
-          cmake --version | sed -n 1p
-          df -h /
-          Scripts/build-swift-toolchain.sh info
-          echo "llvm_version=$(Scripts/build-swift-toolchain.sh info | sed -n 's/^llvm version *: //p')" >> "${GITHUB_OUTPUT}"
+          # Everything below is also written to swift.log: the failure report
+          # only has that file, not the job log.
+          : > swift.log
+          {
+            uname -a
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-path
+            python3 --version
+            cmake --version | sed -n 1p
+            df -h /
+            Scripts/build-swift-toolchain.sh info
+          } 2>&1 | tee -a swift.log
+          info="$(Scripts/build-swift-toolchain.sh info)"
+          echo "llvm_version=$(printf '%s\n' "${info}" | sed -n 's/^llvm version *: //p')" >> "${GITHUB_OUTPUT}"
           echo "swift_version=${SWIFT_BRANCH#swift-}" >> "${GITHUB_OUTPUT}"
         id: versions
 

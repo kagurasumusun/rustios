@@ -43,7 +43,10 @@ IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-16.0}"
 # Workspace layout (swift's update-checkout puts every sibling repository next
 # to the swift checkout, so they all live inside SWIFT_WORKSPACE_DIR).
 SWIFT_SOURCE_DIR="${SWIFT_SOURCE_DIR:-${REPO_ROOT}/swift-source/swift}"
-SWIFT_WORKSPACE_DIR="${SWIFT_WORKSPACE_DIR:-$(cd "$(dirname "${SWIFT_SOURCE_DIR}")" && pwd)}"
+# `info` must work before anything is cloned, so this only rewrites the path
+# (no `cd` into a directory that does not exist yet).
+[[ "${SWIFT_SOURCE_DIR}" = /* ]] || SWIFT_SOURCE_DIR="${REPO_ROOT}/${SWIFT_SOURCE_DIR}"
+SWIFT_WORKSPACE_DIR="${SWIFT_WORKSPACE_DIR:-$(dirname "${SWIFT_SOURCE_DIR}")}"
 SWIFT_BUILD_ROOT="${SWIFT_BUILD_ROOT:-${SWIFT_WORKSPACE_DIR}/build}"
 SWIFT_BUILD_SUBDIR="${SWIFT_BUILD_SUBDIR:-LLVMClangSwift_iphoneos}"
 SWIFT_PRESET_FILE="${SWIFT_PRESET_FILE:-${SCRIPT_DIR}/swift-ios-toolchain-presets.ini}"
@@ -680,7 +683,7 @@ info() {
 swift branch        : ${SWIFT_BRANCH}
 swift checkout      : ${SWIFT_SOURCE_DIR}
 swift commit        : $(swift_commit)
-llvm-project        : ${SWIFT_WORKSPACE_DIR}/llvm-project (${llvm_commit})
+llvm-project        : ${SWIFT_WORKSPACE_DIR}/llvm-project ($(llvm_commit))
 llvm version        : $(llvm_version)
 llvm targets        : ${LLVM_TARGETS}
 ios deployment      : ${IOS_DEPLOYMENT_TARGET}
