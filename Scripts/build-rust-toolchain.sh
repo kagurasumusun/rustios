@@ -14,7 +14,17 @@
 #     host   = where the produced rustc runs     (aarch64-apple-ios)
 #     target = what that rustc compiles for      (aarch64-apple-ios, iOS 16.0)
 #
-# Subcommands: fetch, configure, build, verify, package, support,
+# The artifacts mirror, one for one, what emexlab/LLVM-On-iOS ships for Swift
+# (see docs/parity.md for the mapping and the build-flag parity matrix):
+#
+#   RustToolchain.zip          <- SwiftToolchain.zip   (usr/{bin,include,lib},
+#                                                        same LLVM tools in bin)
+#   Rust.xcframework.tar.xz    <- LLVM.xcframework     (rust.a  <- llvm.a)
+#   RustSupportLibs.tar.xz     <- CoreCompilerSupportLibs (runtime dylibs)
+#   RustStd.tar.xz               (rustios addition: std; the Swift preset
+#                                 deliberately builds no stdlib)
+#
+# Subcommands: fetch, configure, build, verify, package, std, support,
 #              xcframework, all, clean, clean-all, info
 #
 set -euo pipefail
@@ -48,8 +58,14 @@ HOST_TRIPLE="${HOST_TRIPLE:-aarch64-apple-ios}"
 # Bootstrap stage. Stage 2 is a proper, optimised, self-hosting toolchain.
 STAGE="${STAGE:-2}"
 
-# LLVM backends. rustc only compiles for HOST_TRIPLE, so AArch64 is enough.
-LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
+# LLVM backends. Must equal `llvm-targets-to-build` in the Swift preset
+# (Scripts/swift-ios-toolchain-presets.ini): both compilers are built against
+# an LLVM with the same target set. In `swift` mode the value is inert
+# (bootstrap does not build LLVM; the shared LLVM reports its own targets via
+# llvm-config --targets-built); in `intree` mode it makes bootstrap's LLVM
+# match the Swift one. AArch64 is what rustc emits; ARM and X86 are required
+# by compiler-rt's embedded builtins.
+LLVM_TARGETS="${LLVM_TARGETS:-AArch64;ARM;X86}"
 
 # Which LLVM the Rust compiler links against:
 #
@@ -74,21 +90,36 @@ ARTIFACTS_DIR="${ARTIFACTS_DIR:-${REPO_ROOT}/artifacts}"
 # Parallelism (empty = let x.py decide).
 JOBS="${JOBS:-}"
 
-# Package naming, mirroring LLVM-On-iOS' SwiftToolchain.zip / LLVM.xcframework.
+# Package naming, mirroring LLVM-On-iOS' artifacts one for one (no
+# platform/version suffixes - versions are recorded in build-info.json,
+# REPORT.txt and SHA256SUMS.txt, and releases are per-tag anyway):
 #
-#   RustToolchain  <- SwiftToolchain.zip   the compiler itself, no std
-#   RustStd        <- (no counterpart)     std for the target, shipped apart
-#   Rust.xcframework <- LLVM.xcframework   the compiler as a static library
+#   RustToolchain.zip     <- SwiftToolchain.zip          the compiler itself
+#   Rust.xcframework      <- LLVM.xcframework            rust.a <- llvm.a
+#   RustSupportLibs       <- CoreCompilerSupportLibs     runtime support dylibs
+#   RustStd               (rustios addition)             std, shipped apart
 #
 # std is deliberately *not* inside the toolchain: it is the largest part of the
 # payload, it is the only part that changes when a user rebuilds user code, and
 # an app that embeds Rust.xcframework often never needs it on the device at
-# all. Swift's toolchain is split the same way (compiler + CoreCompilerSupport-
-# Libs + LLVM).
-PACKAGE_PREFIX="iphoneos-arm64"
+# all. The Swift preset builds no stdlib at all (iOS carries the Swift runtime
+# in the OS); Rust has no OS-provided std, so RustStd is the counterpart of
+# that gap rather than of an existing Swift artifact.
 TOOLCHAIN_NAME="RustToolchain"
+TOOLCHAIN_ZIP="RustToolchain.zip"
 STD_NAME="RustStd"
+STD_TARBALL="RustStd.tar.xz"
+SUPPORT_NAME="RustSupportLibs"
+SUPPORT_TARBALL="RustSupportLibs.tar.xz"
 XCFRAMEWORK_NAME="Rust.xcframework"
+XCFRAMEWORK_TARBALL="Rust.xcframework.tar.xz"
+# The static compiler archive inside Rust.xcframework - the counterpart of
+# llvm.a inside LLVM.xcframework.
+STATIC_COMPILER_LIB="rust.a"
+
+# The Swift preset is also the source of truth for the LLVM component tools
+# that RustToolchain/usr/bin ships (the same tools SwiftToolchain/usr/bin has).
+SWIFT_PRESET_FILE="${SWIFT_PRESET_FILE:-${SCRIPT_DIR}/swift-ios-toolchain-presets.ini}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -144,8 +175,132 @@ llvm_lib_dir() {
     fi
 }
 
+# bin/ of the iOS LLVM the tools are taken from (the shared Swift LLVM, or
+# bootstrap's own build in intree mode).
+llvm_bin_dir() {
+    if [[ "${RUST_LLVM_MODE}" == "swift" ]]; then
+        echo "${SWIFT_LLVM_DIR}/ios/bin"
+    else
+        echo "$(llvm_dir)/bin"
+    fi
+}
+
+# lib/clang/ (resource headers, builtins) of the iOS LLVM.
+llvm_resource_dir() {
+    if [[ "${RUST_LLVM_MODE}" == "swift" ]]; then
+        echo "${SWIFT_LLVM_DIR}/ios/lib/clang"
+    else
+        echo "$(llvm_dir)/lib/clang"
+    fi
+}
+
 # True when the Rust compiler must build its own LLVM.
 llvm_is_in_tree() { [[ "${RUST_LLVM_MODE}" != "swift" ]]; }
+
+# llvm_component_tools: the binary tools named by the Swift preset's
+# `llvm-install-components` line. Parsing the preset keeps one source of
+# truth across both compilers: Swift's build-script installs exactly these
+# into SwiftToolchain/usr/bin, build-swift-toolchain.sh copies them into
+# SwiftLLVM/{macosx,ios}/bin, and `package` below puts the same set into
+# RustToolchain/usr/bin. That is the tool-level half of the artifact parity
+# (docs/parity.md).
+llvm_component_tools() {
+    [[ -f "${SWIFT_PRESET_FILE}" ]] || return 0
+    sed -n 's/^llvm-install-components=//p' "${SWIFT_PRESET_FILE}" \
+        | tr ';' '\n' \
+        | grep -E '^(clang|lld|llvm-[a-z0-9-]+)$' || true
+}
+
+# install_component_tools <source bin> <destination bin>: copy the preset's
+# LLVM component tools plus the driver flavour aliases (clang++/clang-cpp,
+# ld64.lld and friends), preserving symlinks.
+install_component_tools() {
+    local build_bin="$1" dest_bin="$2" tool flavor copied=0
+    mkdir -p "${dest_bin}"
+    for tool in $(llvm_component_tools); do
+        if [[ -e "${build_bin}/${tool}" ]]; then
+            cp -a "${build_bin}/${tool}" "${dest_bin}/"
+            copied=$((copied + 1))
+        fi
+        case "${tool}" in
+            clang)
+                for flavor in clang++ clang-cpp; do
+                    if [[ -e "${build_bin}/${flavor}" ]]; then
+                        cp -a "${build_bin}/${flavor}" "${dest_bin}/"
+                    fi
+                done
+                ;;
+            lld)
+                for flavor in ld64.lld ld.lld lld-link wasm-ld; do
+                    if [[ -e "${build_bin}/${flavor}" ]]; then
+                        cp -a "${build_bin}/${flavor}" "${dest_bin}/"
+                    fi
+                done
+                ;;
+        esac
+    done
+    echo "${copied}"
+}
+
+# verify_component_tools <bin dir> <label>: every tool named by the preset
+# must be present, so RustToolchain/usr/bin provably carries the same LLVM
+# tools as SwiftToolchain/usr/bin.
+verify_component_tools() {
+    local bindir="$1" label="$2" tool missing=() count=0
+    for tool in $(llvm_component_tools); do
+        count=$((count + 1))
+        [[ -e "${bindir}/${tool}" ]] || missing+=("${tool}")
+    done
+    if [[ "${count}" -eq 0 ]]; then
+        warn "${label}: no llvm-install-components found in ${SWIFT_PRESET_FILE}"
+        return 0
+    fi
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        warn "${label}: missing LLVM component tools: ${missing[*]}"
+        return 1
+    fi
+    log "${label}: all ${count} LLVM component tools from the Swift preset are present"
+}
+
+# materialize_symlinks <root>: replace the driver symlinks a toolchain zip
+# must not ship as links (the same list LLVM-On-iOS materializes in
+# SwiftToolchain.zip) with copies of their targets.
+materialize_symlinks() {
+    local root="$1" link target resolved tmp relative
+    while IFS= read -r link; do
+        target="$(readlink "${link}")"
+        relative="${link#"${root}/"}"
+        if [[ "${target}" != /* ]]; then
+            case "${relative}" in
+                bin/swift|bin/swiftc|bin/clang|bin/clang++|bin/clang-cpp| \
+                usr/bin/swift|usr/bin/swiftc|usr/bin/clang|usr/bin/clang++|usr/bin/clang-cpp)
+                    ;;
+                *) continue ;;
+            esac
+        fi
+        if [[ "${target}" = /* ]]; then
+            resolved="${target}"
+        else
+            resolved="$(cd "$(dirname "${link}")" && pwd)/${target}"
+        fi
+        [[ -e "${resolved}" ]] || die "dangling symlink ${link} -> ${target}"
+        tmp="${link}.materialized"
+        rm -rf "${tmp}"
+        cp -aL "${resolved}" "${tmp}"
+        rm -f "${link}"
+        mv "${tmp}" "${link}"
+    done < <(find "${root}" -type l -print)
+}
+
+# copy_tree <source> <destination>: merge a directory tree (no-op when the
+# source does not exist).
+copy_tree() {
+    local source="$1" destination="$2"
+    if [[ -d "${source}" ]]; then
+        mkdir -p "${destination}"
+        cp -a "${source}/." "${destination}/"
+    fi
+}
 
 # Human-readable description of the LLVM that is linked (recorded in
 # build-info.json and the report).
@@ -190,25 +345,27 @@ write_usage_doc() {
 
 A Rust toolchain (rustc) built for **aarch64-apple-ios** with deployment
 target **iOS ${IOS_DEPLOYMENT_TARGET}**, from Rust ${RUST_VERSION}
-(${RUST_CHANNEL}).
+(${RUST_CHANNEL}), linking the LLVM that Swift 6.4 is built from.
 
-This is the rustios counterpart of LLVM-On-iOS' Swift toolchain: the compiler
-itself runs on the device.
+This is the rustios counterpart of LLVM-On-iOS' SwiftToolchain.zip: the
+compiler itself runs on the device, and \`usr/bin\` carries the same LLVM
+component tools (clang, lld, llvm-ar, ...) that SwiftToolchain/usr/bin has -
+the very same binaries, from the same shared LLVM build.
 
-The compiler is shipped without std; std is in
-\`${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz\`. Extract both and merge them
-(the second one is the missing \`lib/rustlib/${HOST_TRIPLE}/lib\` subtree):
+The compiler is shipped without std; std is in \`${STD_TARBALL}\`. Extract
+both and merge them (the second one is the missing
+\`lib/rustlib/${HOST_TRIPLE}/lib\` subtree):
 
 \`\`\`sh
-tar -xJf ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-tar -xJf ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz -C ${TOOLCHAIN_NAME}
+unzip ${TOOLCHAIN_ZIP}
+tar -xJf ${STD_TARBALL} -C ${TOOLCHAIN_NAME}
 
 # on the device / inside your app container:
 export RUST_DIR="\$PWD/${TOOLCHAIN_NAME}/usr"
 export PATH="\$RUST_DIR/bin:\$PATH"
 \`\`\`
 
-Or keep them separate and pass \`--sysroot=\"\$PWD/${STD_NAME}/usr\"\` to every
+Or keep them separate and pass \`--sysroot="\$PWD/${STD_NAME}/usr"\` to every
 invocation.
 
 ## Use
@@ -218,13 +375,45 @@ rustc --version
 rustc --edition 2021 -C opt-level=2 hello.rs -o hello
 \`\`\`
 
-\`rustc\` needs a Mach-O linker (\`ld\`/\`ld64\`, or the one shipped by your
-jailbreak/TrollStore environment) and an iPhoneOS SDK to link programs.
-Compiling to object files (\`--emit=obj\`) or rlibs works without a linker.
+Linking a program needs a Mach-O linker and an iPhoneOS SDK. This toolchain
+ships both a linker (\`usr/bin/ld64.lld\`) and a clang driver
+(\`usr/bin/clang\`) from the shared LLVM:
+
+\`\`\`sh
+rustc -C linker="\$RUST_DIR/bin/clang" \\
+      -C link-arg=-fuse-ld="\$RUST_DIR/bin/ld64.lld" \\
+      -C link-arg=-isysroot -C link-arg=/path/to/iPhoneOS.sdk \\
+      hello.rs -o hello
+\`\`\`
+
+(The SDK itself is not part of any artifact here - the same is true for
+LLVM-On-iOS' Swift toolchain.) Compiling to object files (\`--emit=obj\`) or
+rlibs works without a linker.
 
 cargo is not part of this toolchain: it spawns child processes, which needs
 extra plumbing on iOS (see the README).
 EOF
+}
+
+# llvm_config_facts: extra build-info.json entries describing the LLVM the
+# compiler actually links, read back from the very llvm-config the build used.
+# These are the machine-checkable half of the flag-parity matrix in
+# docs/parity.md (targets, build mode, assertions, RTTI of the shared LLVM).
+llvm_config_facts() {
+    local config flag key value
+    if llvm_is_in_tree; then
+        config="$(llvm_dir)/bin/llvm-config"
+    else
+        config="$(llvm_config_for "${HOST_TRIPLE}")"
+    fi
+    if [[ ! -x "${config}" ]]; then
+        return 0
+    fi
+    for flag in version targets-built build-mode assertion-mode has-rtti; do
+        key="llvm_$(printf '%s' "${flag}" | tr '-' '_')"
+        value="$("${config}" "--${flag}" 2>/dev/null || echo unknown)"
+        printf '"%s": "%s"\n' "${key}" "${value}"
+    done
 }
 
 # write_build_info <directory> [extra "key": value lines...]
@@ -245,7 +434,7 @@ write_build_info() {
         '"stage": '${STAGE}
         '"built_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"'
     )
-    local entry first=1
+    local entry first=1 line
 
     {
         printf '{\n'
@@ -257,6 +446,9 @@ write_build_info() {
             fi
             printf '  %s' "${entry}"
         done
+        while IFS= read -r line; do
+            printf ',\n  %s' "${line}"
+        done < <(llvm_config_facts)
         printf '\n}\n'
     } > "${dest}/build-info.json"
 }
@@ -541,7 +733,7 @@ if MARKER in src:
 old = '                filename.ends_with(".rmeta")\n'
 new = (
     "                // rustios: keep the object files as well, so that the\n"
-    "                // static driver in Rust.xcframework (libRustCompiler.a)\n"
+    "                // static driver in Rust.xcframework (rust.a)\n"
     "                // can link against rustc_driver_impl and its deps.\n"
     '                filename.ends_with(".rmeta") || filename.ends_with(".rlib")\n'
 )
@@ -1062,11 +1254,23 @@ verify() {
 }
 
 # ---------------------------------------------------------------------------
-# package: RustToolchain (the compiler alone, i.e. SwiftToolchain.zip)
+# package: RustToolchain.zip (the compiler alone, i.e. SwiftToolchain.zip)
+#
+# Structure mirrors LLVM-On-iOS' SwiftToolchain.zip:
+#
+#   SwiftToolchain/usr/{bin,include,lib,share}   (their layout)
+#   RustToolchain/usr/{bin,include,lib}          (this one)
+#
+# usr/bin carries rustc/rustdoc *plus the same LLVM component tools* the Swift
+# toolchain ships (parsed from the same preset line), taken from the same
+# shared LLVM build; usr/include carries the compiler's C API header
+# (rustios.h), the counterpart of the Swift toolchain's C headers; usr/lib
+# carries what rustc needs at runtime (driver dylib, rustlib/...), the
+# counterpart of their lib/swift.
 # ---------------------------------------------------------------------------
 
 package() {
-    local stage dest tarball
+    local stage dest zip_file
     stage="$(stage_dir)"
     dest="${WORK_DIR}/${TOOLCHAIN_NAME}"
 
@@ -1092,8 +1296,43 @@ package() {
     fi
     find "${dest}" -name '*.dSYM' -prune -exec rm -rf {} + 2>/dev/null || true
 
+    # usr/bin: the LLVM component tools of the shared LLVM (clang, lld,
+    # llvm-ar, ...) - the same binaries, from the same build, that
+    # SwiftToolchain/usr/bin ships through the preset's llvm-install-components.
+    local tools_src count
+    tools_src="$(llvm_bin_dir)"
+    if [[ -d "${tools_src}" ]]; then
+        count="$(install_component_tools "${tools_src}" "${dest}/usr/bin")"
+        log "added ${count} LLVM component tools from ${tools_src}"
+    else
+        warn "no LLVM tools at ${tools_src}; usr/bin will hold only rustc/rustdoc"
+    fi
+    # Same driver-symlink materialization LLVM-On-iOS applies to
+    # SwiftToolchain.zip (clang/clang++/clang-cpp become real files).
+    materialize_symlinks "${dest}"
+
+    # usr/include: the C API header of the embedded compiler (the counterpart
+    # of the Swift toolchain's usr/include).
+    mkdir -p "${dest}/usr/include"
+    cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${dest}/usr/include/"
+
+    # usr/lib/clang: resource headers (clang-resource-headers component), the
+    # same subtree SwiftToolchain/usr/lib/clang has.
+    copy_tree "$(llvm_resource_dir)" "${dest}/usr/lib/clang"
+
     assert_ios_only "${dest}/usr/bin" "RustToolchain (bin)"
     assert_ios_only "${dest}/usr/lib" "RustToolchain (lib)"
+    # Parity check: usr/bin must carry exactly the preset's LLVM tool set, so
+    # the Rust toolchain is verifiably equivalent to the Swift one. In intree
+    # mode bootstrap's LLVM builds no clang/lld by default ([llvm] clang =
+    # false), so a reduced set only warns there.
+    if verify_component_tools "${dest}/usr/bin" "RustToolchain (bin)"; then
+        :
+    elif [[ "${RUST_LLVM_MODE}" == "swift" ]]; then
+        die "RustToolchain/usr/bin is missing LLVM component tools; not equivalent to SwiftToolchain"
+    else
+        warn "RUST_LLVM_MODE=${RUST_LLVM_MODE}: the in-tree LLVM ships fewer tools than the Swift preset"
+    fi
 
     shopt -s nullglob
     local leaked=("${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib/"*.rlib)
@@ -1108,12 +1347,16 @@ package() {
         sign_tree "${dest}/usr"
     fi
 
-    tarball="${ARTIFACTS_DIR}/${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
-    log "creating ${tarball}"
-    tar_xz "${WORK_DIR}" "${TOOLCHAIN_NAME}" "${tarball}"
-    checksum "${tarball}"
-    log "toolchain: $(human_size "${tarball}")"
-    report_line "RustToolchain: $(human_size "${tarball}") (compiler only, no std)"
+    zip_file="${ARTIFACTS_DIR}/${TOOLCHAIN_ZIP}"
+    log "creating ${zip_file}"
+    mkdir -p "${ARTIFACTS_DIR}"
+    rm -f "${zip_file}"
+    # -y: keep relative symlinks (lld flavours) as symlinks, like
+    # LLVM-On-iOS' `zip -qry SwiftToolchain.zip`.
+    ( cd "${WORK_DIR}" && zip -qry "${zip_file}" "${TOOLCHAIN_NAME}" )
+    checksum "${zip_file}"
+    log "toolchain: $(human_size "${zip_file}")"
+    report_line "RustToolchain: $(human_size "${zip_file}") (zip, RustToolchain/usr; compiler + LLVM tools, no std)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1138,7 +1381,7 @@ std() {
     [[ "${#std_rlibs[@]}" -gt 0 ]] || die "no libstd in ${src}"
 
     cat > "${dest}/README.md" <<EOF
-# ${STD_NAME} (${PACKAGE_PREFIX})
+# ${STD_NAME} (aarch64-apple-ios)
 
 The Rust standard library for ${HOST_TRIPLE} (iOS ${IOS_DEPLOYMENT_TARGET}),
 built by rustios' stage1 compiler from Rust ${RUST_VERSION}.
@@ -1157,8 +1400,8 @@ ways to use it:
 
 \`\`\`sh
 # 1. complete the toolchain (one merged sysroot)
-tar -xJf ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-tar -xJf ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz -C ${TOOLCHAIN_NAME}
+unzip ${TOOLCHAIN_ZIP}
+tar -xJf ${STD_TARBALL} -C ${TOOLCHAIN_NAME}
 
 # 2. keep them apart and point rustc at it
 rustc --sysroot=\"\$PWD/${STD_NAME}/usr\" --emit=obj hello.rs -o hello.o
@@ -1170,7 +1413,7 @@ EOF
 
     write_build_info "${dest}"
 
-    tarball="${ARTIFACTS_DIR}/${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
+    tarball="${ARTIFACTS_DIR}/${STD_TARBALL}"
     log "creating ${tarball}"
     tar_xz "${WORK_DIR}" "${STD_NAME}" "${tarball}"
     checksum "${tarball}"
@@ -1179,10 +1422,90 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# support: RustSupportLibs (LLVM-On-iOS' CoreCompilerSupportLibs)
+#
+# CoreCompilerSupportLibs is a flat directory of the dylibs the embedded Swift
+# compiler support loads at runtime (lib/swift/host/compiler/lib_Compiler*.dylib).
+# The Rust counterpart is the set of dylibs an app needs at runtime when it
+# embeds the compiler dynamically instead of through the static rust.a:
+# librustc_driver (the compiler dylib), its libstd dylib, and the codegen
+# backend dylibs. They are copies - the originals stay inside
+# RustToolchain/usr/lib, exactly like the Swift dylibs stay inside
+# SwiftToolchain/usr/lib/swift/host/compiler.
+# ---------------------------------------------------------------------------
+
+support() {
+    local stage dest tarball
+    stage="$(stage_dir)"
+    dest="${WORK_DIR}/${SUPPORT_NAME}"
+
+    [[ -x "${stage}/bin/rustc" ]] || die "missing ${stage}/bin/rustc; run 'build' first"
+    merge_target_std
+
+    log "collecting runtime support dylibs"
+    rm -rf "${dest}"
+    mkdir -p "${dest}"
+
+    shopt -s nullglob
+    local driver=("${stage}/lib"/librustc_driver-*.dylib)
+    local std_dylib=("${stage}/lib"/libstd-*.dylib)
+    local backends=("${stage}/lib/rustlib/${HOST_TRIPLE}/codegen-backends"/*.dylib)
+    shopt -u nullglob
+
+    [[ "${#driver[@]}" -gt 0 ]] \
+        || die "no librustc_driver-*.dylib in ${stage}/lib; cannot bundle ${SUPPORT_NAME}"
+    cp -a "${driver[@]}" "${dest}/"
+    if [[ "${#std_dylib[@]}" -gt 0 ]]; then
+        cp -a "${std_dylib[@]}" "${dest}/"
+    else
+        warn "no libstd-*.dylib in ${stage}/lib (static std build?)"
+    fi
+    if [[ "${#backends[@]}" -gt 0 ]]; then
+        mkdir -p "${dest}/codegen-backends"
+        cp -a "${backends[@]}" "${dest}/codegen-backends/"
+    fi
+
+    cat > "${dest}/README.md" <<EOF
+# ${SUPPORT_NAME}
+
+The rustios counterpart of LLVM-On-iOS' \`CoreCompilerSupportLibs\`: the
+dylibs the embedded compiler needs at runtime, bundled flat (plus
+\`codegen-backends/\` when the build produced separate backend dylibs).
+
+* \`librustc_driver-*.dylib\` - the Rust compiler as a dylib
+  (counterpart of \`lib_Compiler*.dylib\`)
+* \`libstd-*.dylib\`         - the std dylib the driver links against
+* \`codegen-backends/*.dylib\` - extra codegen backends, if any
+  (the LLVM backend is linked into the driver itself)
+
+Apps that embed \`${XCFRAMEWORK_NAME}\` as the **static** \`${STATIC_COMPILER_LIB}\`
+do not need these files at runtime; they are for dynamic embedding
+(dlopen / "Embed & Sign") and mirror how CoreCompilerSupportLibs is used with
+LLVM-On-iOS' in-process Swift compiler support.
+EOF
+
+    write_build_info "${dest}"
+    assert_ios_only "${dest}" "${SUPPORT_NAME}"
+
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+        sign_tree "${dest}"
+    fi
+
+    tarball="${ARTIFACTS_DIR}/${SUPPORT_TARBALL}"
+    log "creating ${tarball}"
+    tar_xz "${WORK_DIR}" "${SUPPORT_NAME}" "${tarball}"
+    checksum "${tarball}"
+    log "support libs: $(human_size "${tarball}")"
+    report_line "RustSupportLibs: $(human_size "${tarball}") (${#driver[@]} driver + ${#std_dylib[@]} std + ${#backends[@]} backend dylibs)"
+}
+
+# ---------------------------------------------------------------------------
 # xcframework: Rust.xcframework (LLVM-On-iOS' LLVM.xcframework)
 #
-# LLVM-On-iOS ships `llvm.a` inside `LLVM.xcframework`; this does the same for
-# rustc. A static archive is possible because bootstrap keeps the rustc rlibs
+# LLVM-On-iOS ships `llvm.a` inside `LLVM.xcframework`; this ships `rust.a`
+# inside `Rust.xcframework` - the whole compiler stack (rustc + the shared
+# LLVM) as one static archive plus Headers, the same structure. A static
+# archive is possible because bootstrap keeps the rustc rlibs
 # (see patch_bootstrap_rustc_artifacts) - upstream throws the object files away
 # and only distributes `.rmeta`, because `rustc_driver` is a dylib crate.
 #
@@ -1367,7 +1690,7 @@ report_line() {
 # `rustc --crate-type staticlib` bundles the objects of the Rust crates but
 # not their native (C++) dependencies, so the compiler archive on its own
 # still references LLVM symbols. LLVM-On-iOS ships `llvm.a` for exactly this
-# reason; fold the iOS LLVM archives into libRustCompiler.a so an app links
+# reason; fold the iOS LLVM archives into rust.a so an app links
 # one file plus the system libraries.
 bundle_llvm() {
     local lib="$1" llvm merged archives=() log_file
@@ -1495,7 +1818,7 @@ build_xcframework() {
     ln -sfn "${stage2}/lib/rustlib/${HOST_TRIPLE}" "${merged}/lib/rustlib/${HOST_TRIPLE}"
 
     if find_target_rlib driver_rlib librustc_driver_impl; then
-        log "building the static rustios driver (libRustCompiler.a)"
+        log "building the static rustios driver (${STATIC_COMPILER_LIB})"
         log "  rustc_driver_impl: ${driver_rlib}"
         if RUSTC_BOOTSTRAP=1 \
            RUSTIOS_VERSION="${RUST_VERSION}" \
@@ -1509,11 +1832,11 @@ build_xcframework() {
                 -C opt-level=2 \
                 -C debuginfo=0 \
                 -L "dependency=${libdir}" \
-                -o "${out_dir}/lib/libRustCompiler.a" \
+                -o "${out_dir}/lib/${STATIC_COMPILER_LIB}" \
                 "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"; then
             static_lib="true"
             c_api="true"
-            library="libRustCompiler.a"
+            library="${STATIC_COMPILER_LIB}"
             has_headers="true"
             bundle_llvm "${out_dir}/lib/${library}"
             mkdir -p "${out_dir}/Headers"
@@ -1582,7 +1905,7 @@ build_xcframework() {
         fi
     fi
 
-    local a="${ARTIFACTS_DIR}/${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
+    local a="${ARTIFACTS_DIR}/${XCFRAMEWORK_TARBALL}"
     log "creating ${a}"
     tar_xz "${out_dir}" "${XCFRAMEWORK_NAME}" "${a}"
     checksum "${a}"
@@ -1616,9 +1939,10 @@ rustios build configuration
   work dir                : ${WORK_DIR}
   artifacts dir           : ${ARTIFACTS_DIR}
   packages (all iOS/arm64):
-                          ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-                          ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-                          ${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
+      ${TOOLCHAIN_ZIP}          <- SwiftToolchain.zip
+      ${XCFRAMEWORK_TARBALL}     <- LLVM.xcframework (${STATIC_COMPILER_LIB} <- llvm.a)
+      ${SUPPORT_TARBALL}    <- CoreCompilerSupportLibs
+      ${STD_TARBALL}            (rustios addition: std)
 EOF
 }
 
@@ -1642,10 +1966,11 @@ commands:
   configure     write bootstrap.toml (cross-compile rustc for ${HOST_TRIPLE})
   build         run x.py build --stage ${STAGE}
   verify        check that rustc/std really are iOS arm64 artifacts
-  package       create ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz (compiler only)
-  std           create ${STD_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz (std, shipped apart)
-  xcframework   create ${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz
-  all           fetch + configure + build + verify + package + std + xcframework
+  package       create ${TOOLCHAIN_ZIP} (compiler + LLVM tools, no std)
+  std           create ${STD_TARBALL} (std, shipped apart)
+  support       create ${SUPPORT_TARBALL} (runtime dylibs)
+  xcframework   create ${XCFRAMEWORK_TARBALL} (static ${STATIC_COMPILER_LIB} + Headers)
+  all           fetch + configure + build + verify + package + std + support + xcframework
   info          print the effective configuration
   clean         remove build output, work dir and artifacts
   clean-all     clean + remove the Rust checkout
@@ -1669,6 +1994,7 @@ main() {
         verify)      verify ;;
         package)     package ;;
         std)         std ;;
+        support)     support ;;
         xcframework) build_xcframework ;;
         all)
             fetch
@@ -1677,6 +2003,7 @@ main() {
             verify
             package
             std
+            support
             build_xcframework
             ;;
         info)        info ;;

@@ -22,23 +22,26 @@ Rust 側から見ると「LLVM を自分でビルドする代わりに、Swift �
 ## 0. 成果物の構成（Swift 側と揃える）
 
 Swift 側（LLVM-On-iOS）は「コンパイラ」「LLVM」「サポートライブラリ」が別々の
-成果物です。Rust 側も同じ形にそろえ、**std をツールチェーンから分離**しました。
+成果物です。rustios は **LLVM-On-iOS と同名の Swift 成果物**
+（`SwiftToolchain.zip` / `LLVM.xcframework` / `CoreCompilerSupportLibs`）を作り、
+Rust 側をそれと 1 対 1 対応の構造に揃えています:
 
-| Swift (LLVM-On-iOS) | rustios | 中身 |
-| --- | --- | --- |
-| `SwiftToolchain.zip` | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | コンパイラ本体（`rustc` / `rustdoc` / codegen backend / `librustc_driver*.dylib`）。**std を含まない** |
-| （対応物なし） | `RustStd-iphoneos-arm64-<ver>.tar.xz` | **std のみ**（`RustStd/usr/lib/rustlib/aarch64-apple-ios/lib/*.rlib`） |
-| `LLVM.xcframework` | `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `libRustCompiler.a` + `Headers/rustios.h` |
-| `LLVM.xcframework` | `SwiftLLVM-iphoneos-arm64-21.1.6.tar.xz` / `LLVM.xcframework-…` | **共有 LLVM**（Swift ジョブが生成。Rust 側はコピーを持たない） |
+| Swift（= LLVM-On-iOS） | Rust（対応物） |
+| --- | --- |
+| `SwiftToolchain.zip`（`SwiftToolchain/usr/{bin,include,lib,share}`） | `RustToolchain.zip`（`RustToolchain/usr/{bin,include,lib}`。bin は同じ LLVM ツール一式） |
+| `LLVM.xcframework`（`llvm.a` + 結合 `Headers/`） | `Rust.xcframework`（`rust.a` + `Headers/rustios.h`） |
+| `CoreCompilerSupportLibs`（`lib_Compiler*.dylib`） | `RustSupportLibs`（`librustc_driver-*.dylib` ほか） |
+| （なし — Rust をビルドしない） | `SwiftLLVM.tar.xz`（**共有 LLVM** の再配置可能形。Rust ジョブへの受け渡し用） |
+| （なし — Swift プリセットは stdlib をビルドしない） | `RustStd.tar.xz`（std。OS 内蔵 Swift ランタイム相当が Rust には無いため） |
 
-以前の `RustSupportLibs`（LLVM のコピー + std）は廃止しました。LLVM は Swift の
-成果物をそのまま使うので Rust 用の複製は不要で、std は `RustStd` に移しました。
+対応表の完全版・ビルドフラグの対応表・意図的差分の根拠は
+**[docs/parity.md](parity.md)** にあります。
 
 `RustStd` は `RustToolchain/usr` にそのまま重ねられるので、
 
 ```sh
-tar -xJf RustToolchain-iphoneos-arm64-<ver>.tar.xz
-tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した sysroot になる
+unzip RustToolchain.zip
+tar -xJf RustStd.tar.xz -C RustToolchain   # 完成した sysroot になる
 ```
 
 あるいは分けたまま `rustc --sysroot="$PWD/RustStd/usr" ...` と渡せます。
@@ -137,7 +140,7 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 | --- | --- | --- |
 | `[llvm] download-ci-llvm` | `false` | 配布 LLVM は macOS 用で、iOS 用 rustc には使えない |
 | `[llvm] link-shared` | `false` | 静的ライブラリをリンク（`LLVM_LINK_SHARED` を立てない） |
-| `[llvm] targets` | `AArch64` | 外部 LLVM を使う場合は未使用（bootstrap が LLVM をビルドしないため） |
+| `[llvm] targets` | `AArch64;ARM;X86` | **Swift プリセットの `llvm-targets-to-build` と同値**（parity.md §2）。外部 LLVM を使う `swift` モードでは未使用（bootstrap が LLVM をビルドしないため）だが、`intree` モードでは同じ構成の LLVM をビルドし、`build-info.json` には共有 LLVM の `--targets-built` が記録される |
 | `[rust] llvm-tools` | `false` | 外部 LLVM に llvm-tools は無い。必要な `llvm-ar` 等は `SwiftLLVM/ios/bin` に同梱 |
 | `[build] build` | `aarch64-apple-darwin` | ビルドマシン |
 | `[target."aarch64-apple-darwin"]` | `llvm-config = <SwiftLLVM>/macosx/bin/llvm-config` | stage1 rustc（macOS で動く）用 |
@@ -180,10 +183,16 @@ Rust と噛み合わせるために意識している設定:
   なる（macOS 用の成果物を iOS と称さないための大前提）。
 
 `install_llvm` は CMake のビルドツリーから「インストール済みの形」を組み立てます。
+bin には llvm-config shim に加え、プリセットの `llvm-install-components` が
+SwiftToolchain にインストールするのと同じツール一式（clang, lld, llvm-ar,
+llvm-nm, llvm-ranlib, llvm-cov, llvm-profdata, llvm-objdump, llvm-objcopy,
+llvm-symbolizer）が入ります。`RustToolchain/usr/bin` も同じ一覧を
+同じプリセット行からパースして同梱するため、両ツールチェーンの LLVM ツールは
+常に一致します（`verify_component_tools` が検証）。
 
 ```
-work/SwiftLLVM/macosx/{bin/llvm-config, include/, lib/*.a}
-work/SwiftLLVM/ios/   {bin/{llvm-config,llvm-ar,…}, include/, lib/*.a}
+work/SwiftLLVM/macosx/{bin/{llvm-config,clang,lld,llvm-*}, include/, lib/*.a, lib/clang/}
+work/SwiftLLVM/ios/   {bin/{llvm-config,clang,lld,llvm-*}, include/, lib/*.a, lib/clang/}
 ```
 
 ヘッダは **ソースツリーの `llvm/include` ＋ ビルドツリーの生成ヘッダ**
@@ -224,13 +233,13 @@ shim は呼ばれるたびに `<prefix>/llvm-config.log` に引数を記録し�
 
 | ファイル | 変更 |
 | --- | --- |
-| `Scripts/build-swift-toolchain.sh` | 新規。Swift 6.4 + LLVM 21.1.6 を iOS 向けにビルドし、`SwiftLLVM/{macosx,ios}` と `SwiftToolchain` を作る |
-| `Scripts/swift-ios-toolchain-presets.ini` | 新規。LLVM-On-iOS 相当のプリセット（RTTI 有効、AArch64 のみ、iOS 16.0） |
-| `Scripts/llvm-config-shim.py` | 新規。再配置可能な `llvm-config` の生成 |
-| `Scripts/build-rust-toolchain.sh` | `RUST_LLVM_MODE=swift` を追加。`bootstrap.toml` に `[target.*] llvm-config` と `llvm-has-rust-patches=false` を書き、`src/llvm-project` を fetch せず、`llvm-tools=false` にし、`verify` で LLVM の出所を証明する。既定 `RUST_VERSION=1.94.0` |
-| `.github/workflows/build-rust-ios.yml` | `swift` ジョブ（Swift + LLVM）→ `build` ジョブ（Rust）の 2 段構成。LLVM のキャッシュを廃止し、`SwiftLLVM` artifact で受け渡す |
-| `Makefile` | `make llvm` / `make swift` を追加、`RUST_VERSION=1.94.0`、`RUST_LLVM_MODE=swift` |
-| `Scripts/build-rust-toolchain.sh`（パッケージ） | `RustSupportLibs` を廃止し、`RustToolchain`（コンパイラのみ）と `RustStd`（std のみ）に分割 |
+| `Scripts/build-swift-toolchain.sh` | Swift 6.4 + LLVM 21.1.6 を iOS 向けにビルドし、`SwiftLLVM/{macosx,ios}` と `SwiftToolchain` を作る。パッケージは LLVM-On-iOS と同名（`SwiftToolchain.zip`、`LLVM.xcframework`（llvm.a は libswift\*/libclang\*/liblld\*/libLLVM\*/cmark の結合、Headers は同順の結合）、`CoreCompilerSupportLibs`） |
+| `Scripts/swift-ios-toolchain-presets.ini` | LLVM-On-iOS 相当のプリセット（RTTI 有効、iOS 16.0）。`llvm-targets-to-build=AArch64;ARM;X86` と ZLIB/TERMINFO OFF のみ意図的差分（parity.md §3）。`llvm-install-components` 行は両ツールチェーンのツール一覧の唯一の出所 |
+| `Scripts/llvm-config-shim.py` | 再配置可能な `llvm-config` の生成 |
+| `Scripts/build-rust-toolchain.sh` | `RUST_LLVM_MODE=swift`（既定）。`bootstrap.toml` に `[target.*] llvm-config` と `llvm-has-rust-patches=false` を書き、`src/llvm-project` を fetch せず、`llvm-tools=false`、`[llvm] targets` はプリセットと同値。`verify` で LLVM の出所を証明。パッケージは Swift 側と 1 対 1（`RustToolchain.zip`（LLVM ツール同梱）、`Rust.xcframework`（`rust.a`）、`RustSupportLibs`、`RustStd`） |
+| `.github/workflows/build-rust-ios.yml` | `swift` ジョブ（Swift + LLVM）→ `build` ジョブ（Rust）の 2 段構成。LLVM のキャッシュを廃止し、`SwiftLLVM.tar.xz` artifact で受け渡す |
+| `Makefile` | `make all` で Swift 3 点 + Rust 4 点の全製品。`LLVM_TARGETS` 既定をプリセットと同値に |
+| `docs/parity.md` | 成果物・ビルドフラグの対応表と意図的差分の根拠（新規） |
 
 Rust のビルドで LLVM 用に残っているのは次の 2 つだけで、どちらも
 「LLVM を作らない」方向の変更です。
@@ -296,6 +305,9 @@ RUST_LLVM_MODE=swift Scripts/build-rust-toolchain.sh configure
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | ビルド時間 | Swift 4 h + Rust 1.5–2 h。ジョブ上限 6 h に対して余裕は小さい |
+| `llvm.a` の結合構成（libswift\*/libclang\*/liblld\*/libLLVM\*/cmark） | **実装済み・未実機検証**。中間インストールに静的ライブラリが無い場合は iOS ビルドツリーから補完し、実際に何が入ったかを `REPORT.txt` に記録する。CI の初回実行で確認する |
+| `RustToolchain/usr/bin` の LLVM ツール同梱（clang, lld, ...） | **実装済み・未実機検証**。ツールは `SwiftLLVM/ios/bin` 経由で CI の Rust ジョブに届く。サイズ増（SwiftLLVM.tar.xz + 数百 MB）は計測していない |
+| `SwiftToolchain.zip` の `zip -qry`（symlink 保持） | **実装済み・未実機検証**。LLVM-On-iOS と同じオプション |
 
 既知の割り切り:
 
@@ -317,6 +329,9 @@ grep -E "set\(LLVM_VERSION" rust-source/src/llvm-project/cmake/Modules/LLVMVersi
 
 # Rust がどの LLVM を指しているか
 grep -A2 'llvm-config' rust-source/bootstrap.toml
+
+# 成果物の対応（parity）
+# → docs/parity.md §4 のコマンド群
 
 # 実際に LLVM をビルドしていないこと
 ls rust-source/build/*/llvm/build 2>/dev/null && echo "LLVM was built!" || echo "no in-tree LLVM"

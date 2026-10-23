@@ -25,21 +25,24 @@
  *     }
  *
  * The compiler is shipped as a static archive, like `llvm.a` in
- * LLVM-On-iOS' LLVM.xcframework:
+ * LLVM-On-iOS' LLVM.xcframework - same structure, same usage:
  *
- *     Rust.xcframework/ios-arm64/libRustCompiler.a   <- rustc + this API
+ *     Rust.xcframework/ios-arm64/rust.a        <- rustc + shared LLVM + this API
  *     Rust.xcframework/ios-arm64/Headers/rustios.h
  *
- * Link it into the app (the Rust standard library is part of the archive, so
- * only the iOS system libraries are needed):
+ * Link it into the app (the Rust standard library and the LLVM that Swift is
+ * built from are part of the archive, so only the iOS system libraries are
+ * needed):
  *
- *     clang main.c Rust.xcframework/ios-arm64/libRustCompiler.a \
+ *     clang main.c Rust.xcframework/ios-arm64/rust.a \
  *           -IRust.xcframework/ios-arm64/Headers \
  *           -lc++ -lSystem -o app
  *
- * In Xcode, drag `libRustCompiler.a` into "Frameworks, Libraries, and
- * Embedded Content" (Do Not Embed) and add `-lc++ -lSystem` to the other
- * linker flags.
+ * In Xcode, drag `rust.a` into "Frameworks, Libraries, and Embedded
+ * Content" (Do Not Embed) and add `-lc++ -lSystem` to the other linker
+ * flags. The same header is also installed as
+ * `RustToolchain/usr/include/rustios.h` (the counterpart of the Swift
+ * toolchain's `usr/include`).
  *
  * The embedded compiler still needs a sysroot with the target's std at
  * runtime: ship `RustStd/usr` (and the `codegen-backends` directory from

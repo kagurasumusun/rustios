@@ -3,10 +3,16 @@ name: build-rust-ios
 # Builds, from *one* LLVM, both compilers of a shared-LLVM iOS toolchain:
 #
 #   swift job : Swift 6.4 for iOS + the LLVM it is built from (macOS and iOS
-#               slices), packaged as SwiftToolchain / SwiftLLVM / LLVM.xcframework
+#               slices), packaged exactly like emexlab/LLVM-On-iOS:
+#               SwiftToolchain.zip, LLVM.xcframework.tar.xz,
+#               CoreCompilerSupportLibs.tar.xz (+ SwiftLLVM.tar.xz, the
+#               relocatable shared-LLVM tree the rust job consumes)
 #   rust job  : rustc for iOS built against *that* LLVM - bootstrap is given a
 #               `llvm-config` in the Swift LLVM tree, so src/llvm-project is
-#               never checked out and no Rust-specific LLVM is built
+#               never checked out and no Rust-specific LLVM is built. Its
+#               artifacts mirror the Swift ones one for one: RustToolchain.zip,
+#               Rust.xcframework.tar.xz (rust.a <- llvm.a),
+#               RustSupportLibs.tar.xz, RustStd.tar.xz (see docs/parity.md)
 #
 # Both jobs run on macOS, which is only the build environment: every shipped
 # binary is verified to be iOS/arm64 (see `verify`). Packaging follows
@@ -187,7 +193,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: swift-llvm
-          path: artifacts/SwiftLLVM-*.tar.xz
+          path: artifacts/SwiftLLVM.tar.xz
           if-no-files-found: error
           retention-days: 90
 
@@ -203,13 +209,15 @@ jobs:
           echo "===== swift verify =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
 
-      - name: Package SwiftToolchain and LLVM.xcframework
+      - name: Package SwiftToolchain.zip, LLVM.xcframework and CoreCompilerSupportLibs
         run: |-
           set -o pipefail
           echo "===== swift package =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh package 2>&1 | tee -a swift.log
           echo "===== swift llvm-xcframework =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh llvm-xcframework 2>&1 | tee -a swift.log
+          echo "===== swift support =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh support 2>&1 | tee -a swift.log
 
       - name: Upload Swift artifacts
         if: always()
@@ -217,8 +225,9 @@ jobs:
         with:
           name: swift-toolchain
           path: |-
-            artifacts/SwiftToolchain-*.tar.xz
-            artifacts/LLVM.xcframework-*.tar.xz
+            artifacts/SwiftToolchain.zip
+            artifacts/LLVM.xcframework.tar.xz
+            artifacts/CoreCompilerSupportLibs.tar.xz
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 90
@@ -307,7 +316,7 @@ jobs:
         run: |-
           set -euo pipefail
           mkdir -p work
-          tar -xJf swift-llvm/SwiftLLVM-*.tar.xz -C work
+          tar -xJf swift-llvm/SwiftLLVM.tar.xz -C work
           test -x work/SwiftLLVM/ios/bin/llvm-config
           test -x work/SwiftLLVM/macosx/bin/llvm-config
           echo "llvm-config (iOS) says: $(work/SwiftLLVM/ios/bin/llvm-config --version)"
@@ -429,7 +438,7 @@ jobs:
             exit 1
           fi
 
-      - name: Package RustToolchain
+      - name: Package RustToolchain.zip
         run: |-
           set -o pipefail
           echo "===== package =====" | tee -a build.log
@@ -443,6 +452,13 @@ jobs:
           echo "===== std =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh std 2>&1 | tee -a build.log
 
+      # RustSupportLibs - the counterpart of CoreCompilerSupportLibs.
+      - name: Package support libs
+        run: |-
+          set -o pipefail
+          echo "===== support =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh support 2>&1 | tee -a build.log
+
       - name: Build Rust.xcframework
         if: env.BUILD_XCFRAMEWORK == 'true'
         run: |-
@@ -450,14 +466,15 @@ jobs:
           echo "===== xcframework =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee -a build.log
 
-      - name: Upload RustToolchain + std
+      - name: Upload RustToolchain + std + support libs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rustios-toolchain-${{ env.RUST_VERSION }}
           path: |-
-            artifacts/RustToolchain-*.tar.xz
-            artifacts/RustStd-*.tar.xz
+            artifacts/RustToolchain.zip
+            artifacts/RustStd.tar.xz
+            artifacts/RustSupportLibs.tar.xz
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 90
@@ -467,7 +484,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rustios-xcframework-${{ env.RUST_VERSION }}
-          path: artifacts/Rust.xcframework-*.tar.xz
+          path: artifacts/Rust.xcframework.tar.xz
           if-no-files-found: error
           retention-days: 90
 
@@ -510,7 +527,7 @@ jobs:
             if [ "${JOB_STATUS}" = "success" ]; then
               echo "| artifact | size |"
               echo "| --- | --- |"
-              for f in artifacts/*.tar.xz; do
+              for f in artifacts/*.tar.xz artifacts/*.zip; do
                 if [ -e "$f" ]; then
                   echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
                 fi
@@ -601,10 +618,12 @@ jobs:
           One LLVM (${{ needs.swift.outputs.llvm_version }}, the one Swift is built
           from) is shared by both compilers:
 
-          * \`SwiftToolchain-*.tar.xz\` - the Swift compiler that runs on iOS
-          * \`SwiftLLVM-*.tar.xz\` - the shared LLVM (macOS + iOS static libraries)
-          * \`LLVM.xcframework-*.tar.xz\` - \`llvm.a\` + headers for iOS apps
-          * \`RustToolchain-*.tar.xz\` - rustc/rustdoc that run on iOS (no std)
-          * \`RustStd-*.tar.xz\` - std for iOS, shipped separately
-          * \`Rust.xcframework-*.tar.xz\` - the compiler as a static library with a C API"
+          * \`SwiftToolchain.zip\` - the Swift compiler that runs on iOS
+          * \`LLVM.xcframework.tar.xz\` - \`llvm.a\` + merged headers for iOS apps
+          * \`CoreCompilerSupportLibs.tar.xz\` - the Swift host-compiler support dylibs
+          * \`SwiftLLVM.tar.xz\` - the shared LLVM (macOS + iOS slices, llvm-config shims)
+          * \`RustToolchain.zip\` - rustc/rustdoc that run on iOS + the same LLVM tools (no std)
+          * \`Rust.xcframework.tar.xz\` - the Rust compiler as one static \`rust.a\` with a C API
+          * \`RustSupportLibs.tar.xz\` - the Rust runtime support dylibs
+          * \`RustStd.tar.xz\` - std for iOS, shipped separately"
           fi

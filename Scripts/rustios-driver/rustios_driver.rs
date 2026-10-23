@@ -1,16 +1,17 @@
 //! rustios driver: exposes the Rust compiler through a small C ABI so that an
 //! iOS app can embed `rustc` as a library.
 //!
-//! This crate is compiled as a `staticlib` for `aarch64-apple-ios` and wrapped
-//! into `Rust.xcframework` (see `Scripts/build-rust-toolchain.sh`), exactly like
-//! `llvm.a` ships inside the `LLVM.xcframework` produced by
-//! emexlab/LLVM-On-iOS.
+//! This crate is compiled as a `staticlib` for `aarch64-apple-ios` and shipped
+//! as `rust.a` inside `Rust.xcframework` (see `Scripts/build-rust-toolchain.sh`)
+//! - the exact counterpart of the `llvm.a` that ships inside the
+//! `LLVM.xcframework` produced by emexlab/LLVM-On-iOS.
 //!
 //! A static archive works because rustios keeps the rustc rlibs in the sysroot
 //! (`patch_bootstrap_rustc_artifacts`); upstream only distributes `.rmeta`,
 //! because `rustc_driver` itself is a dylib crate. This crate therefore links
 //! `rustc_driver_impl` - the real driver, of which `rustc_driver` is only a
-//! re-export - and ends up as one `libRustCompiler.a`.
+//! re-export - and ends up, merged with the shared Swift LLVM archives, as one
+//! `rust.a`.
 //!
 //! The C interface lives in `include/rustios.h`.
 //!
