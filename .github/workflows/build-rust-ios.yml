@@ -204,11 +204,29 @@ jobs:
           echo "===== build stage 2 (target phase) =====" | tee -a build.log
           RUSTIOS_BUILD_PHASE=target Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
 
+      # `set -e` deliberately not used: the exit code is reported explicitly,
+      # and on failure the state that matters is dumped into build.log (the
+      # only part of the run that is visible from the PR comment).
       - name: Verify artifacts
         run: |
           set -o pipefail
           echo "===== verify =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh verify 2>&1 | tee -a build.log
+          rc=${PIPESTATUS[0]}
+          echo "verify exited with ${rc}" | tee -a build.log
+          if [ "${rc}" -ne 0 ]; then
+            for dir in rust-source/build/aarch64-apple-ios/stage2/bin \
+                       rust-source/build/aarch64-apple-ios/stage2/lib \
+                       rust-source/build/aarch64-apple-ios/stage2/lib/rustlib/aarch64-apple-ios/lib \
+                       rust-source/build/aarch64-apple-darwin/stage1/lib/rustlib/aarch64-apple-ios/lib; do
+              echo "--- ${dir} ---" | tee -a build.log
+              ls -la "${dir}" 2>&1 | head -40 | tee -a build.log
+            done
+            echo "--- disk ---" | tee -a build.log
+            df -h / | tee -a build.log
+            du -sh rust-source/build 2>/dev/null | tee -a build.log
+            exit 1
+          fi
 
       - name: Package RustToolchain
         run: |

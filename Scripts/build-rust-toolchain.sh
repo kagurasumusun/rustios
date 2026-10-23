@@ -674,7 +674,7 @@ build() {
 #
 # Idempotent, and it never overwrites what Assemble produced (`cp -n`).
 merge_target_std() {
-    local stage1 src dst
+    local stage1 src dst existing
     stage1="$(build_host_dir)"
     src="${stage1}/lib/rustlib/${HOST_TRIPLE}/lib"
     dst="$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/lib"
@@ -682,20 +682,52 @@ merge_target_std() {
     if [[ "${BUILD_TRIPLE}" == "${HOST_TRIPLE}" || "${dst}" == "${src}" ]]; then
         return 0
     fi
+
+    # Already merged (build does this right after the target phase, and every
+    # consumer calls this function too): nothing to copy.
+    shopt -s nullglob
+    existing=("${dst}"/libstd-*.rlib)
+    shopt -u nullglob
+    if [[ "${#existing[@]}" -gt 0 ]]; then
+        return 0
+    fi
+
     if [[ ! -d "${src}" ]]; then
         die "missing ${src}: the host phase (stage 1) did not build std for ${HOST_TRIPLE}"
     fi
 
     mkdir -p "${dst}"
     log "adding std for ${HOST_TRIPLE} to ${dst}"
-    cp -an "${src}/." "${dst}/"
+    if command -v rsync >/dev/null 2>&1; then
+        # --ignore-existing: never replace what Assemble put there.
+        if ! rsync -a --ignore-existing "${src}/" "${dst}/"; then
+            die "could not copy std from ${src} to ${dst} (is the disk full?)"
+        fi
+    else
+        if ! cp -an "${src}/." "${dst}/"; then
+            die "could not copy std from ${src} to ${dst} (is the disk full?)"
+        fi
+    fi
 
     # codegen-backends lives next to lib, not inside it.
     if [[ -d "${stage1}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" ]]; then
         mkdir -p "$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends"
-        cp -an "${stage1}/lib/rustlib/${HOST_TRIPLE}/codegen-backends/." \
-            "$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends/"
+        if command -v rsync >/dev/null 2>&1; then
+            rsync -a --ignore-existing "${stage1}/lib/rustlib/${HOST_TRIPLE}/codegen-backends/" \
+                "$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends/" \
+                || die "could not copy codegen-backends to $(stage_dir)"
+        else
+            cp -an "${stage1}/lib/rustlib/${HOST_TRIPLE}/codegen-backends/." \
+                "$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/codegen-backends/" \
+                || die "could not copy codegen-backends to $(stage_dir)"
+        fi
     fi
+
+    shopt -s nullglob
+    existing=("${dst}"/libstd-*.rlib)
+    shopt -u nullglob
+    [[ "${#existing[@]}" -gt 0 ]] || die "std is still missing from ${dst}"
+    log "std for ${HOST_TRIPLE} is in place"
 }
 
 # ---------------------------------------------------------------------------
@@ -705,6 +737,9 @@ merge_target_std() {
 verify() {
     require_macos
     local sysroot rustc desc archs build_info
+    if command -v df >/dev/null 2>&1; then
+        log "free space: $(df -h / | awk 'NR==2 {print $4}')"
+    fi
     sysroot="$(stage_dir)"
     rustc="${sysroot}/bin/rustc"
 
