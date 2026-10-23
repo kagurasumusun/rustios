@@ -352,16 +352,32 @@ $ vtool -show-build rust-source/build/aarch64-apple-ios/stage2/bin/rustc
 | --- | --- |
 | `swift-source`（Swift + llvm-project ほか sibling リポジトリ） | `actions/cache`（`swift-src-*`）。リリースごとに不変 |
 | `rust-source`（Rust 本体 + `library/backtrace`） | `actions/cache`（`rust-src-*`） |
-| 共有 LLVM（ビルド済み） | `swift` ジョブ → `build` ジョブへ **artifact**（`SwiftLLVM.tar.xz`）で受け渡し |
-| Swift / LLVM のビルドツリー | キャッシュしない（数十 GB で上限 10 GB を超える） |
+| Swift の完成済み配布物 | `actions/cache`（`swift-artifacts-*`）。Swift リリース・iOS バージョン・ビルドスクリプト/プリセットのハッシュが同じなら**再ビルドせず**に復元 |
+| Rust の完成済み配布物 | `actions/cache`（`rust-artifacts-*`）。Rust/Swift LLVM バージョン・stage・iOS バージョン・関連スクリプトのハッシュが同じなら**再ビルドせず**に復元 |
+| 共有 LLVM（ビルド済み） | `swift` ジョブ → `build` ジョブへ **artifact**（`SwiftLLVM.tar.xz`）で受け渡し（Rust 成果物キャッシュ miss 時だけダウンロード） |
+| Swift/LLVM の C/C++ オブジェクト | 4 GiB の `ccache`（`ccache-swift-*`）。スクリプト/プリセット変更後も同一 Swift リリースの旧キーを候補に復元 |
+| Swift / LLVM のビルドツリー | キャッシュしない（数十 GB で Actions の 10 GB 上限を超える） |
 | stage0 のダウンロード | bootstrap が `build/cache` に保持（ジョブ内のみ） |
 
 LLVM を Rust 側でビルドしないため、`rust-llvm-*` キャッシュは廃止しました。
 `swift` ジョブは LLVM →（artifact 公開）→ Swift の順に進むので、Swift の
 ビルドが時間切れになっても LLVM の成果物は残ります。
 
+初回、または上表の成果物キャッシュキーに含まれる入力を変更した実行だけは
+通常どおりコンパイルします。次回以降は完成済み tar/zip を復元し、同じ
+`verify`・nyxian スモークテスト・artifact upload を実行します。したがって
+キャッシュによって検証を省略したり、古い LLVM を Rust に渡したりしません。
+
 `sccache` は使いません（GitHub Actions バックエンドの一時的なストレージ
-エラーでコンパイル自体が落ちるため）。
+エラーでコンパイル自体が落ちるため）。Swift/LLVM の C/C++ コンパイルには、
+リモートストレージを使わないローカル `ccache` を使います。
+
+標準の `macos-latest` は無料の ARM64 runner です。さらに初回ビルドを短縮する
+ために課金対象の大きい ARM64 runner を利用できる場合は、リポジトリの
+**Settings → Secrets and variables → Actions → Variables** に
+`RUNNER_LABEL=macos-15-xlarge`（利用可能な ARM64 macOS large-runner label）を
+設定できます。未設定時は必ず `macos-latest` のままです。x86_64 の
+`*-large` は共有 LLVM の macOS/arm64 slice と互換ではないため指定しません。
 
 `Scripts/` の設定を変えたときは、ワークフローの `CACHE_VERSION` を上げてください。
 

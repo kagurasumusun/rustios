@@ -68,10 +68,15 @@ env:
   # The Swift release whose llvm-project the Rust compiler links.
   SWIFT_BRANCH: swift-6.4.0-RELEASE
   # Bump these to invalidate the caches below (e.g. after changing configure).
-  CACHE_VERSION: "2"
+  # v3: added the packaged-artifact caches and ccache.
+  CACHE_VERSION: "3"
   # Never export SDKROOT: the build host is macOS, only the iOS compilation
   # should see the iPhoneOS SDK (the scripts handle that themselves).
   CARGO_INCREMENTAL: "0"
+  # Set an explicit ccache location: ccache 3 used ~/.ccache while ccache 4
+  # defaults to ~/.cache/ccache. Keeping it in the workspace makes the Actions
+  # cache path stable across Homebrew upgrades.
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -83,8 +88,13 @@ jobs:
     # long pole (LLVM for macOS and iOS, then the two Swift compilers). A run
     # with LLVM's full target set needed ~5 h 45 min and was cut off while
     # packaging, hence 360 and the reduced target list in the preset.
+    #
+    # The standard macOS runner has 3 cores / 7 GB. The ARM64 xlarge runner
+    # (macos-15-xlarge: 5 cores / 14 GB) improves parallel compile and link
+    # headroom, but is billed even for public repositories; set RUNNER_LABEL
+    # to opt in (empty/unset = free macos-latest).
     timeout-minutes: 360
-    runs-on: macos-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'macos-latest' }}
     outputs:
       llvm_version: ${{ steps.versions.outputs.llvm_version }}
       swift_version: ${{ steps.versions.outputs.swift_version }}
@@ -92,6 +102,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # What this job produces is fully determined by its inputs (the Swift
+      # release, the preset, the build script, the deployment target). When
+      # they did not change since a successful run, the packaged artifacts are
+      # restored instead of rebuilt (~4 h -> ~2 min) and the rust job can
+      # start right away. The key hashes the inputs, so any change to them
+      # rebuilds from scratch.
+      - name: Restore Swift artifacts
+        id: cache-swift-artifacts
+        uses: actions/cache/restore@v4
+        with:
+          path: artifacts
+          key: swift-artifacts-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ env.IOS_DEPLOYMENT_TARGET }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini', 'Scripts/llvm-config-shim.py') }}
 
       - name: Show environment
         run: |-
@@ -101,6 +124,7 @@ jobs:
           : > swift.log
           {
             uname -a
+            sysctl -n hw.ncpu hw.memsize || true
             xcodebuild -version
             xcrun --sdk iphoneos --show-sdk-path
             python3 --version
@@ -108,12 +132,9 @@ jobs:
             df -h /
             Scripts/build-swift-toolchain.sh info
           } 2>&1 | tee -a swift.log
-          info="$(Scripts/build-swift-toolchain.sh info)"
-          echo "llvm_version=$(printf '%s\n' "${info}" | sed -n 's/^llvm version *: //p')" >> "${GITHUB_OUTPUT}"
-          echo "swift_version=${SWIFT_BRANCH#swift-}" >> "${GITHUB_OUTPUT}"
-        id: versions
 
       - name: Free disk space
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -euo pipefail
           shopt -s nullglob
@@ -134,18 +155,40 @@ jobs:
           echo "disk after:"; df -h /
 
       - name: Install build dependencies
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -euo pipefail
           if ! command -v ninja >/dev/null 2>&1; then
             HOMEBREW_NO_AUTO_UPDATE=1 brew install ninja
           fi
           ninja --version
+          # ccache caches every C/C++ object of the LLVM and Swift-compiler
+          # builds across runs (the build script picks it up through
+          # CMAKE_<LANG>_COMPILER_LAUNCHER; the output is identical).
+          if ! command -v ccache >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ccache
+          fi
+          ccache --version | head -1
+          ccache -M 4G
+
+      # ccache directory of the LLVM/Swift C++ compiles. The exact key covers
+      # the current inputs; restore-keys also accept an older ccache of the
+      # same Swift release, so a preset tweak still reuses most objects.
+      - name: Restore ccache
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-swift-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini') }}
+          restore-keys: |
+            ccache-swift-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-
 
       # A cold `update-checkout` of ~40 sibling repositories is 10-20 minutes of
       # network time; the checkout itself is immutable for a given release, so
       # it is worth caching. The build trees are not cached: they are far
       # larger than the 10 GB cache limit of a repository.
       - name: Restore Swift sources
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         id: cache-swift-src
         uses: actions/cache/restore@v4
         with:
@@ -153,6 +196,7 @@ jobs:
           key: swift-src-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}
 
       - name: Fetch Swift sources
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift fetch =====" | tee -a swift.log
@@ -160,23 +204,42 @@ jobs:
 
       - name: Save Swift sources
         continue-on-error: true
-        if: steps.cache-swift-src.outputs.cache-hit != 'true'
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true' && steps.cache-swift-src.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: swift-source
           key: swift-src-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}
+
+      # The job outputs: from the restored REPORT.txt on a cache hit, from the
+      # fetched sources otherwise (the llvm-project checkout is what
+      # llvm_version reads).
+      - name: Record versions
+        id: versions
+        run: |-
+          set -euo pipefail
+          llvm_version=""
+          if [ -f artifacts/REPORT.txt ]; then
+            llvm_version="$(sed -n 's/^SwiftLLVM \([0-9][0-9.]*\):.*/\1/p' artifacts/REPORT.txt | head -1)"
+          fi
+          if [ -z "${llvm_version}" ] || [ "${llvm_version}" = "unknown" ]; then
+            llvm_version="$(Scripts/build-swift-toolchain.sh info | sed -n 's/^llvm version *: //p')"
+          fi
+          echo "llvm_version=${llvm_version:-unknown}" >> "${GITHUB_OUTPUT}"
+          echo "swift_version=${SWIFT_BRANCH#swift-}" >> "${GITHUB_OUTPUT}"
 
       # Swift 6.4's build-script builds the two LLVM trees (macOS: the compiler
       # that does the work, iOS: the one that is shipped and that rustc links
       # against) and the two Swift compilers in one invocation; see
       # Scripts/build-swift-toolchain.sh. ~4 hours on a 3-core runner.
       - name: Build Swift + LLVM for iOS
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift llvm =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh llvm 2>&1 | tee -a swift.log
 
       - name: Verify the LLVM slices
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift verify (llvm) =====" | tee -a swift.log
@@ -185,6 +248,7 @@ jobs:
       # Up first: the Rust job only needs this part, and a Swift build that
       # later times out must not hide it.
       - name: Package the shared LLVM
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift package-llvm =====" | tee -a swift.log
@@ -200,18 +264,21 @@ jobs:
           retention-days: 90
 
       - name: Collect the iOS Swift compiler
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift install-swift =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh install-swift 2>&1 | tee -a swift.log
 
       - name: Verify the Swift toolchain
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift verify =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
 
       - name: Package SwiftToolchain.zip, LLVM.xcframework and CoreCompilerSupportLibs
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift package =====" | tee -a swift.log
@@ -220,6 +287,25 @@ jobs:
           Scripts/build-swift-toolchain.sh llvm-xcframework 2>&1 | tee -a swift.log
           echo "===== swift support =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh support 2>&1 | tee -a swift.log
+
+      - name: Save ccache
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-swift-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini') }}
+
+      # On an artifacts-cache hit nothing was built, but the nyxian interface
+      # must still hold: recreate the staging trees that the root directories
+      # are copied from out of the cached tarballs.
+      - name: Restore nyxian staging from cached artifacts
+        if: steps.cache-swift-artifacts.outputs.cache-hit == 'true'
+        run: |-
+          set -euo pipefail
+          mkdir -p work/LLVM.xcframework.build
+          tar -xJf artifacts/LLVM.xcframework.tar.xz -C work/LLVM.xcframework.build
+          tar -xJf artifacts/CoreCompilerSupportLibs.tar.xz -C work
 
       # The nyxian contract (docs/nyxian.md): nyxian's Makefile cp -r's
       # CoreCompilerSupportLibs/ and LLVM.xcframework/ out of the repository
@@ -242,6 +328,17 @@ jobs:
           test -x work/nyxian-smoke/Shared/SwiftToolchain/usr/bin/swift-frontend
           test -d work/nyxian-smoke/Shared/SwiftToolchain/usr/lib/swift
           echo "nyxian interface OK (swift)" | tee -a swift.log
+
+      # Cache only after both the normal packaging checks and the nyxian
+      # interface smoke test passed; a failed product can never become a cache
+      # hit on a later run.
+      - name: Save Swift artifacts
+        if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts
+          key: swift-artifacts-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ env.IOS_DEPLOYMENT_TARGET }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini', 'Scripts/llvm-config-shim.py') }}
 
       - name: Upload Swift artifacts
         if: always()
@@ -278,6 +375,7 @@ jobs:
             echo "| Swift | \`${SWIFT_BRANCH}\` |"
             echo "| LLVM | \`${{ steps.versions.outputs.llvm_version }}\` (macOS + iOS) |"
             echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
+            echo "| cache hit (artifacts) | \`${{ steps.cache-swift-artifacts.outputs.cache-hit }}\` |"
             echo "| cache hit (sources) | \`${{ steps.cache-swift-src.outputs.cache-hit }}\` |"
             echo
             echo '```'
@@ -320,7 +418,7 @@ jobs:
     # environment). Non-iOS binaries make `verify`/`package` fail.
     needs: swift
     timeout-minutes: 300
-    runs-on: macos-latest
+    runs-on: ${{ vars.RUNNER_LABEL || 'macos-latest' }}
     outputs:
       rust_version: ${{ steps.version.outputs.rust_version }}
 
@@ -328,15 +426,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Same idea as the swift job: the packaged Rust artifacts are a pure
+      # function of the Rust version, the bootstrap configuration (the
+      # scripts), the shared LLVM and the inputs below. On a hit this job is
+      # minutes instead of hours. The swift job's llvm_version is part of the
+      # key, so a rebuilt shared LLVM always invalidates it.
+      - name: Restore Rust artifacts
+        id: cache-rust-artifacts
+        uses: actions/cache/restore@v4
+        with:
+          path: artifacts
+          key: rust-artifacts-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}-${{ env.STAGE }}-${{ env.BUILD_XCFRAMEWORK }}-${{ needs.swift.outputs.llvm_version }}-${{ hashFiles('Scripts/build-rust-toolchain.sh', 'Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini', 'Scripts/llvm-config-shim.py', 'Scripts/rustios-driver/rustios_driver.rs', 'Scripts/rustios-driver/include/rustios.h') }}
+
       # The LLVM that the compiler is built against: produced by the swift job,
       # consumed here through the relocatable llvm-config shims inside it.
       - name: Download the shared LLVM
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         uses: actions/download-artifact@v4
         with:
           name: swift-llvm
           path: swift-llvm
 
       - name: Unpack the shared LLVM
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -euo pipefail
           mkdir -p work
@@ -361,6 +473,7 @@ jobs:
         id: version
 
       - name: Free disk space
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -euo pipefail
           shopt -s nullglob
@@ -379,6 +492,7 @@ jobs:
           echo "disk after:"; df -h /
 
       - name: Install build dependencies
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -euo pipefail
           if ! command -v ninja >/dev/null 2>&1; then
@@ -388,13 +502,12 @@ jobs:
 
       # Only the Rust checkout + the submodule it still needs
       # (library/backtrace). src/llvm-project is *not* fetched: nothing builds
-      # it, and that is the point of the shared LLVM.
-      #
-      # sccache is deliberately not used: its GitHub Actions backend talks to
-      # Azure storage, and a single transient storage error there aborts the
-      # compiler invocation (it killed a run at the first LLVM object file with
-      # "cache storage failed to read").
+      # it, and that is the point of the shared LLVM. No compiler wrapper is
+      # installed in this job: in swift mode it compiles no C/C++ (LLVM arrives
+      # prebuilt), and sccache's GitHub Actions backend has previously aborted
+      # compiler invocations on a transient storage error (docs/parity.md §5).
       - name: Restore Rust sources
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         id: cache-rust-src
         uses: actions/cache/restore@v4
         with:
@@ -402,17 +515,19 @@ jobs:
           key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
 
       - name: Fetch Rust sources
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: Scripts/build-rust-toolchain.sh fetch
 
       - name: Save Rust sources
         continue-on-error: true
-        if: steps.cache-rust-src.outputs.cache-hit != 'true'
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true' && steps.cache-rust-src.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: rust-source
           key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
 
       - name: Configure bootstrap
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== configure =====" | tee -a build.log
@@ -423,12 +538,14 @@ jobs:
       # that runs on iOS. Both link the Swift LLVM, so there is no second LLVM
       # build anywhere in this job.
       - name: Build stage 1 (build-machine compiler)
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== build stage 1 (host phase) =====" | tee -a build.log
           RUSTIOS_BUILD_PHASE=host Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
 
       - name: Build stage 2 (rustc for iOS)
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== build stage 2 (target phase) =====" | tee -a build.log
@@ -438,6 +555,7 @@ jobs:
       # and on failure the state that matters is dumped into build.log (the
       # only part of the run that is visible from the PR comment).
       - name: Verify artifacts
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== verify =====" | tee -a build.log
@@ -463,6 +581,7 @@ jobs:
           fi
 
       - name: Package RustToolchain.zip
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== package =====" | tee -a build.log
@@ -471,6 +590,7 @@ jobs:
       # std is packaged separately from the compiler (the largest part of the
       # payload, and the part a device often does not need at all).
       - name: Package std
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== std =====" | tee -a build.log
@@ -478,17 +598,32 @@ jobs:
 
       # RustSupportLibs - the counterpart of CoreCompilerSupportLibs.
       - name: Package support libs
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== support =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh support 2>&1 | tee -a build.log
 
       - name: Build Rust.xcframework
-        if: env.BUILD_XCFRAMEWORK == 'true'
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true' && env.BUILD_XCFRAMEWORK == 'true'
         run: |-
           set -o pipefail
           echo "===== xcframework =====" | tee -a build.log
           Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee -a build.log
+
+      # A cached artifacts directory contains only distributable files. Restore
+      # the two staging directories which Makefile's nyxian-rust-dirs copies
+      # to the repository root, so the exact same nyxian smoke test runs on a
+      # cache hit and a cache miss.
+      - name: Restore nyxian staging from cached artifacts
+        if: steps.cache-rust-artifacts.outputs.cache-hit == 'true'
+        run: |-
+          set -euo pipefail
+          mkdir -p work/Rust.xcframework.build
+          tar -xJf artifacts/RustSupportLibs.tar.xz -C work
+          if [ "${BUILD_XCFRAMEWORK}" = "true" ]; then
+            tar -xJf artifacts/Rust.xcframework.tar.xz -C work/Rust.xcframework.build
+          fi
 
       # The nyxian contract (docs/nyxian.md): the Rust counterparts of the
       # directories nyxian copies (RustSupportLibs/, Rust.xcframework/) and
@@ -512,6 +647,14 @@ jobs:
           test -x work/nyxian-smoke/Shared/RustToolchain/usr/bin/rustc
           ls work/nyxian-smoke/Shared/RustToolchain/usr/lib/rustlib/aarch64-apple-ios/lib/libstd-*.rlib >/dev/null
           echo "nyxian interface OK (rust)" | tee -a build.log
+
+      - name: Save Rust artifacts
+        if: steps.cache-rust-artifacts.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: artifacts
+          key: rust-artifacts-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}-${{ env.IOS_DEPLOYMENT_TARGET }}-${{ env.STAGE }}-${{ env.BUILD_XCFRAMEWORK }}-${{ needs.swift.outputs.llvm_version }}-${{ hashFiles('Scripts/build-rust-toolchain.sh', 'Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini', 'Scripts/llvm-config-shim.py', 'Scripts/rustios-driver/rustios_driver.rs', 'Scripts/rustios-driver/include/rustios.h') }}
 
       - name: Upload RustToolchain + std + support libs
         if: always()
@@ -629,6 +772,7 @@ jobs:
             echo "| host / target | \`${HOST_TRIPLE:-aarch64-apple-ios}\` |"
             echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
             echo "| shared LLVM | \`${{ needs.swift.outputs.llvm_version }}\` (Swift's) |"
+            echo "| cache hit (artifacts) | \`${{ steps.cache-rust-artifacts.outputs.cache-hit }}\` |"
             echo "| cache hit (sources) | \`${{ steps.cache-rust-src.outputs.cache-hit }}\` |"
             echo
             echo '```'

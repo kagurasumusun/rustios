@@ -439,6 +439,21 @@ build_swift() {
 
     refresh_cmark_cache
 
+    # ccache: when it is installed, every C/C++ compile of the build (both
+    # LLVM trees, clang, lld, cmark and the C++ sources of the Swift
+    # compiler) goes through it. CMake >= 3.17 initialises
+    # CMAKE_<LANG>_COMPILER_LAUNCHER from these environment variables, so the
+    # preset does not change and the produced objects are identical - only
+    # rebuilds get faster (CI caches CCACHE_DIR between runs; locally it just
+    # works if ccache is installed). sccache is deliberately not used: its
+    # GitHub Actions backend aborts compiler invocations on transient storage
+    # errors (docs/parity.md §5).
+    if command -v ccache >/dev/null 2>&1; then
+        export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-ccache}"
+        export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-ccache}"
+        log "ccache       : $(ccache --version | head -1)"
+    fi
+
     log "iPhoneOS SDK : ${sdk}"
     log "swift        : ${SWIFT_BRANCH} ($(swift_commit))"
     log "llvm         : $(llvm_version) ($(llvm_commit))"
@@ -450,6 +465,11 @@ build_swift() {
         export IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
         utils/build-script "${args[@]}"
     )
+
+    if command -v ccache >/dev/null 2>&1; then
+        log "ccache statistics:"
+        ccache --show-stats 2>/dev/null | tail -n 12 || true
+    fi
 }
 
 # cmark's iPhoneOS CMake cache is kept across builds; if it was configured
