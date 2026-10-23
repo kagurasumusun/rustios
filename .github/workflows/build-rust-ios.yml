@@ -60,7 +60,7 @@ env:
   CACHE_VERSION: "1"
   # Bump when the LLVM/CMake configuration changes, so a stale LLVM tree is
   # never restored (bootstrap trusts the build stamps inside it).
-  LLVM_CACHE_VERSION: "2"
+  LLVM_CACHE_VERSION: "3"
   # Never export SDKROOT: the build host is macOS, only the iOS compilation
   # should see the iPhoneOS SDK (the script handles that itself).
   CARGO_INCREMENTAL: "0"
