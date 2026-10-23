@@ -1,15 +1,16 @@
 //! rustios driver: exposes the Rust compiler through a small C ABI so that an
 //! iOS app can embed `rustc` as a library.
 //!
-//! This crate is compiled as a `cdylib` for `aarch64-apple-ios` and wrapped
-//! into `Rust.xcframework` (see `Scripts/build-rust-toolchain.sh`). It is the
-//! rustios counterpart of the `LLVM.xcframework` produced by
+//! This crate is compiled as a `staticlib` for `aarch64-apple-ios` and wrapped
+//! into `Rust.xcframework` (see `Scripts/build-rust-toolchain.sh`), exactly like
+//! `llvm.a` ships inside the `LLVM.xcframework` produced by
 //! emexlab/LLVM-On-iOS.
 //!
-//! The result is dynamic: rustc cannot be archived into a static library
-//! because upstream declares `rustc_driver` as `crate-type = ["dylib"]`. The
-//! framework therefore contains this shim plus the `rustc_driver` and `std`
-//! dylibs it loads, and all of them have to be embedded in the app.
+//! A static archive works because rustios keeps the rustc rlibs in the sysroot
+//! (`patch_bootstrap_rustc_artifacts`); upstream only distributes `.rmeta`,
+//! because `rustc_driver` itself is a dylib crate. This crate therefore links
+//! `rustc_driver_impl` - the real driver, of which `rustc_driver` is only a
+//! re-export - and ends up as one `libRustCompiler.a`.
 //!
 //! The C interface lives in `include/rustios.h`.
 //!
@@ -19,14 +20,14 @@
 #![allow(unused_extern_crates)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-extern crate rustc_driver;
+extern crate rustc_driver_impl;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 
-use rustc_driver::Callbacks;
+use rustc_driver_impl::Callbacks;
 
 /// Compilation finished without errors.
 pub const RUSTIOS_OK: c_int = 0;
@@ -101,9 +102,9 @@ fn run_args(args: &[String]) -> c_int {
     // which is how the compiler reports unsuccessful compilations. Panics
     // (ICE) are caught separately by `catch_unwind`.
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        rustc_driver::catch_fatal_errors(|| {
+        rustc_driver_impl::catch_fatal_errors(|| {
             let mut callbacks = RustiosCallbacks;
-            rustc_driver::run_compiler(args, &mut callbacks);
+            rustc_driver_impl::run_compiler(args, &mut callbacks);
         })
     }));
 

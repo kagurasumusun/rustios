@@ -408,6 +408,66 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# bootstrap patch: keep the rustc object files
+#
+# Upstream copies only `.rmeta` files for the rustc crates into the sysroot:
+# the object files are already inside `librustc_driver.so`, and the metadata is
+# enough to link a driver against it. That makes a *static* driver impossible.
+#
+# rustios ships `Rust.xcframework` as a static archive (like LLVM-On-iOS'
+# `llvm.a`), so the rlibs have to survive. This patch keeps them.
+# ---------------------------------------------------------------------------
+
+patch_bootstrap_rustc_artifacts() {
+    local file="${RUST_SOURCE_DIR}/src/bootstrap/src/core/build_steps/compile.rs"
+    if [[ ! -f "${file}" ]]; then
+        warn "bootstrap compile.rs not found; skipping the rlib patch"
+        return 0
+    fi
+    require_cmd python3
+
+    if ! python3 - "${file}" <<'PY'
+import pathlib
+import sys
+
+MARKER = "rustios: keep the object files"
+path = pathlib.Path(sys.argv[1])
+src = path.read_text()
+
+if MARKER in src:
+    print("bootstrap already keeps the rustc rlibs")
+    sys.exit(0)
+
+old = '                filename.ends_with(".rmeta")\n'
+new = (
+    "                // rustios: keep the object files as well, so that the\n"
+    "                // static driver in Rust.xcframework (libRustCompiler.a)\n"
+    "                // can link against rustc_driver_impl and its deps.\n"
+    '                filename.ends_with(".rmeta") || filename.ends_with(".rlib")\n'
+)
+
+if src.count(old) != 1:
+    sys.stderr.write(
+        "could not find the single rustc artifact filter in compile.rs "
+        f"(found {src.count(old)} matches)\n"
+    )
+    sys.exit(3)
+
+path.write_text(src.replace(old, new, 1))
+print("patched bootstrap: rustc rlibs are kept in the sysroot")
+PY
+    then
+        warn "could not patch bootstrap's rustc artifact filter (valid for RUST_VERSION=${RUST_VERSION}); continuing"
+    fi
+
+    if grep -q "rustios: keep the object files" "${file}"; then
+        log "bootstrap patched: rustc rlibs stay in the sysroot (static xcframework)"
+    else
+        warn "rustc rlibs will not be kept; Rust.xcframework falls back to a dylib"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # configure
 # ---------------------------------------------------------------------------
 
@@ -499,6 +559,7 @@ EOF
     sed 's/^/    /' "${cfg}"
 
     patch_bootstrap_llvm
+    patch_bootstrap_rustc_artifacts
 }
 
 # ---------------------------------------------------------------------------
@@ -579,17 +640,18 @@ verify() {
     [[ -d "${sysroot}/lib/rustlib/${HOST_TRIPLE}/codegen-backends" ]] \
         || die "codegen backends for ${HOST_TRIPLE} are missing"
 
-    # bootstrap keeps the Rust dylibs the compiler itself links against in
-    # <sysroot>/lib, the target's std rlibs in <sysroot>/lib/rustlib/<host>/lib.
+    # A static Rust.xcframework needs the rustc rlibs, which only exist when
+    # patch_bootstrap_rustc_artifacts applied before the build.
     shopt -s nullglob
+    local driver_rlibs=("${libdir}"/librustc_driver_impl-*.rlib)
     local compiler_dylibs=("${sysroot}/lib"/librustc_driver-*.dylib)
-    local std_dylibs=("${sysroot}/lib"/libstd-*.dylib)
     shopt -u nullglob
-    if [[ "${#compiler_dylibs[@]}" -eq 0 ]]; then
-        warn "librustc_driver-*.dylib is missing from ${sysroot}/lib; Rust.xcframework will fail"
-    fi
-    if [[ "${#std_dylibs[@]}" -eq 0 ]]; then
-        warn "libstd-*.dylib is missing from ${sysroot}/lib; Rust.xcframework will fail"
+    if [[ "${#driver_rlibs[@]}" -eq 0 ]]; then
+        warn "librustc_driver_impl-*.rlib is missing from ${libdir}"
+        warn "Rust.xcframework will fall back to a dynamic library (no C API)"
+        warn "re-run 'configure' and rebuild to get the static archive"
+    elif [[ "${#compiler_dylibs[@]}" -eq 0 ]]; then
+        warn "librustc_driver-*.dylib is missing from ${sysroot}/lib"
     fi
 
     assert_ios_only "${sysroot}/bin" "the iOS toolchain (bin)"
@@ -723,11 +785,15 @@ EOF
 # ---------------------------------------------------------------------------
 # xcframework: Rust.xcframework (LLVM-On-iOS' LLVM.xcframework)
 #
-# rustc cannot be turned into a static archive: `rustc_driver` is declared as
-# `crate-type = ["dylib"]` in rust-lang/rust and no platform distributes a
-# static `librustc_driver.a`. The xcframework therefore contains a dynamic
-# library slice: the rustios C API shim, linked against the compiler dylib,
-# next to the compiler/runtime dylibs it loads at runtime.
+# LLVM-On-iOS ships `llvm.a` inside `LLVM.xcframework`; this does the same for
+# rustc. A static archive is possible because bootstrap keeps the rustc rlibs
+# (see patch_bootstrap_rustc_artifacts) - upstream throws the object files away
+# and only distributes `.rmeta`, because `rustc_driver` is a dylib crate.
+#
+# The static library is produced by the stage1 (build machine) compiler, which
+# emits aarch64-apple-ios objects, and links the stage2 rlibs for that same
+# target. If those rlibs are missing the framework falls back to a dynamic
+# slice holding the compiler dylib itself (no C API, `"c_api": false`).
 # ---------------------------------------------------------------------------
 
 # is_ios_dylib <file>: true for an arm64 Mach-O dylib linked for iOS.
@@ -780,14 +846,31 @@ find_ios_dylib() {
     return 1
 }
 
+# find_target_rlib <result-var> <prefix...>: store the first rlib for the iOS
+# target (ties are broken by the first search directory that has one).
+find_target_rlib() {
+    local result_var="$1" prefix dir
+    local matches
+    shift
+    for prefix in "$@"; do
+        for dir in "${XCFRAMEWORK_SEARCH_DIRS[@]}"; do
+            if [[ ! -d "${dir}" ]]; then
+                continue
+            fi
+            shopt -s nullglob
+            matches=("${dir}/${prefix}-"*.rlib)
+            shopt -u nullglob
+            if [[ "${#matches[@]}" -gt 0 ]]; then
+                printf -v "${result_var}" '%s' "${matches[0]}"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 # make_relocatable <directory>: rewrite the dylibs in <directory> so that they
 # can be shipped together in one folder inside an app bundle.
-#
-#  * every dylib gets an `@rpath/<name>` install name,
-#  * every dependency on another dylib in the same directory becomes
-#    `@rpath/<name>` (bootstrap links against absolute build paths),
-#  * every dylib gets a `@loader_path` rpath so that transitive dependencies
-#    resolve to its siblings instead of the original build tree.
 make_relocatable() {
     local dir="$1" file dep base
     if ! command -v install_name_tool >/dev/null 2>&1 || ! command -v otool >/dev/null 2>&1; then
@@ -856,10 +939,30 @@ write_xcframework_plist() {
 EOF
 }
 
+# check_static_library <path>: the archive must be an arm64 static library
+# that defines the C API.
+check_static_library() {
+    local lib="$1" desc archs symbols
+    desc="$(file -b "${lib}")"
+    [[ "${desc}" == *"ar archive"* ]] || die "$(basename "${lib}") is not a static archive: ${desc}"
+    archs="$(lipo -info "${lib}" 2>&1 || true)"
+    [[ "${archs}" == *arm64* ]] \
+        || die "$(basename "${lib}") has no arm64 objects: ${archs}"
+    if command -v nm >/dev/null 2>&1; then
+        symbols="$(nm -g "${lib}" 2>/dev/null || true)"
+        [[ "${symbols}" == *"_rustios_run"* ]] \
+            || die "$(basename "${lib}") does not export rustios_run"
+        [[ "${symbols}" == *"_rustios_version"* ]] \
+            || die "$(basename "${lib}") does not export rustios_version"
+    fi
+    log "static library: arm64, exports the rustios C API"
+}
+
 build_xcframework() {
     require_macos
     local stage1 stage2 libdir out_dir merged xcfw slice
-    local runtime_driver runtime_std library has_headers="false" c_api="false"
+    local runtime_driver runtime_std driver_rlib library
+    local has_headers="false" c_api="false" static_lib="false"
     local desc archs build_info
     stage1="$(build_host_dir)"
     stage2="$(stage_dir)"
@@ -872,74 +975,78 @@ build_xcframework() {
     [[ -x "${stage1}/bin/rustc" ]] || die "missing ${stage1}/bin/rustc; run 'build' first"
     [[ -d "${libdir}" ]] || die "missing ${libdir}; run 'build' first"
 
-    # rustc_driver is a dylib crate, so the compiler ships as a dylib.
-    # bootstrap puts it in <sysroot>/lib (the stage2 compiler's own libdir);
-    # the other entries are fallbacks for different bootstrap versions.
+    # Target artifacts live in the sysroot; the compiler dylibs in <sysroot>/lib.
     XCFRAMEWORK_SEARCH_DIRS=(
-        "${stage2}/lib"
         "${libdir}"
+        "${stage2}/lib"
         "${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
         "${stage1}/lib"
     )
-    find_ios_dylib runtime_driver librustc_driver \
-        || die "no librustc_driver-*.dylib for ${HOST_TRIPLE} (searched: ${XCFRAMEWORK_SEARCH_DIRS[*]})"
-    find_ios_dylib runtime_std libstd \
-        || die "no libstd-*.dylib for ${HOST_TRIPLE} (searched: ${XCFRAMEWORK_SEARCH_DIRS[*]})"
-    log "compiler dylib: ${runtime_driver}"
 
     log "assembling ${out_dir}"
     rm -rf "${out_dir}"
     mkdir -p "${out_dir}/lib" "${merged}/lib/rustlib"
 
-    # Compile the C shim with the stage1 compiler: it runs on the build machine
-    # but emits iOS/arm64 code. The sysroot is merged because the codegen
-    # backends are the stage1 (build machine) ones while rustc_driver/std for
-    # the target come from stage2.
+    # The stage1 compiler runs on the build machine but emits iOS/arm64 code.
+    # Its sysroot has to contain both the stage1 codegen backends (for the
+    # build machine) and the stage2 std/rustc rlibs (for the target).
     if [[ "${BUILD_TRIPLE}" != "${HOST_TRIPLE}" && -d "${stage1}/lib/rustlib/${BUILD_TRIPLE}" ]]; then
         ln -sfn "${stage1}/lib/rustlib/${BUILD_TRIPLE}" "${merged}/lib/rustlib/${BUILD_TRIPLE}"
     fi
     ln -sfn "${stage2}/lib/rustlib/${HOST_TRIPLE}" "${merged}/lib/rustlib/${HOST_TRIPLE}"
 
-    log "building the rustios C API (rustc_private)"
-    if RUSTC_BOOTSTRAP=1 \
-       RUSTIOS_VERSION="${RUST_VERSION}" \
-       IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
-       "${stage1}/bin/rustc" \
-            --edition 2021 \
-            --crate-name rustios_driver \
-            --crate-type cdylib \
-            --target "${HOST_TRIPLE}" \
-            --sysroot "${merged}" \
-            -C opt-level=2 \
-            -C debuginfo=0 \
-            -C prefer-dynamic \
-            -C "link-arg=-Wl,-install_name,@rpath/libRustCompiler.dylib" \
-            -C "link-arg=-Wl,-rpath,@loader_path" \
-            -L "dependency=${stage2}/lib" \
-            -L "dependency=${libdir}" \
-            -L "native=$(llvm_dir)/lib" \
-            -o "${out_dir}/lib/libRustCompiler.dylib" \
-            "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"; then
-        c_api="true"
-        library="libRustCompiler.dylib"
-        has_headers="true"
-        mkdir -p "${out_dir}/Headers"
-        cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
+    if find_target_rlib driver_rlib librustc_driver_impl; then
+        log "building the static rustios driver (libRustCompiler.a)"
+        log "  rustc_driver_impl: ${driver_rlib}"
+        if RUSTC_BOOTSTRAP=1 \
+           RUSTIOS_VERSION="${RUST_VERSION}" \
+           IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+           "${stage1}/bin/rustc" \
+                --edition 2021 \
+                --crate-name rustios_driver \
+                --crate-type staticlib \
+                --target "${HOST_TRIPLE}" \
+                --sysroot "${merged}" \
+                -C opt-level=2 \
+                -C debuginfo=0 \
+                -L "dependency=${libdir}" \
+                -o "${out_dir}/lib/libRustCompiler.a" \
+                "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"; then
+            static_lib="true"
+            c_api="true"
+            library="libRustCompiler.a"
+            has_headers="true"
+            mkdir -p "${out_dir}/Headers"
+            cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
+        else
+            warn "could not build the static rustios driver"
+        fi
     else
-        warn "could not build the rustc_private C API for ${HOST_TRIPLE}"
-        warn "shipping the compiler dylib itself as the framework library"
+        warn "no librustc_driver_impl-*.rlib in ${libdir}"
+        warn "bootstrap did not keep the rustc rlibs; run 'configure' + a full rebuild"
+    fi
+
+    if [[ "${static_lib}" != "true" ]]; then
+        # Fallback: ship the compiler dylib itself. It is an iOS shared library
+        # (rustc_driver is a dylib crate upstream), so the framework stays
+        # usable for dlopen()-style embedding, just without the C API.
+        warn "falling back to a dynamic Rust.xcframework"
+        find_ios_dylib runtime_driver librustc_driver \
+            || die "no librustc_driver-*.dylib for ${HOST_TRIPLE} (searched: ${XCFRAMEWORK_SEARCH_DIRS[*]})"
+        find_ios_dylib runtime_std libstd \
+            || die "no libstd-*.dylib for ${HOST_TRIPLE} (searched: ${XCFRAMEWORK_SEARCH_DIRS[*]})"
+        log "compiler dylib: ${runtime_driver}"
         # Keep the original file name: the install_name inside the dylib
         # (@rpath/librustc_driver-<hash>.dylib) has to stay resolvable.
         library="$(basename "${runtime_driver}")"
-        cp "${runtime_driver}" "${out_dir}/lib/${library}"
+        cp -f "${runtime_driver}" "${out_dir}/lib/"
+        cp -f "${runtime_std}" "${out_dir}/lib/"
+        make_relocatable "${out_dir}/lib"
     fi
 
-    # Everything the library loads at runtime has to sit next to it.
-    cp -f "${runtime_driver}" "${out_dir}/lib/"
-    cp -f "${runtime_std}" "${out_dir}/lib/"
-    make_relocatable "${out_dir}/lib"
-
-    local extra=('"c_api": '"${c_api}" '"library": "dynamic"')
+    local kind="dynamic"
+    [[ "${static_lib}" == "true" ]] && kind="static"
+    local extra=('"c_api": '"${c_api}" '"library": "'"${kind}"'"')
     write_build_info "${out_dir}" "${extra[@]}"
 
     if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
@@ -956,28 +1063,29 @@ build_xcframework() {
     fi
     write_xcframework_plist "${xcfw}/Info.plist" "ios-arm64" "${library}" "${has_headers}"
 
-    # Validate the slice the same way the toolchain is validated.
-    desc="$(file -b "${slice}/${library}")"
-    [[ "${desc}" == *"Mach-O 64-bit dynamically linked shared library arm64"* ]] \
-        || die "${library} is not an arm64 dylib: ${desc}"
-    archs="$(lipo -archs "${slice}/${library}")"
-    [[ " ${archs} " == *" arm64 "* ]] || die "${library} has no arm64 slice: ${archs}"
-    if command -v vtool >/dev/null 2>&1; then
-        build_info="$(vtool -show-build "${slice}/${library}")"
-        [[ "${build_info}" == *"platform IOS"* ]] \
-            || die "${library} was not linked for iOS"
-        [[ "${build_info}" == *"minos ${IOS_DEPLOYMENT_TARGET}"* ]] \
-            || warn "${library} deployment target is not ${IOS_DEPLOYMENT_TARGET}"
-    fi
-    if [[ "${has_headers}" == "true" ]]; then
+    if [[ "${static_lib}" == "true" ]]; then
+        check_static_library "${slice}/${library}"
         [[ -f "${slice}/Headers/rustios.h" ]] || die "Headers/rustios.h is missing"
+    else
+        desc="$(file -b "${slice}/${library}")"
+        [[ "${desc}" == *"Mach-O 64-bit dynamically linked shared library arm64"* ]] \
+            || die "${library} is not an arm64 dylib: ${desc}"
+        archs="$(lipo -archs "${slice}/${library}")"
+        [[ " ${archs} " == *" arm64 "* ]] || die "${library} has no arm64 slice: ${archs}"
+        if command -v vtool >/dev/null 2>&1; then
+            build_info="$(vtool -show-build "${slice}/${library}")"
+            [[ "${build_info}" == *"platform IOS"* ]] \
+                || die "${library} was not linked for iOS"
+            [[ "${build_info}" == *"minos ${IOS_DEPLOYMENT_TARGET}"* ]] \
+                || warn "${library} deployment target is not ${IOS_DEPLOYMENT_TARGET}"
+        fi
     fi
 
     local a="${ARTIFACTS_DIR}/${XCFRAMEWORK_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz"
     log "creating ${a}"
     tar_xz "${out_dir}" "${XCFRAMEWORK_NAME}" "${a}"
     checksum "${a}"
-    log "xcframework: $(human_size "${a}") (c_api=${c_api}, library=${library})"
+    log "xcframework: $(human_size "${a}") (${kind}, c_api=${c_api}, library=${library})"
 }
 
 # ---------------------------------------------------------------------------

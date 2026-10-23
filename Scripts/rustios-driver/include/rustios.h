@@ -24,23 +24,26 @@
  *         return rc;
  *     }
  *
- * The library is dynamic: rustc is only available as a dylib ("rustc_driver"
- * is a dylib crate upstream), so the framework slice contains three dylibs
- * that all have to be embedded in the app and signed:
+ * The compiler is shipped as a static archive, like `llvm.a` in
+ * LLVM-On-iOS' LLVM.xcframework:
  *
- *     Rust.xcframework/ios-arm64/libRustCompiler.dylib    <- this API
- *     Rust.xcframework/ios-arm64/librustc_driver-*.dylib  <- the compiler
- *     Rust.xcframework/ios-arm64/libstd-*.dylib           <- its runtime
+ *     Rust.xcframework/ios-arm64/libRustCompiler.a   <- rustc + this API
+ *     Rust.xcframework/ios-arm64/Headers/rustios.h
  *
- * Linking by hand:
+ * Link it into the app (the Rust standard library is part of the archive, so
+ * only the iOS system libraries are needed):
  *
- *     clang main.c -IRust.xcframework/ios-arm64/Headers \
- *           -LRust.xcframework/ios-arm64 -lRustCompiler \
- *           -Wl,-rpath,@executable_path/Frameworks
+ *     clang main.c Rust.xcframework/ios-arm64/libRustCompiler.a \
+ *           -IRust.xcframework/ios-arm64/Headers \
+ *           -lc++ -lSystem -o app
  *
- * In Xcode, add the three dylibs to a "Copy Files" phase that writes into
- * "Frameworks" and enable "Code Sign On Copy" (or use "Embed & Sign"); the
- * rpath above is where iOS looks by default.
+ * In Xcode, drag `libRustCompiler.a` into "Frameworks, Libraries, and
+ * Embedded Content" (Do Not Embed) and add `-lc++ -lSystem` to the other
+ * linker flags.
+ *
+ * The embedded compiler still needs a sysroot with the target's std and the
+ * codegen backend at runtime: ship `RustSupportLibs/sysroot` and pass
+ * `--sysroot=<...>` in the argument list.
  */
 #ifndef RUSTIOS_H
 #define RUSTIOS_H
