@@ -275,6 +275,7 @@ jobs:
           name: rustios-logs-${{ env.RUST_VERSION }}
           path: |
             build.log
+            artifacts/REPORT.txt
             rust-source/build/*.log
             rust-source/build/**/*.log
           if-no-files-found: ignore
@@ -326,6 +327,16 @@ jobs:
               echo '```'
               cat artifacts/SHA256SUMS.txt 2>/dev/null || echo "(no checksums)"
               echo '```'
+              if [ -s artifacts/REPORT.txt ]; then
+                echo
+                echo "<details><summary>artifact report</summary>"
+                echo
+                echo '```'
+                cat artifacts/REPORT.txt
+                echo '```'
+                echo
+                echo "</details>"
+              fi
             else
               echo "Build failed. Tail of build.log:"
               echo
@@ -336,6 +347,14 @@ jobs:
                 echo "(build.log is empty - the failure happened before the first command)"
               fi
               echo '```'
+              if [ -s artifacts/REPORT.txt ]; then
+                echo
+                echo "artifact report:"
+                echo
+                echo '```'
+                cat artifacts/REPORT.txt
+                echo '```'
+              fi
             fi
           } > report.md
           gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" \

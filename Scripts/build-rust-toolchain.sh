@@ -1115,6 +1115,107 @@ check_static_library() {
     log "static library: arm64, exports the rustios C API"
 }
 
+# report_line <text>: append a line to the report that ends up in the PR
+# comment (artifacts/REPORT.txt). The build log itself is not reachable from
+# the CI run, so anything worth knowing about the artifacts goes here.
+report_line() {
+    mkdir -p "${ARTIFACTS_DIR}"
+    printf '%s\n' "$*" >> "${ARTIFACTS_DIR}/REPORT.txt"
+}
+
+# bundle_llvm <archive>
+#
+# `rustc --crate-type staticlib` bundles the objects of the Rust crates but
+# not their native (C++) dependencies, so the compiler archive on its own
+# still references LLVM symbols. LLVM-On-iOS ships `llvm.a` for exactly this
+# reason; fold the iOS LLVM archives into libRustCompiler.a so an app links
+# one file plus the system libraries.
+bundle_llvm() {
+    local lib="$1" llvm merged archives=() log_file
+    llvm="$(llvm_dir)/lib"
+    if [[ ! -d "${llvm}" ]]; then
+        warn "no iOS LLVM at ${llvm}; $(basename "${lib}") will need LLVM linked separately"
+        report_line "xcframework: LLVM **not** bundled (missing ${llvm})"
+        return 0
+    fi
+    shopt -s nullglob
+    archives=("${llvm}"/*.a)
+    shopt -u nullglob
+    if [[ "${#archives[@]}" -eq 0 ]]; then
+        warn "no LLVM static libraries in ${llvm}"
+        report_line "xcframework: LLVM **not** bundled (no *.a in ${llvm})"
+        return 0
+    fi
+
+    merged="${lib}.merged"
+    log_file="${WORK_DIR}/libtool.log"
+    rm -f "${merged}"
+    log "bundling ${#archives[@]} LLVM archives into $(basename "${lib}") ($(human_size "${llvm}"))"
+    if command -v libtool >/dev/null 2>&1; then
+        # Duplicate member names (the same file name in several LLVM archives)
+        # produce a warning each; keep them out of the build log.
+        libtool -static -o "${merged}" "${lib}" "${archives[@]}" >"${log_file}" 2>&1 || true
+    fi
+    if [[ ! -s "${merged}" ]]; then
+        warn "libtool could not merge the archives; falling back to ar"
+        cp "${lib}" "${merged}"
+        if ! ar -q "${merged}" "${archives[@]}" >>"${log_file}" 2>&1; then
+            warn "ar could not merge the archives; shipping $(basename "${lib}") without LLVM"
+            report_line "xcframework: LLVM merge **failed**; link \`RustSupportLibs/llvm/lib/*.a\` too"
+            rm -f "${merged}"
+            return 0
+        fi
+    fi
+    mv -f "${merged}" "${lib}"
+    if [[ -s "${log_file}" ]]; then
+        log "libtool: $(grep -c 'warning' "${log_file}" 2>/dev/null || echo 0) warnings (${log_file})"
+    fi
+    log "$(basename "${lib}"): $(human_size "${lib}") with LLVM"
+    report_line "xcframework: $(basename "${lib}") = rustc + LLVM, $(human_size "${lib}")"
+}
+
+# link_check_static <archive> <headers-dir>
+#
+# The only way to know that the framework can be dropped into an app is to
+# link one against it. This runs a real clang link for arm64/iOS (nothing is
+# executed, so it works on the build machine). A failure is reported but does
+# not fail the build: the artifacts are still worth having.
+link_check_static() {
+    local lib="$1" headers="$2" sdk tmp out missing
+    tmp="$(mktemp -d)"
+    sdk="$(xcrun --sdk iphoneos --show-sdk-path 2>/dev/null || true)"
+    if [[ -z "${sdk}" ]]; then
+        warn "no iPhoneOS SDK; skipping the link test"
+        report_line "xcframework: link test skipped (no iPhoneOS SDK)"
+        rm -rf "${tmp}"
+        return 0
+    fi
+
+    cat > "${tmp}/main.c" <<'EOF'
+#include <rustios.h>
+int main(void) { return rustios_version() == 0; }
+EOF
+
+    out="${tmp}/a.out"
+    if clang -target "arm64-apple-ios${IOS_DEPLOYMENT_TARGET}" \
+            -isysroot "${sdk}" -I "${headers}" \
+            "${tmp}/main.c" "${lib}" -lc++ -lSystem -o "${out}" >"${tmp}/link.log" 2>&1; then
+        log "link test passed: a test app links against $(basename "${lib}")"
+        report_line "xcframework: link test **passed** (clang -target arm64-apple-ios${IOS_DEPLOYMENT_TARGET})"
+    else
+        warn "link test failed; see ${tmp}/link.log"
+        missing="$(grep -o '_[A-Za-z_][A-Za-z0-9_]*' "${tmp}/link.log" \
+                   | sort -u | head -10 | paste -sd ' ' - || true)"
+        report_line "xcframework: link test **failed** ($(basename "${lib}"))"
+        report_line ""
+        report_line '```'
+        report_line "$(tail -15 "${tmp}/link.log")"
+        report_line '```'
+        report_line "unresolved symbols (first 10): ${missing}"
+    fi
+    rm -rf "${tmp}"
+}
+
 build_xcframework() {
     require_macos
     local stage1 stage2 libdir out_dir merged xcfw slice
@@ -1175,6 +1276,7 @@ build_xcframework() {
             c_api="true"
             library="libRustCompiler.a"
             has_headers="true"
+            bundle_llvm "${out_dir}/lib/${library}"
             mkdir -p "${out_dir}/Headers"
             cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
         else
@@ -1225,6 +1327,7 @@ build_xcframework() {
     if [[ "${static_lib}" == "true" ]]; then
         check_static_library "${slice}/${library}"
         [[ -f "${slice}/Headers/rustios.h" ]] || die "Headers/rustios.h is missing"
+        link_check_static "${slice}/${library}" "${slice}/Headers"
     else
         desc="$(file -b "${slice}/${library}")"
         [[ "${desc}" == *"Mach-O 64-bit dynamically linked shared library arm64"* ]] \
@@ -1245,6 +1348,7 @@ build_xcframework() {
     tar_xz "${out_dir}" "${XCFRAMEWORK_NAME}" "${a}"
     checksum "${a}"
     log "xcframework: $(human_size "${a}") (${kind}, c_api=${c_api}, library=${library})"
+    report_line "xcframework: ${kind} slice, c_api=${c_api}, $(human_size "${a}")"
 }
 
 # ---------------------------------------------------------------------------
