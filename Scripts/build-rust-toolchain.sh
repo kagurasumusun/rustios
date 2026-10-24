@@ -14,7 +14,7 @@
 #     host   = where the produced rustc runs     (aarch64-apple-ios)
 #     target = what that rustc compiles for      (aarch64-apple-ios, iOS 16.0)
 #
-# Subcommands: fetch, configure, build, verify, package, support,
+# Subcommands: fetch, configure, preflight, build, verify, package, std,
 #              xcframework, all, clean, clean-all, info
 #
 set -euo pipefail
@@ -711,6 +711,7 @@ ${llvm_section}
 EOF
 
     log "bootstrap.toml written (build=${BUILD_TRIPLE} host=${HOST_TRIPLE} iOS ${IOS_DEPLOYMENT_TARGET})"
+    preflight
     printf '%s\n' "--- ${cfg} ---"
     sed 's/^/    /' "${cfg}"
 
@@ -1591,6 +1592,170 @@ build_xcframework() {
 }
 
 # ---------------------------------------------------------------------------
+# preflight: fail in seconds when the shared LLVM cannot be consumed
+#
+# Every check below is a fact that would otherwise only be discovered at the
+# end of a multi-hour build: a library that the iOS slice does not contain is a
+# link error after rustc has been compiled twice, and a macOS library inside
+# the iOS tree produces a compiler that cannot run on the device.
+# ---------------------------------------------------------------------------
+
+# platform_of <mach-o file>: "IOS", "MACOS", ... or "none"/"unknown".
+platform_of() {
+    local target="$1" desc info
+    command -v file >/dev/null 2>&1 || { echo unknown; return 0; }
+    desc="$(file -b "${target}" 2>/dev/null || true)"
+    case "${desc}" in
+        *Mach-O*) ;;
+        *) echo none; return 0 ;;
+    esac
+    if command -v vtool >/dev/null 2>&1; then
+        info="$(vtool -show-build "${target}" 2>/dev/null || true)"
+        case "${info}" in
+            *"platform IOS"*)           echo IOS; return 0 ;;
+            *"platform MACOS"*)         echo MACOS; return 0 ;;
+            *"LC_VERSION_MIN_IPHONEOS"*) echo IOS; return 0 ;;
+            *"LC_VERSION_MIN_MACOSX"*)   echo MACOS; return 0 ;;
+        esac
+    fi
+    case "$(otool -l "${target}" 2>/dev/null | sed -n 's/.*platform \([A-Z]*\).*/\1/p' | head -1)" in
+        IOS) echo IOS ;;
+        MACOS) echo MACOS ;;
+        *) echo unknown ;;
+    esac
+}
+
+# archive_platform <archive>: platform of the first member that is a Mach-O.
+# A Darwin archive starts with its symbol table (__.SYMDEF), which is not a
+# Mach-O file, so members are inspected until one answers.
+archive_platform() {
+    local archive="$1" member listing workdir result=none
+    [[ -f "${archive}" ]] || { echo none; return 0; }
+    listing="$(ar -t "${archive}" 2>/dev/null || true)"
+    [[ -n "${listing}" ]] || { echo none; return 0; }
+    workdir="$(mktemp -d)"
+    while IFS= read -r member; do
+        case "${member}" in
+            ''|*SYMDEF*|*/) continue ;;
+        esac
+        if ar -p "${archive}" "${member}" > "${workdir}/member.o" 2>/dev/null; then
+            result="$(platform_of "${workdir}/member.o")"
+            case "${result}" in
+                IOS|MACOS|TVOS|WATCHOS) break ;;
+            esac
+        fi
+        result=none
+    done <<PLATFORMS
+${listing}
+PLATFORMS
+    rm -rf "${workdir}"
+    echo "${result}"
+}
+
+preflight() {
+    if [[ "${RUST_LLVM_MODE}" != "swift" ]]; then
+        log "preflight: RUST_LLVM_MODE=${RUST_LLVM_MODE}; bootstrap builds LLVM in-tree, nothing to check"
+        return 0
+    fi
+    local ios_prefix="${SWIFT_LLVM_DIR}/ios" host_prefix="${SWIFT_LLVM_DIR}/macosx"
+    local ios_config host_config host_version ios_version cfg
+
+    ios_config="$(llvm_config_for "${HOST_TRIPLE}")"
+    host_config="$(llvm_config_for "${BUILD_TRIPLE}")"
+    for cfg in "${host_config}" "${ios_config}"; do
+        [[ -x "${cfg}" ]] \
+            || die "missing ${cfg}; unpack the SwiftLLVM artifact (or run Scripts/build-swift-toolchain.sh llvm)"
+    done
+
+    host_version="$("${host_config}" --version 2>/dev/null || echo unknown)"
+    ios_version="$("${ios_config}" --version 2>/dev/null || echo unknown)"
+    [[ "${ios_version}" != "unknown" ]] || die "${ios_config} --version failed"
+    [[ "${host_version}" == "${ios_version}" ]] \
+        || die "the macOS and iOS llvm-config disagree: ${host_version} vs ${ios_version}"
+    log "llvm-config: ${ios_version} for macOS and iOS"
+
+    [[ -f "${ios_prefix}/include/llvm/Config/llvm-config.h" ]] \
+        || die "missing ${ios_prefix}/include/llvm/Config/llvm-config.h; rustc_llvm compiles its C++ wrapper against it"
+    [[ -f "${host_prefix}/include/llvm/Config/llvm-config.h" ]] \
+        || die "missing ${host_prefix}/include/llvm/Config/llvm-config.h"
+
+    # The headers and the version string must describe the same LLVM. Swift's
+    # PACKAGE_VERSION makes llvm-config print 21.0.0 for a 21.1.6 tree, so only
+    # the major version is compared.
+    local header_major major
+    header_major="$(sed -n 's/^#define LLVM_VERSION_MAJOR //p' \
+        "${ios_prefix}/include/llvm/Config/llvm-config.h" | head -1 | tr -d ' ')"
+    major="${ios_version%%.*}"
+    if [[ -n "${header_major}" && "${header_major}" != "${major}" ]]; then
+        die "llvm-config reports ${ios_version} but the headers are major ${header_major}"
+    fi
+
+    # The iOS llvm-config derives its library list from the macOS build, so a
+    # library the iOS slice did not produce appears as \`-l<name>\` instead of a
+    # path - which rustc_llvm turns into a link error hours later.
+    local link_flags missing="" name count
+    link_flags="$("${ios_config}" --link-static --libs)"
+    [[ -n "${link_flags}" ]] || die "${ios_config} --link-static --libs is empty"
+    for name in ${link_flags}; do
+        case "${name}" in
+            -lLLVMLineEditor) log "  LLVMLineEditor is not shipped (rustc filters it)" ;;
+            -l*) missing="${missing} ${name#-l}" ;;
+        esac
+    done
+    if [[ -n "${missing}" ]]; then
+        warn "libraries named by ${ios_config} but absent from ${ios_prefix}/lib:${missing}"
+        die "the iOS LLVM is incomplete; rustc could not link against it"
+    fi
+    count="$(printf '%s\n' "${link_flags}" | tr ' ' '\n' | grep -c . || true)"
+    log "the iOS LLVM provides all ${count} library entries"
+
+    # A macOS library in the iOS tree would make the compiler unusable on the
+    # device, and the reverse breaks the stage1 compiler on the build machine.
+    local sample platform ios_seen=0 unconfirmed=0
+    for sample in "${ios_prefix}/lib/libLLVMCore.a" "${ios_prefix}/lib/libLLVMSupport.a" \
+                  "${ios_prefix}/lib/libLLVMCodeGen.a"; do
+        [[ -f "${sample}" ]] || continue
+        platform="$(archive_platform "${sample}")"
+        log "  $(basename "${sample}"): ${platform}"
+        [[ "${platform}" != "MACOS" ]] \
+            || die "$(basename "${sample}") in ${ios_prefix}/lib is a macOS library"
+        if [[ "${platform}" == "IOS" ]]; then
+            ios_seen=$((ios_seen + 1))
+        else
+            unconfirmed=$((unconfirmed + 1))
+        fi
+    done
+    if [[ "${ios_seen}" -gt 0 ]]; then
+        log "${ios_seen} sampled libraries are iOS Mach-O archives"
+    fi
+    if [[ "${unconfirmed}" -gt 0 ]]; then
+        warn "${unconfirmed} sampled libraries could not be confirmed as iOS (is 'file'/'vtool' available?)"
+    fi
+    sample="${host_prefix}/lib/libLLVMCore.a"
+    if [[ -f "${sample}" ]]; then
+        platform="$(archive_platform "${sample}")"
+        log "  macosx/$(basename "${sample}"): ${platform}"
+        [[ "${platform}" != "IOS" ]] \
+            || die "${sample} is an iOS library; the stage1 compiler could not link it"
+    fi
+
+    if [[ ! -f "${ios_prefix}/bin/llvm-ar" ]]; then
+        warn "${ios_prefix}/bin/llvm-ar is missing: rustc on the device cannot create archives"
+    fi
+
+    # One line of evidence in REPORT.txt; the workflow runs preflight twice
+    # (unpack step and configure), so do not append it twice.
+    local slice="iOS slice not inspected"
+    if [[ "${ios_seen}" -gt 0 ]]; then
+        slice="iOS slice confirmed (${ios_seen} sampled)"
+    fi
+    local line
+    line="shared LLVM preflight: ${ios_version}, ${count} libraries, ${slice}"
+    grep -qxF "${line}" "${ARTIFACTS_DIR}/REPORT.txt" 2>/dev/null || report_line "${line}"
+    log "preflight passed: the shared LLVM ${ios_version} can be consumed by rustc"
+}
+
+# ---------------------------------------------------------------------------
 # misc
 # ---------------------------------------------------------------------------
 
@@ -1640,6 +1805,7 @@ usage: $(basename "$0") <command>
 commands:
   fetch         clone rust ${RUST_VERSION} and the required submodules
   configure     write bootstrap.toml (cross-compile rustc for ${HOST_TRIPLE})
+  preflight     check, in seconds, that the shared LLVM can be linked
   build         run x.py build --stage ${STAGE}
   verify        check that rustc/std really are iOS arm64 artifacts
   package       create ${TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${RUST_VERSION}.tar.xz (compiler only)
@@ -1666,6 +1832,7 @@ main() {
         fetch)       fetch ;;
         configure)   configure ;;
         build)       build ;;
+        preflight)   preflight ;;
         verify)      verify ;;
         package)     package ;;
         std)         std ;;

@@ -286,6 +286,11 @@ if let Ok(sdk) = std::env::var("RUSTIOS_IOS_SDK") {
 
 ### 検証
 
+その前に `Scripts/build-rust-toolchain.sh preflight` が数秒で「この LLVM を
+実際にリンクできるか」を確認します（`ios/lib` に無いライブラリ、iOS 側に混ざった
+macOS のアーカイブ、ヘッダとバージョンの major の不一致など。放っておくと 2 段の
+ビルドが終わった後のリンクエラーになるもの）。
+
 `make verify` は 2 つを確認します。
 
 **(1) Swift の LLVM が本当に使われたか**（`verify_llvm_source`）。

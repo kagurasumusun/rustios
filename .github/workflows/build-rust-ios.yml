@@ -366,6 +366,11 @@ jobs:
           echo "llvm-config (macOS) says: $(work/SwiftLLVM/macosx/bin/llvm-config --version)"
           test -d work/SwiftLLVM/ios/include/llvm
           ls work/SwiftLLVM/ios/lib | head
+          # Fail in seconds, not after the two compiler stages: these are the
+          # properties whose violation otherwise only shows up as a link error
+          # at the end of the build (a library missing from the iOS slice, a
+          # macOS archive in the iOS tree, headers and libraries that disagree).
+          Scripts/build-rust-toolchain.sh preflight
 
       - name: Show environment
         run: |-

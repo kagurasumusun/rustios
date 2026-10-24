@@ -309,6 +309,24 @@ $ cat work/SwiftLLVM/ios/llvm-config.log
 CI では `verify` が失敗したとき、bootstrap.toml・`llvm-config.log`・
 ディレクトリ一覧を `build.log` に落とし、PR コメントに出します。
 
+### 5.1 ビルド前の `preflight`（数秒で落とす）
+
+`Scripts/build-rust-toolchain.sh preflight` は、`build` の**前**に「その LLVM を
+実際にリンクできるか」を数秒で確認します。ここで検出するものは、放っておくと
+**2 段のコンパイラビルドが終わった後のリンクエラー**としてしか現れません。
+
+* macOS 版と iOS 版の `llvm-config` が同じバージョンを返すか
+* `ios/include/llvm/Config/llvm-config.h` があり、`--version` と major が一致するか
+  （Swift の `PACKAGE_VERSION` のため patch は一致しない。§1 参照）
+* iOS の `llvm-config --link-static --libs` が `-l<name>` を出さないか。
+  shim のライブラリ一覧は macOS 側の `llvm-config` から作るので、iOS スライスに
+  無いライブラリは「パスではなく `-l`」として現れる
+* `ios/lib` のアーカイブが本当に iOS か（`__.SYMDEF` を飛ばして実メンバーを検査、
+  `macosx/lib` 側が macOS か）
+* `ios/bin/llvm-ar` があるか（無いと端末上の rustc がアーカイブを作れない）
+
+`configure` の最後と、CI の「Unpack the shared LLVM」ステップで実行します。
+
 ローカルで確認できること（macOS 不要・スタブで実行可能）:
 
 ```bash
