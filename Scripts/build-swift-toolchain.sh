@@ -702,25 +702,48 @@ classify_tree() {
 # has to be proven on its members.
 verify_archive_is_ios() {
     local archive="$1" label="$2" tmp member extracted platform
+    local members=() checked=0
     [[ -f "${archive}" ]] || die "missing ${archive}"
     tmp="$(mktemp -d)"
     # shellcheck disable=SC2064
     trap "rm -rf '${tmp}'" RETURN
-    member="$(ar -t "${archive}" 2>/dev/null | head -1)"
-    [[ -n "${member}" ]] || { warn "${label}: could not list ${archive}"; return 0; }
-    if ! ( cd "${tmp}" && ar -x "${archive}" "${member}" ) >/dev/null 2>&1; then
-        warn "${label}: could not extract a member of ${archive}"
-        return 0
-    fi
-    extracted="${tmp}/${member}"
-    [[ -f "${extracted}" ]] || { warn "${label}: ${member} not extracted"; return 0; }
-    platform="$(macho_platform "${extracted}")"
-    if [[ "${platform}" != "IOS" ]] && [[ "${platform}" != "unknown" ]]; then
-        die "${label}: ${member} in ${archive##*/} is ${platform}, not IOS"
-    fi
-    file -b "${extracted}" | grep -q arm64 \
-        || die "${label}: ${member} in ${archive##*/} is not arm64"
-    log "${label}: ${archive##*/} member ${member} is ${platform}/arm64"
+
+    # The first entry of a Darwin archive is the symbol table (`__.SYMDEF`,
+    # `__.SYMDEF SORTED`, ...), which is not a Mach-O file at all - checking it
+    # would report "none". Take real objects only.
+    while IFS= read -r member; do
+        case "${member}" in
+            ""|__.SYMDEF*|SYMDEF*|"") continue ;;
+            */) continue ;;   # GNU ar writes member names with a trailing slash
+        esac
+        members+=("${member}")
+    done < <(ar -t "${archive}" 2>/dev/null)
+
+    [[ "${#members[@]}" -gt 0 ]] || { warn "${label}: no object members in ${archive##*/}"; return 0; }
+
+    # A few members are enough: every object of an LLVM archive comes out of
+    # the same compiler invocation with the same -target/-isysroot flags.
+    for member in "${members[@]:0:3}"; do
+        rm -f "${tmp}/"*
+        if ! ( cd "${tmp}" && ar -x "${archive}" "${member}" ) >/dev/null 2>&1; then
+            warn "${label}: could not extract ${member} from ${archive##*/}"
+            continue
+        fi
+        extracted="${tmp}/${member}"
+        [[ -f "${extracted}" ]] || continue
+        platform="$(macho_platform "${extracted}")"
+        case "${platform}" in
+            none) continue ;;
+            IOS|unknown) ;;
+            *) die "${label}: ${member} in ${archive##*/} is ${platform}, not IOS" ;;
+        esac
+        file -b "${extracted}" | grep -q arm64 \
+            || die "${label}: ${member} in ${archive##*/} is not arm64"
+        checked=$((checked + 1))
+    done
+
+    [[ "${checked}" -gt 0 ]] || { warn "${label}: could not inspect a member of ${archive##*/}"; return 0; }
+    log "${label}: ${archive##*/} members are ${platform}/arm64 (${checked} checked)"
 }
 
 verify() {

@@ -65,6 +65,13 @@ CI の履歴:
    `swiftc` が macOS バイナリだったため検証で停止し、Rust ジョブはスキップ。
    → 検証を「`swift-frontend` は iOS 必須、他は内訳をレポート」に変更し、
    `SwiftLLVM` ができていれば Rust ジョブを実行するようにした。
+5. ビルド成功（4 時間 29 分）→ `Verify the LLVM slices` で失敗:
+   `__.SYMDEF in libLLVMCore.a is none, not IOS`。Darwin の ar はアーカイブの
+   先頭に**シンボルテーブル**（`__.SYMDEF`）を入れており、これは Mach-O では
+   ない。→ メンバー一覧から `SYMDEF*` を除外し、複数メンバーを確認するよう修正。
+   加えて、**パッケージとアップロードを検証より前に**移した（4.5 時間のビルドを
+   検証のバグで捨てないため）。ビルド成果物（`work/SwiftLLVM` と
+   `work/SwiftToolchain`）をキャッシュするようにもした。
 
 ---
 
@@ -316,7 +323,7 @@ RUST_LLVM_MODE=swift Scripts/build-rust-toolchain.sh configure
 | Swift 6.4 の iOS ビルド（LLVM 2 種 + swift-frontend） | **CI で成功**（4 時間 21 分、`swift-frontend` は iOS/arm64） |
 | `swiftc`（ドライバ）の iOS 性 | **未確認／おそらくホスト用**: 直近の実行で macOS バイナリと判定。`swift-frontend` が iOS なのでコンパイラとしては成立するが、ドライバをデバイスで使うには追加対応が要る |
 | Swift ツールチェーンに混ざるホスト（macOS）バイナリ | **既知**: LLVM-On-iOS も `lib/swift/host/compiler/*.dylib` を同梱。`verify` は内訳をレポートし、iOS と偽らない |
-| 静的ライブラリの iOS 性 | **実装**: メンバー（`.o`）を抽出して `vtool` で `platform IOS` を確認（`file` では ar archive としか出ないため） |
+| 静的ライブラリの iOS 性 | **実装**: シンボルテーブル（`__.SYMDEF`）を除いたメンバー（`.o`）を抽出して `vtool` で `platform IOS` を確認（`file` では ar archive としか出ないため）。実アーカイブでの確認は次回実行 |
 | Rust 1.94.0 が LLVM 21.1.6 でリンク・動作すること | **未検証**。このワークフローで初めて実行する |
 | rust-lang/llvm-project 固有パッチの全列挙 | **未完了**。`rustc/21.1-2025-08-01` は upstream `release/21.x` のマージが主で、bootstrap 側の分岐は `LLVM_RUSTLLVM` の定義だけ。ただし「1 つも無い」ことまでは確認できていない |
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |

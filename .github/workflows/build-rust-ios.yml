@@ -162,24 +162,33 @@ jobs:
           path: swift-source
           key: swift-src-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}
 
+      # The build itself is ~4.5 h on a 3-core runner and is a pure function of
+      # (sources, preset, this script), so its *outputs* are cached. The build
+      # trees are far too large for a cache; the two installed trees are not,
+      # and they are what the rest of the pipeline uses.
+      - name: Restore the built LLVM and Swift compiler
+        id: cache-swift-built
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/SwiftLLVM
+            work/SwiftToolchain
+          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini') }}
+
       # Swift 6.4's build-script builds the two LLVM trees (macOS: the compiler
       # that does the work, iOS: the one that is shipped and that rustc links
       # against) and the two Swift compilers in one invocation; see
       # Scripts/build-swift-toolchain.sh. ~4 hours on a 3-core runner.
       - name: Build Swift + LLVM for iOS
+        if: steps.cache-swift-built.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift llvm =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh llvm 2>&1 | tee -a swift.log
 
-      - name: Verify the LLVM slices
-        run: |-
-          set -o pipefail
-          echo "===== swift verify (llvm) =====" | tee -a swift.log
-          Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
-
-      # Up first: the Rust job only needs this part, and a Swift build that
-      # later times out must not hide it.
+      # Package and upload before verifying: four and a half hours of build
+      # must not be thrown away by a bug (or a stricter check) in a later step,
+      # and the rust job can start from the artifact either way.
       - name: Package the shared LLVM
         run: |-
           set -o pipefail
@@ -207,7 +216,14 @@ jobs:
           fi
         id: llvm-ready
 
+      - name: Verify the LLVM slices
+        run: |-
+          set -o pipefail
+          echo "===== swift verify (llvm) =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
+
       - name: Collect the iOS Swift compiler
+        if: steps.cache-swift-built.outputs.cache-hit != 'true'
         run: |-
           set -o pipefail
           echo "===== swift install-swift =====" | tee -a swift.log
@@ -238,6 +254,16 @@ jobs:
             artifacts/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 90
+
+      - name: Save the built LLVM and Swift compiler
+        continue-on-error: true
+        if: always() && steps.cache-swift-built.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            work/SwiftLLVM
+            work/SwiftToolchain
+          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini') }}
 
       - name: Upload Swift logs
         if: always()
