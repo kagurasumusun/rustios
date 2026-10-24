@@ -136,6 +136,28 @@ git tag v1.94.0 && git push origin v1.94.0
 `RUST_VERSION` を変えるときは、そのタグが想定する LLVM の major.minor を
 確認してください（[docs/llvm-sharing.md](docs/llvm-sharing.md) の対応表）。
 
+### Rust 半分だけを、既にある `SwiftLLVM` から作る
+
+`build-rust-from-artifact` は、**Swift をビルドし直さずに** 既存の
+`swift-llvm` artifact をダウンロードして Rust 側だけをビルドします
+（artifact は 90 日保持）。Swift と Rust は 1 つの run の 2 ジョブなので、
+Rust 側だけやり直したいときに 4.5 時間の Swift ビルドをやり直さずに済み、
+**push でキャンセルされない** 独立した concurrency グループを持ちます。
+
+```sh
+# 方法 1: GitHub UI（Actions → build-rust-from-artifact → Run workflow）
+#         source_run_id が空なら「最新の swift-llvm artifact」を使う
+#         ※ workflow_dispatch には actions:write 権限が要る
+
+# 方法 2: トリガーファイルを push（contents:write だけで起動できる）
+#         .github/rust-from-artifact.trigger に run id を書く（空なら最新）
+```
+
+どの run の LLVM を使ったかは、ジョブの「Show environment」と PR コメント
+（`swift-llvm from: …/runs/<id>`, commit）に記録されます。LLVM は作り直さず、
+Swift ジョブも走らせません。これは「rustc が Swift の LLVM をリンクできるか」
+を最短で確かめる経路でもあります。
+
 ### ローカル
 
 macOS + Xcode（iPhoneOS SDK）が必要です。
