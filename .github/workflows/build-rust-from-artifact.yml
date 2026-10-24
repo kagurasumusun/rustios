@@ -65,10 +65,18 @@ permissions:
   # storage, which is not reachable from everywhere.
   pull-requests: write
 
+# One group *per run*: this workflow builds for two to three hours, and nothing
+# - not a push, not another trigger, not a cancel of a queued sibling run -
+# should be able to take that work away. GitHub cancels a previously *pending*
+# run when a new run enters the same group, so a shared group would silently
+# drop triggers; with a unique group every trigger is a run of its own.
+#
+# The consequence is that two triggers build in parallel (two runners, two sets
+# of artifacts, each in its own run) instead of one replacing the other, which
+# is what we want here: the LLVM artifact is read-only input and the outputs
+# never share a path.
 concurrency:
-  # Deliberately not the group of build-rust-ios: a push must not cancel a
-  # multi-hour Rust build, and this workflow must not cancel a Swift build.
-  group: build-rust-from-artifact-${{ github.ref }}
+  group: build-rust-from-artifact-${{ github.run_id }}-${{ github.run_attempt }}
   cancel-in-progress: false
 
 env:

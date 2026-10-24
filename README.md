@@ -153,6 +153,11 @@ Rust 側だけやり直したいときに 4.5 時間の Swift ビルドをやり
 #         .github/rust-from-artifact.trigger に run id を書く（空なら最新）
 ```
 
+長時間ビルドが **push でキャンセルされない** ようにしてあります:
+`build-rust-ios` は `cancel-in-progress: false`（実行中のビルドは残り、待機中の
+run だけが新しい push に置き換わります）、`build-rust-from-artifact` は run ごとに
+別の concurrency グループを持つので、そもそも待機・置換が起きません。
+
 どの run の LLVM を使ったかは、ジョブの「Show environment」と PR コメント
 （`swift-llvm from: …/runs/<id>`, commit）に記録されます。LLVM は作り直さず、
 Swift ジョブも走らせません。これは「rustc が Swift の LLVM をリンクできるか」
