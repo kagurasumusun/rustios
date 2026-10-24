@@ -56,7 +56,13 @@ permissions:
 
 concurrency:
   group: build-rust-ios-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/') }}
+  # Do *not* cancel a run in progress: a run is ~4.5 h of Swift + LLVM, and
+  # GitHub's `pull_request` path filter matches the whole PR diff, so every
+  # push to a branch that touches `Scripts/` starts a run - which used to throw
+  # away a build that had been going for hours. With `false`, a push only
+  # replaces the *pending* run, and the one that is running finishes (and saves
+  # the Swift cache, so the next run skips the 4.5 h build entirely).
+  cancel-in-progress: false
 
 env:
   RUST_VERSION: ${{ github.event.inputs.rust_version || '1.94.0' }}
