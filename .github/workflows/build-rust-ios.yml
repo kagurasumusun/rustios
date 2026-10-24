@@ -19,10 +19,12 @@ on:
     tags: ["v*"]
   pull_request:
     paths:
+      # A push cancels the run in progress (see `concurrency`), and a run is
+      # ~4.5 h of LLVM/Swift plus the Rust build. Documentation-only changes
+      # must therefore not start one.
       - ".github/workflows/build-rust-ios.yml"
       - "Makefile"
       - "Scripts/**"
-      - "docs/**"
   workflow_dispatch:
     inputs:
       rust_version:
@@ -332,7 +334,11 @@ jobs:
     # half must not hide the answer to the question this job exists for (does
     # rustc link Swift's LLVM?).
     if: always() && needs.swift.outputs.llvm_uploaded == 'true'
-    timeout-minutes: 300
+    # Stage 1 (build-machine rustc) and stage 2 (rustc that runs on iOS) each
+    # compile the compiler, so this is the second longest job in the workflow.
+    # GitHub-hosted runners allow at most 6 h; a timeout discards every product
+    # of the run, so use the whole budget.
+    timeout-minutes: 360
     runs-on: macos-latest
     outputs:
       rust_version: ${{ steps.version.outputs.rust_version }}
