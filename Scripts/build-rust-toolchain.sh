@@ -670,6 +670,13 @@ locked-deps = true
 # Sanitizer runtimes need compiler-rt built for the target, which this
 # toolchain does not ship.
 sanitizers = false
+# compiler-rt lives in src/llvm-project, which is never checked out here (the
+# LLVM is Swift's). For a release channel the default asks for the C
+# implementations of a few intrinsics (CompilerBuiltins::BuildLLVMFuncs) and
+# fails with "submodule src/llvm-project does not appear to be checked out";
+# build compiler_builtins in Rust instead. Only the speed of those intrinsics
+# is affected, not correctness.
+optimized-compiler-builtins = false
 ${jobs_line}
 ${ccache_line}
 
