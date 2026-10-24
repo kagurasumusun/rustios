@@ -15,9 +15,17 @@ name: build-rust-from-artifact
 # The LLVM is *not* rebuilt here and the Swift job is not run: this workflow is
 # proof that the Rust compiler consumes what Swift produced.
 #
-# Trigger it manually (Actions -> build-rust-from-artifact -> Run workflow) on
-# the branch whose `Scripts/` should do the build. Leave `source_run_id` empty
-# to take the newest non-expired `swift-llvm` artifact in this repository.
+# How to start it:
+#
+#   * Actions -> build-rust-from-artifact -> Run workflow (leave `source_run_id`
+#     empty for the newest non-expired `swift-llvm` artifact), or
+#   * edit `.github/rust-from-artifact.trigger` (put a run id in it, or leave it
+#     empty for "newest") and push - that is the path CI credentials with only
+#     `contents: write` can use, because `workflow_dispatch` needs
+#     `actions: write`.
+#
+# Either way the branch that is checked out (`Scripts/`) does the build, and the
+# artifact may come from any branch or run of this repository.
 #
 # NOTE: the build job below duplicates the `build` job of build-rust-ios.yml.
 # They are kept in sync by hand; once the Rust job is verified, build-rust-ios
@@ -42,6 +50,11 @@ on:
         description: "Also build Rust.xcframework (needs rustc_private)"
         type: boolean
         default: true
+  # Push-to-trigger: see the header. The file itself may be empty (newest
+  # artifact) or hold a run id (with `#` comments allowed).
+  push:
+    paths:
+      - ".github/rust-from-artifact.trigger"
 
 permissions:
   contents: read
@@ -59,10 +72,11 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUST_VERSION: ${{ inputs.rust_version }}
+  # `inputs` is empty for the push trigger, hence the fallbacks.
+  RUST_VERSION: ${{ inputs.rust_version || '1.94.0' }}
   IOS_DEPLOYMENT_TARGET: "16.0"
-  STAGE: ${{ inputs.stage }}
-  BUILD_XCFRAMEWORK: ${{ inputs.build_xcframework }}
+  STAGE: ${{ inputs.stage || '2' }}
+  BUILD_XCFRAMEWORK: ${{ inputs.build_xcframework || 'true' }}
   # The Swift release whose llvm-project the artifact was built from.
   SWIFT_BRANCH: swift-6.4.0-RELEASE
   # Must match build-rust-ios.yml, or the rust source cache is not shared.
@@ -82,6 +96,9 @@ jobs:
       source_branch: ${{ steps.pick.outputs.source_branch }}
       created_at: ${{ steps.pick.outputs.created_at }}
     steps:
+      - name: Checkout (only to read the trigger file)
+        uses: actions/checkout@v4
+
       - name: Look up the newest swift-llvm artifact
         id: pick
         env:
@@ -90,6 +107,10 @@ jobs:
           WANTED_RUN: ${{ inputs.source_run_id }}
         run: |
           set -euo pipefail
+          # The push trigger carries its run id in the file, not in inputs.
+          if [ -z "${WANTED_RUN}" ] && [ -f .github/rust-from-artifact.trigger ]; then
+            WANTED_RUN="$(sed 's/#.*//' .github/rust-from-artifact.trigger | tr -d '[:space:]')"
+          fi
           # One query, no pagination loop: artifacts are listed newest first
           # and `sort_by` keeps the result deterministic anyway.
           pick='[.artifacts[] | select(.name == "swift-llvm" and (.expired | not))]
