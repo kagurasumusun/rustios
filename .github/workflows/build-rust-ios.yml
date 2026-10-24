@@ -20,11 +20,15 @@ on:
   pull_request:
     paths:
       # A push cancels the run in progress (see `concurrency`), and a run is
-      # ~4.5 h of LLVM/Swift plus the Rust build. Documentation-only changes
-      # must therefore not start one.
+      # ~4.5 h of LLVM/Swift plus the Rust build, so only changes to the Swift
+      # half start one. Rust-side iteration (`Scripts/build-rust-toolchain.sh`,
+      # `Scripts/llvm-config-shim.py`, docs) uses build-rust-from-artifact,
+      # which takes the LLVM from an existing artifact - otherwise every Rust
+      # fix would throw away a Swift build that is hours old.
       - ".github/workflows/build-rust-ios.yml"
       - "Makefile"
-      - "Scripts/**"
+      - "Scripts/build-swift-toolchain.sh"
+      - "Scripts/swift-ios-toolchain-presets.ini"
   workflow_dispatch:
     inputs:
       rust_version:

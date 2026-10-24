@@ -691,6 +691,12 @@ download-rustc = false
 # produce archives on device. With an external LLVM they are shipped by
 # build-swift-toolchain.sh (ios/bin/), so bootstrap must not look for them.
 ${llvm_tools_line}
+# Bootstrap's sanity check requires a FileCheck executable next to an external
+# LLVM whenever codegen tests are enabled (sanity.rs: "Externally configured
+# LLVM requires FileCheck to exist"), and the default is `true`. No test of
+# tests/codegen is run here, so turn it off instead of shipping a tool the
+# toolchain would never use.
+codegen-tests = false
 
 [llvm]
 # The LLVM that ends up inside the iOS rustc must be an iOS library, so the
