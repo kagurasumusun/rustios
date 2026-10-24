@@ -82,6 +82,7 @@ CI の履歴:
 | Swift | `swift-6.4.0-RELEASE` | `utils/update-checkout --tag swift-6.4.0-RELEASE` |
 | swiftlang/llvm-project | `903b9faa…`（`swift/release/6.4.0`） | 上記タグが指す llvm-project |
 | **Swift の LLVM** | **21.1.6** | `llvm/CMakeLists.txt` → `cmake/Modules/LLVMVersion.cmake` |
+| `llvm-config --version`（Swift のビルド） | **21.0.0** | Swift のビルドが `-DPACKAGE_VERSION=21.0.0` を渡すため（`CLANG_USER_VISIBLE_VERSION`）。**ソース/API は 21.1.6** |
 | Rust | `1.94.0` | `RUST_VERSION` の既定値 |
 | rust-lang/llvm-project | `00d23d10…`（`rustc/21.1-2025-08-01`） | `1.94.0` の `src/llvm-project` サブモジュール |
 | **Rust が想定する LLVM** | **21.1.8** | 同じく `LLVMVersion.cmake` |
@@ -98,6 +99,15 @@ CI の履歴:
 
 方針は「major.minor が同じなら patch 差は許す」。21.1.6 と 21.1.8 は同じ
 `release/21.x` 系列で、差はバグ修正のみです。
+
+> **`llvm-config --version` が 21.0.0 を返す理由**: Swift のビルドは
+> `swift/utils/build_swift/build_swift/defaults.py` の
+> `CLANG_USER_VISIBLE_VERSION = Version('21.0.0')` を `-DPACKAGE_VERSION` として
+> LLVM に渡します。そのため `llvm-config --version` は 21.0.0 になりますが、
+> **チェックアウトされているソースとヘッダは 21.1.6**（`LLVMVersion.cmake`、
+> コミット `903b9faa`）です。rustc がコンパイルする相手はヘッダとライブラリ
+> なので、実際の API は 21.1.6 です。bootstrap の検査は major のみ（≥ 20）なので
+> 影響しません。レポートには両方の数字を記録します。
 
 > **注意**: bootstrap 自身はこの対応を検査しません（後述のとおり
 > 「LLVM ≥ 20」しか見ない）。この表が唯一の根拠なので、`RUST_VERSION` を
