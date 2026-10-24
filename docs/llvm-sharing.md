@@ -189,6 +189,21 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 
 ---
 
+### 2.5 rust-lang 版 LLVM との API 差（パッチで吸収）
+
+major.minor が同じでも、rust-lang/llvm-project の `rustc/21.1-2025-08-01` と
+swiftlang/llvm-project の `swift-6.4.0-RELEASE` は別のコミットです。rustc の
+C++ ラッパーが LLVM を**バージョン番号だけで**分岐している箇所は、upstream 側の
+API 変更がそのままコンパイルエラーになります（実ビルドで 1 件検出）。
+
+| 箇所 | rust-lang 版 (21.1.8) | swiftlang 版 (21.1.6) | 対応 |
+| --- | --- | --- | --- |
+| `llvm::PGOOptions` のコンストラクタ | 第 5 引数に `IntrusiveRefCntPtr<vfs::FileSystem>` | **無い**（upstream が 21.1.6 より前に削除） | `patches/0001-rustc-1.94.0-pgooptions-without-vfs.patch` で `FS` を渡さない形にそろえる（rustc は LLVM 22 まで「ある」前提で分岐している） |
+
+パッチは `fetch` と `configure` が自動で当てます（`git apply`、当たらない場合は
+**失敗**させます。無理に押し通さない）。`RUST_LLVM_MODE=intree` では当てません。
+理由は各パッチのヘッダにも書いてあります。
+
 ## 3. Swift 側の LLVM
 
 `Scripts/swift-ios-toolchain-presets.ini` は emexlab/LLVM-On-iOS の
@@ -357,6 +372,7 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | rust-lang/llvm-project 固有パッチの全列挙 | **未完了**。`rustc/21.1-2025-08-01` は upstream `release/21.x` のマージが主で、bootstrap 側の分岐は `LLVM_RUSTLLVM` の定義だけ。ただし「1 つも無い」ことまでは確認できていない |
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
+| rust-lang 版 LLVM との API 差 | **1 件検出・パッチ適用**（`PGOOptions` の vfs 引数）。他にも同種の差があれば実ビルドで判明する |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
 

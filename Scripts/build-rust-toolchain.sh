@@ -309,6 +309,63 @@ sign_tree() {
 }
 
 # ---------------------------------------------------------------------------
+# apply_rust_patches: bring rustc's sources in line with the LLVM we link
+#
+# The LLVM is Swift's, i.e. upstream llvm-project, not rust-lang/llvm-project.
+# The two 21.1 trees have the same major.minor, but they are not the same
+# commit: where rustc's C++ wrappers branch on the LLVM *version* only, an
+# upstream API change can still break the compile. Each such difference is a
+# file in patches/ whose header explains it. A patch that no longer applies is
+# an error: it means rustc changed the code and the condition has to be
+# re-checked rather than forced.
+# ---------------------------------------------------------------------------
+
+PATCH_DIR="${PATCH_DIR:-${REPO_ROOT}/patches}"
+
+apply_rust_patches() {
+    APPLIED_PATCHES=""
+    if [[ "${RUST_LLVM_MODE}" != "swift" ]]; then
+        log "rustc patches: none needed (RUST_LLVM_MODE=${RUST_LLVM_MODE} links rust-lang/llvm-project)"
+        return 0
+    fi
+    [[ -d "${PATCH_DIR}" ]] || { log "rustc patches: ${PATCH_DIR} does not exist"; return 0; }
+
+    local patches=()
+    local patch
+    shopt -s nullglob
+    patches=("${PATCH_DIR}"/*.patch)
+    shopt -u nullglob
+    if [[ "${#patches[@]}" -eq 0 ]]; then
+        log "rustc patches: ${PATCH_DIR} is empty"
+        return 0
+    fi
+
+    local applied=0 skipped=0
+    while IFS= read -r patch; do
+        local name
+        name="$(basename "${patch}")"
+        if git -C "${RUST_SOURCE_DIR}" apply --reverse --check "${patch}" >/dev/null 2>&1; then
+            log "rustc patch already applied: ${name}"
+            skipped=$((skipped + 1))
+        elif git -C "${RUST_SOURCE_DIR}" apply --check "${patch}" >/dev/null 2>&1; then
+            git -C "${RUST_SOURCE_DIR}" apply "${patch}" \
+                || die "could not apply ${name}"
+            log "rustc patch applied: ${name}"
+            applied=$((applied + 1))
+        else
+            printf '%s\n' "--- ${name} (first hunk) ---" >&2
+            sed -n '/^@@/,$p' "${patch}" | head -20 >&2
+            die "${name} does not apply to ${RUST_SOURCE_DIR}; rustc changed the code it patches"
+        fi
+        APPLIED_PATCHES="${APPLIED_PATCHES} ${name}"
+    done < <(printf '%s\n' "${patches[@]}")
+    log "rustc patches: ${applied} applied, ${skipped} already in place:${APPLIED_PATCHES}"
+    # fetch and configure both call this; keep one line in the report.
+    local line="rustc patches (API compatibility with the Swift LLVM):${APPLIED_PATCHES}"
+    grep -qxF "${line}" "${ARTIFACTS_DIR}/REPORT.txt" 2>/dev/null || report_line "${line}"
+}
+
+# ---------------------------------------------------------------------------
 # fetch
 # ---------------------------------------------------------------------------
 
@@ -351,6 +408,8 @@ fetch() {
     [[ -f "${RUST_SOURCE_DIR}/library/backtrace/Cargo.toml" ]] \
         || die "library/backtrace is empty; submodule checkout failed"
     [[ -f "${RUST_SOURCE_DIR}/x.py" ]] || die "x.py not found in ${RUST_SOURCE_DIR}"
+
+    apply_rust_patches
 
     log "rust sources ready ($(git -C "${RUST_SOURCE_DIR}" rev-parse --short HEAD))"
 }
@@ -573,6 +632,9 @@ PY
 
 configure() {
     [[ -d "${RUST_SOURCE_DIR}" ]] || die "${RUST_SOURCE_DIR} does not exist; run 'fetch' first"
+    # Idempotent: needed when the sources come from a cache that predates a
+    # patch, and it fails loudly if a patch stopped applying.
+    apply_rust_patches
 
     local cfg="${RUST_SOURCE_DIR}/bootstrap.toml"
     local jobs_line="" ccache_line=""
@@ -1789,6 +1851,7 @@ rustios build configuration
   LLVM targets            : ${LLVM_TARGETS}
   LLVM for rustc          : $(llvm_description) [RUST_LLVM_MODE=${RUST_LLVM_MODE}]
   LLVM for rustc (config) : $(if llvm_is_in_tree; then echo "built by bootstrap"; else echo "${SWIFT_LLVM_DIR}/{macosx,ios}/bin/llvm-config"; fi)
+  rustc patches           : $(if llvm_is_in_tree; then echo "none"; else (cd "${PATCH_DIR}" 2>/dev/null && ls *.patch 2>/dev/null | tr '\n' ' ') || echo "none"; fi)
   rust sources            : ${RUST_SOURCE_DIR}
   build dir               : ${BUILD_DIR}
   work dir                : ${WORK_DIR}

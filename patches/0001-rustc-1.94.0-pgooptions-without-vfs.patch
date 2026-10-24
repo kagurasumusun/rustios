@@ -1,0 +1,73 @@
+# rustios patch: rustc 1.94.0 against upstream LLVM 21.1.6
+#
+# Why: rust-lang/llvm-project's `rustc/21.1-2025-08-01` branch still has the
+# `IntrusiveRefCntPtr<vfs::FileSystem>` parameter in llvm::PGOOptions, and
+# rustc 1.94 only drops it for LLVM >= 22. swiftlang/llvm-project at
+# swift-6.4.0-RELEASE (LLVM 21.1.6) already removed it, so
+# compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp does not compile:
+#
+#   error: no matching constructor for initialization of 'PGOOptions'
+#   note: candidate constructor not viable: no known conversion from
+#         'IntrusiveRefCntPtr<FileSystem>' to 'PGOAction' for 5th argument
+#
+# The fix passes the same arguments in both branches (the vfs is unused then).
+# This is an API difference between the two LLVM 21.1 trees, not a version
+# mismatch: the major.minor is the same, the patch level differs (21.1.8 vs
+# 21.1.6) and this signature was removed upstream before 21.1.6.
+#
+# Applied by Scripts/build-rust-toolchain.sh ('fetch'/'configure') in
+# RUST_LLVM_MODE=swift only. If it stops applying, rustc changed the file:
+# re-check the condition instead of forcing it.
+
+diff --git a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+index 733f5fd..e7bff3a 100644
+--- a/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
++++ b/compiler/rustc_llvm/llvm-wrapper/PassWrapper.cpp
+@@ -593,16 +593,16 @@ extern "C" LLVMRustResult LLVMRustOptimize(
+   }
+ 
+   std::optional<PGOOptions> PGOOpt;
+-#if LLVM_VERSION_LT(22, 0)
+-  auto FS = vfs::getRealFileSystem();
+-#endif
++  // rustios: upstream LLVM 21.1.6 (swiftlang/llvm-project) already removed the
++  // FileSystem parameter from PGOOptions; rustc only drops it at LLVM 22. Both
++  // branches below now pass the same arguments, so no vfs is needed.
+   if (PGOGenPath) {
+     assert(!PGOUsePath && !PGOSampleUsePath);
+     PGOOpt = PGOOptions(
+ #if LLVM_VERSION_GE(22, 0)
+         PGOGenPath, "", "", "", PGOOptions::IRInstr, PGOOptions::NoCSAction,
+ #else
+-        PGOGenPath, "", "", "", FS, PGOOptions::IRInstr, PGOOptions::NoCSAction,
++        PGOGenPath, "", "", "", PGOOptions::IRInstr, PGOOptions::NoCSAction,
+ #endif
+         PGOOptions::ColdFuncOpt::Default, DebugInfoForProfiling);
+   } else if (PGOUsePath) {
+@@ -611,7 +611,7 @@ extern "C" LLVMRustResult LLVMRustOptimize(
+ #if LLVM_VERSION_GE(22, 0)
+         PGOUsePath, "", "", "", PGOOptions::IRUse, PGOOptions::NoCSAction,
+ #else
+-        PGOUsePath, "", "", "", FS, PGOOptions::IRUse, PGOOptions::NoCSAction,
++        PGOUsePath, "", "", "", PGOOptions::IRUse, PGOOptions::NoCSAction,
+ #endif
+         PGOOptions::ColdFuncOpt::Default, DebugInfoForProfiling);
+   } else if (PGOSampleUsePath) {
+@@ -619,7 +619,7 @@ extern "C" LLVMRustResult LLVMRustOptimize(
+ #if LLVM_VERSION_GE(22, 0)
+         PGOOptions(PGOSampleUsePath, "", "", "", PGOOptions::SampleUse,
+ #else
+-        PGOOptions(PGOSampleUsePath, "", "", "", FS, PGOOptions::SampleUse,
++        PGOOptions(PGOSampleUsePath, "", "", "", PGOOptions::SampleUse,
+ #endif
+                    PGOOptions::NoCSAction, PGOOptions::ColdFuncOpt::Default,
+                    DebugInfoForProfiling);
+@@ -628,7 +628,7 @@ extern "C" LLVMRustResult LLVMRustOptimize(
+ #if LLVM_VERSION_GE(22, 0)
+         "", "", "", "", PGOOptions::NoAction, PGOOptions::NoCSAction,
+ #else
+-        "", "", "", "", FS, PGOOptions::NoAction, PGOOptions::NoCSAction,
++        "", "", "", "", PGOOptions::NoAction, PGOOptions::NoCSAction,
+ #endif
+         PGOOptions::ColdFuncOpt::Default, DebugInfoForProfiling);
+   }
