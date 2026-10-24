@@ -7,3 +7,4 @@
 40019585601
 # (the codegen-tests fix re-runs the Rust half against the same artifact)
 # (optimized-compiler-builtins = false)
+# (PGOOptions patch applied)
