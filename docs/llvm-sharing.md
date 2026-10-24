@@ -335,8 +335,9 @@ Scripts/llvm-config-shim.py --source /path/to/real/llvm-config --mode ios \
     --host-target aarch64-apple-ios --out /tmp/x/bin/llvm-config
 /tmp/x/bin/llvm-config --version --libdir --libs --cxxflags
 
-# configure が書く bootstrap.toml の確認（SwiftLLVM が無くても失敗しない範囲）
-RUST_LLVM_MODE=swift Scripts/build-rust-toolchain.sh configure
+# preflight（偽の SwiftLLVM ツリーでも可。無い場合は configure が先に落ちる）
+SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust-src \
+    Scripts/build-rust-toolchain.sh preflight
 ```
 
 ---
@@ -356,7 +357,8 @@ RUST_LLVM_MODE=swift Scripts/build-rust-toolchain.sh configure
 | rust-lang/llvm-project 固有パッチの全列挙 | **未完了**。`rustc/21.1-2025-08-01` は upstream `release/21.x` のマージが主で、bootstrap 側の分岐は `LLVM_RUSTLLVM` の定義だけ。ただし「1 つも無い」ことまでは確認できていない |
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
-| ビルド時間 | Swift 4 h + Rust 1.5–2 h。ジョブ上限 6 h に対して余裕は小さい |
+| `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
+| ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
 
 既知の割り切り:
 
