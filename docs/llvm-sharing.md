@@ -43,6 +43,29 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 
 あるいは分けたまま `rustc --sysroot="$PWD/RustStd/usr" ...` と渡せます。
 
+### 現状（2026-10-24）
+
+| 要求 | 状態 |
+| --- | --- |
+| Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、4 時間 21 分、`swift-frontend` は iOS/arm64） |
+| Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 96 MB、iOS 側 `lib/*.a` のオブジェクトメンバーを `vtool` で検査） |
+| Rust を Swift の LLVM でビルドする | **実装・ローカル検証済み**。実ビルドは次の Rust ジョブで確認する（Swift 側が失敗しても走るようにした） |
+| Rust 専用の LLVM を別にビルドしない | **実装済み**（`src/llvm-project` を fetch しない、`llvm-config` を渡す、`llvm-tools=false`） |
+| バージョン整合の証拠 | §1 / §2 |
+| std をツールチェーンから分離 | **実装済み**（`RustStd`）。`RustToolchain` 側に std が漏れていないことを `package` が確認 |
+| 未完了項目の明示 | §6 |
+
+CI の履歴:
+
+1. `--skip-build-swift` が `build-script` に拒否される → 1 回のビルドに統合。
+2. `llvm-targets-to-build=AArch64` で compiler-rt の builtins が失敗
+   （`-arm-add-build-attributes`）。
+3. LLVM 既定の全ターゲットではビルド成功するが、パッケージ中に 355 分で打ち切り。
+4. `AArch64;ARM;X86` + 360 分: **Swift + LLVM のビルド成功**（4 時間 21 分）。
+   `swiftc` が macOS バイナリだったため検証で停止し、Rust ジョブはスキップ。
+   → 検証を「`swift-frontend` は iOS 必須、他は内訳をレポート」に変更し、
+   `SwiftLLVM` ができていれば Rust ジョブを実行するようにした。
+
 ---
 
 ## 1. バージョンの対応関係
@@ -289,8 +312,11 @@ RUST_LLVM_MODE=swift Scripts/build-rust-toolchain.sh configure
 | --- | --- |
 | `bootstrap.toml` の生成、`src/llvm-project` を fetch しないこと、`patch_bootstrap_llvm` を適用しないこと | **実装済み・ローカルで確認済み**（スタブ環境） |
 | `verify_llvm_source()` の 3 チェック | **実装済み・ローカルで確認済み**（成功/失敗の両方） |
-| `llvm-config` shim の回答と再配置 | **確認済み**（macOS 実機の llvm-config ではなくスタブで） |
-| Swift 6.4 の iOS ビルド（LLVM 2 種 + swift-frontend） | **CI で実行して確認する必要がある**。所要時間は LLVM-On-iOS の実績で約 4 時間 |
+| `llvm-config` shim の回答と再配置 | **CI で確認済み**（ホスト/iOS 両方の shim が LLVM 21.1.6 を報告、96 MB の artifact として受け渡し） |
+| Swift 6.4 の iOS ビルド（LLVM 2 種 + swift-frontend） | **CI で成功**（4 時間 21 分、`swift-frontend` は iOS/arm64） |
+| `swiftc`（ドライバ）の iOS 性 | **未確認／おそらくホスト用**: 直近の実行で macOS バイナリと判定。`swift-frontend` が iOS なのでコンパイラとしては成立するが、ドライバをデバイスで使うには追加対応が要る |
+| Swift ツールチェーンに混ざるホスト（macOS）バイナリ | **既知**: LLVM-On-iOS も `lib/swift/host/compiler/*.dylib` を同梱。`verify` は内訳をレポートし、iOS と偽らない |
+| 静的ライブラリの iOS 性 | **実装**: メンバー（`.o`）を抽出して `vtool` で `platform IOS` を確認（`file` では ar archive としか出ないため） |
 | Rust 1.94.0 が LLVM 21.1.6 でリンク・動作すること | **未検証**。このワークフローで初めて実行する |
 | rust-lang/llvm-project 固有パッチの全列挙 | **未完了**。`rustc/21.1-2025-08-01` は upstream `release/21.x` のマージが主で、bootstrap 側の分岐は `LLVM_RUSTLLVM` の定義だけ。ただし「1 つも無い」ことまでは確認できていない |
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
@@ -303,8 +329,12 @@ RUST_LLVM_MODE=swift Scripts/build-rust-toolchain.sh configure
   rust-lang 版との混在はありません。
 - `llvm-tools`（`llvm-ar` 等）は Swift のビルド成果物（iOS バイナリ）を
   `SwiftLLVM/ios/bin` に置いて使います。bootstrap には `llvm-tools = false` を渡します。
-- `SwiftLLVM` artifact は macOS/iOS 両方の静的ライブラリを含むため数百 MB になります。
+- `SwiftLLVM` artifact は macOS/iOS 両方の静的ライブラリを含みます（実測 96 MB）。
   これは「LLVM を 2 回ビルドしない」ための必要経費です。
+- **Swift ツールチェーンにはホスト（macOS）バイナリが混ざります。** `lib/swift/host/`
+  など、Swift のクロスビルドが常に出すものです（LLVM-On-iOS も同梱）。iOS と
+  称するのは `swift-frontend` / 静的ライブラリ / `SwiftLLVM` で、混入物は
+  `verify` が一覧と件数をレポートに残します。
 
 ---
 

@@ -51,6 +51,14 @@ macOS 上で動きます（LLVM-On-iOS も `macos-latest` でビルドしてい�
 ビルド途中の macOS 用成果物は `rust-source/build/aarch64-apple-darwin/` に
 ありますが、`artifacts/` には入りません。
 
+Swift の成果物だけは事情が異なります。クロスビルドでは `swift-frontend`
+（= iOS で動くコンパイラ本体）は iOS/arm64 ですが、その隣にホスト用の
+ツール（macOS 版のドライバなど）も出力されます。LLVM-On-iOS も同じ構成
+（`lib/swift/host/compiler/*.dylib` を同梱）なので、Swift 側は
+「**コンパイラ本体が iOS であること**」を必須条件にし、それ以外は
+iOS / ホストの **内訳を数えてレポートに明記** します（黙って iOS と
+称さないため）。Rust 側の成果物は従来どおり全ファイル iOS/arm64 必須です。
+
 ---
 
 ## 成果物

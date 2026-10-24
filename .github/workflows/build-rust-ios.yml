@@ -80,6 +80,10 @@ jobs:
     outputs:
       llvm_version: ${{ steps.versions.outputs.llvm_version }}
       swift_version: ${{ steps.versions.outputs.swift_version }}
+      # Whether the shared LLVM artifact exists. The rust job only needs that,
+      # so it runs even when the Swift toolchain part of this job fails (each
+      # run of the Swift build costs ~4.5 h).
+      llvm_uploaded: ${{ steps.llvm-ready.outputs.uploaded }}
 
     steps:
       - name: Checkout
@@ -183,6 +187,7 @@ jobs:
           Scripts/build-swift-toolchain.sh package-llvm 2>&1 | tee -a swift.log
 
       - name: Upload SwiftLLVM
+        id: upload-llvm
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -190,6 +195,17 @@ jobs:
           path: artifacts/SwiftLLVM-*.tar.xz
           if-no-files-found: error
           retention-days: 90
+
+      # Read by the rust job, which needs the LLVM but not the Swift compiler.
+      - name: Record that the shared LLVM is available
+        if: always()
+        run: |-
+          if compgen -G "artifacts/SwiftLLVM-*.tar.xz" >/dev/null; then
+            echo "uploaded=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "uploaded=false" >> "${GITHUB_OUTPUT}"
+          fi
+        id: llvm-ready
 
       - name: Collect the iOS Swift compiler
         run: |-
@@ -286,6 +302,10 @@ jobs:
     # Everything this job produces is iOS/arm64 (macOS is only the build
     # environment). Non-iOS binaries make `verify`/`package` fail.
     needs: swift
+    # Run as long as the shared LLVM exists: a failure in the Swift compiler
+    # half must not hide the answer to the question this job exists for (does
+    # rustc link Swift's LLVM?).
+    if: always() && needs.swift.outputs.llvm_uploaded == 'true'
     timeout-minutes: 300
     runs-on: macos-latest
     outputs:
@@ -576,7 +596,7 @@ jobs:
   release:
     name: Publish release
     needs: [swift, build]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && needs.swift.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
