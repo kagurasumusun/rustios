@@ -1,0 +1,1271 @@
+#!/usr/bin/env bash
+#
+# rustios - build LLVM and the Swift compiler for iOS (arm64).
+#
+# This is the Swift half of rustios. It builds, from the sources Swift itself
+# uses (`swiftlang/swift` + `swiftlang/llvm-project`, both at the same release
+# tag, as pinned by Swift's `utils/update-checkout`):
+#
+#   * LLVM + Clang for the build machine (llvm-macosx-arm64)
+#   * LLVM + Clang for iOS/arm64        (llvm-iphoneos-arm64)
+#   * the Swift compiler for the build machine (swift-macosx-arm64)
+#   * the Swift compiler for iOS/arm64        (swift-iphoneos-arm64)
+#
+# The build recipe (preset, cross-compile-hosts=iphoneos-arm64, the two
+# required source patches) follows emexlab/LLVM-On-iOS, the reference project
+# for "LLVM and Swift that run on iOS".
+#
+# The iOS LLVM is not only used by Swift: `Scripts/build-rust-toolchain.sh`
+# points rustc's build system at it (`[target.aarch64-apple-ios] llvm-config`
+# in bootstrap.toml), so the Rust compiler links the same LLVM instead of
+# building `rust-lang/llvm-project` a second time. `install-llvm` writes the
+# relocatable trees (with generated llvm-config shims) that make that possible.
+#
+# The artifacts are the ones emexlab/LLVM-On-iOS produces, with the same names
+# and the same contents (see docs/parity.md for the file-by-file mapping):
+#
+#   SwiftToolchain.zip            the iOS Swift compiler  (SwiftToolchain/usr/...)
+#   LLVM.xcframework.tar.xz       llvm.a + merged Headers (their LLVM.xcframework)
+#   CoreCompilerSupportLibs.tar.xz  lib_Compiler*.dylib   (their support libs)
+#   SwiftLLVM.tar.xz              rustios addition: the relocatable LLVM trees
+#                                 that the Rust build links against
+#
+# Subcommands: fetch, llvm, swift, package, llvm-xcframework, support,
+#              verify, all, info
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# ---------------------------------------------------------------------------
+# Configuration (all overridable from the environment)
+# ---------------------------------------------------------------------------
+
+# Swift release to build. The corresponding llvm-project tag is checked out by
+# Swift's own update-checkout, so both halves are always the same release.
+# swift-6.4.0-RELEASE ships LLVM 21.1.6 (see docs/llvm-sharing.md).
+SWIFT_BRANCH="${SWIFT_BRANCH:-swift-6.4.0-RELEASE}"
+
+# Deployment target, matching LLVM-On-iOS' OS_VER=16.0.
+IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-16.0}"
+
+# Workspace layout (swift's update-checkout puts every sibling repository next
+# to the swift checkout, so they all live inside SWIFT_WORKSPACE_DIR).
+SWIFT_SOURCE_DIR="${SWIFT_SOURCE_DIR:-${REPO_ROOT}/swift-source/swift}"
+# `info` must work before anything is cloned, so this only rewrites the path
+# (no `cd` into a directory that does not exist yet).
+[[ "${SWIFT_SOURCE_DIR}" = /* ]] || SWIFT_SOURCE_DIR="${REPO_ROOT}/${SWIFT_SOURCE_DIR}"
+SWIFT_WORKSPACE_DIR="${SWIFT_WORKSPACE_DIR:-$(dirname "${SWIFT_SOURCE_DIR}")}"
+SWIFT_BUILD_ROOT="${SWIFT_BUILD_ROOT:-${SWIFT_WORKSPACE_DIR}/build}"
+SWIFT_BUILD_SUBDIR="${SWIFT_BUILD_SUBDIR:-LLVMClangSwift_iphoneos}"
+SWIFT_PRESET_FILE="${SWIFT_PRESET_FILE:-${SCRIPT_DIR}/swift-ios-toolchain-presets.ini}"
+SWIFT_CROSS_PRESET="${SWIFT_CROSS_PRESET:-rustios_iphoneos_arm64}"
+
+# Outputs.
+WORK_DIR="${WORK_DIR:-${REPO_ROOT}/work}"
+ARTIFACTS_DIR="${ARTIFACTS_DIR:-${REPO_ROOT}/artifacts}"
+SWIFT_INSTALL_DIR="${SWIFT_INSTALL_DIR:-${WORK_DIR}/SwiftToolchain}"
+# <dir>/macosx and <dir>/ios are relocatable LLVM installations (bin/llvm-config
+# shim, include/, lib/*.a). build-rust-toolchain.sh consumes exactly this.
+SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${WORK_DIR}/SwiftLLVM}"
+
+# LLVM backends. Must match `llvm-targets-to-build` in the preset; the Rust
+# side ([llvm] targets in bootstrap.toml) uses the same value, so that both
+# compilers are built against an LLVM with an identical target set. AArch64 is
+# the only backend the shipped compilers emit code for (arm64-apple-ios on
+# device, arm64-apple-darwin on the build host). The sole ARM/X86 consumer was
+# compiler-rt's macho_embedded builtins; patch_compiler_rt_macho_embedded
+# (below) makes them skip cleanly when those backends are absent, and LLVM's
+# full target set does not fit the 6 h CI limit anyway (see the preset).
+LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
+
+# Artifact names - exactly the ones emexlab/LLVM-On-iOS ships (plus the
+# rustios-only SwiftLLVM tree). No platform/version suffixes: the versions are
+# recorded in artifacts/REPORT.txt and SHA256SUMS.txt instead, and GitHub
+# releases are already per-tag.
+SWIFT_TOOLCHAIN_NAME="SwiftToolchain"                       # -> SwiftToolchain.zip
+LLVM_XCFRAMEWORK_NAME="LLVM.xcframework"                    # -> LLVM.xcframework.tar.xz
+SUPPORT_LIBS_NAME="CoreCompilerSupportLibs"                 # -> CoreCompilerSupportLibs.tar.xz
+SWIFT_LLVM_TARBALL="SwiftLLVM.tar.xz"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+require_macos() {
+    [[ "$(uname -s)" == "Darwin" ]] || die "this step requires macOS (Xcode + iPhoneOS SDK)"
+}
+
+report_line() {
+    mkdir -p "${ARTIFACTS_DIR}"
+    printf '%s\n' "$*" >> "${ARTIFACTS_DIR}/REPORT.txt"
+}
+
+human_size() { du -h "$1" | awk '{print $1}'; }
+
+# llvm_dir <macosx|ios>: build tree of the LLVM for that platform.
+llvm_dir() {
+    echo "${SWIFT_BUILD_ROOT}/${SWIFT_BUILD_SUBDIR}/llvm-$1-arm64"
+}
+
+swift_dir() {
+    echo "${SWIFT_BUILD_ROOT}/${SWIFT_BUILD_SUBDIR}/swift-$1-arm64"
+}
+
+# llvm_component_tools: the binary tools that the preset's
+# `llvm-install-components` line installs into a toolchain's bin/. Parsing the
+# preset (instead of repeating the list here) keeps a single source of truth:
+# the same line drives Swift's own install, the relocatable SwiftLLVM trees,
+# and - in build-rust-toolchain.sh - RustToolchain/usr/bin. That is what makes
+# the two toolchains ship the same LLVM tools.
+llvm_component_tools() {
+    sed -n 's/^llvm-install-components=//p' "${SWIFT_PRESET_FILE}" \
+        | tr ';' '\n' \
+        | grep -E '^(clang|lld|llvm-[a-z0-9-]+)$' || true
+}
+
+# install_component_tools <build-tree bin> <destination bin>
+#
+# Copies the preset's LLVM component tools, plus the driver flavour aliases
+# every LLVM toolchain ships (clang++/clang-cpp, ld64.lld and friends).
+# Symlinks are preserved; packaging materializes the same driver links
+# LLVM-On-iOS materializes.
+install_component_tools() {
+    local build_bin="$1" dest_bin="$2" tool flavor copied=0
+    mkdir -p "${dest_bin}"
+    for tool in $(llvm_component_tools); do
+        if [[ -e "${build_bin}/${tool}" ]]; then
+            cp -a "${build_bin}/${tool}" "${dest_bin}/"
+            copied=$((copied + 1))
+        fi
+        case "${tool}" in
+            clang)
+                for flavor in clang++ clang-cpp; do
+                    if [[ -e "${build_bin}/${flavor}" ]]; then
+                        cp -a "${build_bin}/${flavor}" "${dest_bin}/"
+                    fi
+                done
+                ;;
+            lld)
+                for flavor in ld64.lld ld.lld lld-link wasm-ld; do
+                    if [[ -e "${build_bin}/${flavor}" ]]; then
+                        cp -a "${build_bin}/${flavor}" "${dest_bin}/"
+                    fi
+                done
+                ;;
+        esac
+    done
+    echo "${copied}"
+}
+
+# verify_component_tools <bin dir> <label>: every tool named by the preset's
+# llvm-install-components must be present, otherwise the toolchain is not
+# equivalent to the one LLVM-On-iOS ships.
+verify_component_tools() {
+    local bindir="$1" label="$2" tool missing=() count=0
+    for tool in $(llvm_component_tools); do
+        count=$((count + 1))
+        [[ -e "${bindir}/${tool}" ]] || missing+=("${tool}")
+    done
+    if [[ "${#missing[@]}" -gt 0 ]]; then
+        warn "${label}: missing LLVM component tools: ${missing[*]}"
+        return 1
+    fi
+    log "${label}: all ${count} LLVM component tools from the preset are present"
+}
+
+# copy_top_level_libs <lib dir> <destination>: the *.a/*.dylib/*.tbd directly
+# inside <lib dir> (LLVM-On-iOS' copy_top_level_libs).
+copy_top_level_libs() {
+    local source="$1" destination="$2"
+    if [[ -d "${source}" ]]; then
+        mkdir -p "${destination}"
+        find "${source}" -maxdepth 1 -type f \
+            \( -name '*.a' -o -name '*.dylib' -o -name '*.tbd' \) \
+            -exec cp -a {} "${destination}/" \;
+    fi
+}
+
+# llvm_version: LLVM version of the checked out llvm-project (this is what the
+# Swift compiler is built against).
+llvm_version() {
+    local f="${SWIFT_WORKSPACE_DIR}/llvm-project/cmake/Modules/LLVMVersion.cmake"
+    if [[ -f "${f}" ]]; then
+        # -E: BSD sed (macOS) does not support \| in a basic regex.
+        sed -n -E 's/.*set\(LLVM_VERSION_(MAJOR|MINOR|PATCH) ([0-9]+)\).*/\2/p' "${f}" \
+            | head -3 | paste -sd. -
+        return
+    fi
+    echo unknown
+}
+
+llvm_commit() {
+    git -C "${SWIFT_WORKSPACE_DIR}/llvm-project" rev-parse --short HEAD 2>/dev/null || echo unknown
+}
+
+swift_commit() {
+    git -C "${SWIFT_SOURCE_DIR}" rev-parse --short HEAD 2>/dev/null || echo unknown
+}
+
+# ---------------------------------------------------------------------------
+# fetch
+# ---------------------------------------------------------------------------
+
+fetch() {
+    require_cmd git
+    require_macos
+
+    if [[ -d "${SWIFT_SOURCE_DIR}/.git" ]]; then
+        local current
+        current="$(git -C "${SWIFT_SOURCE_DIR}" describe --tags --exact-match 2>/dev/null || true)"
+        if [[ -n "${current}" && "${current}" != "${SWIFT_BRANCH}" ]]; then
+            warn "existing Swift checkout is '${current}', expected '${SWIFT_BRANCH}' - re-cloning"
+            rm -rf "${SWIFT_SOURCE_DIR}"
+        fi
+    fi
+
+    if [[ ! -d "${SWIFT_SOURCE_DIR}/.git" ]]; then
+        mkdir -p "$(dirname "${SWIFT_SOURCE_DIR}")"
+        log "cloning swiftlang/swift ${SWIFT_BRANCH} (shallow)"
+        git clone --depth 1 --branch "${SWIFT_BRANCH}" \
+            https://github.com/swiftlang/swift.git "${SWIFT_SOURCE_DIR}"
+    fi
+
+    # update-checkout checks out every sibling repository (llvm-project, cmark,
+    # swift-syntax, ...) at the same tag, which is exactly what a Swift release
+    # is composed of.
+    if [[ ! -d "${SWIFT_WORKSPACE_DIR}/llvm-project/llvm" ]]; then
+        log "checking out the Swift source tree (update-checkout --tag ${SWIFT_BRANCH})"
+        "${SWIFT_SOURCE_DIR}/utils/update-checkout" --clone --tag "${SWIFT_BRANCH}"
+    else
+        log "swift source tree already present"
+    fi
+
+    [[ -f "${SWIFT_WORKSPACE_DIR}/llvm-project/llvm/CMakeLists.txt" ]] \
+        || die "llvm-project is missing from the Swift workspace ${SWIFT_WORKSPACE_DIR}"
+    [[ -f "${SWIFT_SOURCE_DIR}/utils/build-script" ]] \
+        || die "swift checkout is missing utils/build-script"
+
+    patch_lld_macho
+    patch_swift_cmake_triple
+    patch_compiler_rt_macho_embedded
+
+    log "swift ${SWIFT_BRANCH} ($(swift_commit)), llvm-project $(llvm_commit), LLVM $(llvm_version)"
+}
+
+# Swift's lld has a downstream check that refuses to emit Mach-O on a non-Apple
+# host; the reference project (LLVM-On-iOS) comments it out. We keep that, but
+# only when the exact marker block is present, so a different Swift release does
+# not silently break the checkout.
+patch_lld_macho() {
+    local file="${SWIFT_WORKSPACE_DIR}/llvm-project/lld/MachO/InputFiles.cpp"
+    [[ -f "${file}" ]] || { warn "lld/MachO/InputFiles.cpp not found; skipping lld patch"; return 0; }
+    if grep -q "rustios: apple lies" "${file}"; then
+        return 0
+    fi
+    python3 - "${file}" <<'PY'
+import pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+pattern = (
+    r"(// Swift LLVM fork downstream change start\n)"
+    r"(.*?)"
+    r"(// Swift LLVM fork downstream change end\n)"
+)
+new, count = re.subn(pattern, r"\1/* rustios: apple lies, lld works fine for MachO\n\2*/\n\3", text,
+                     count=1, flags=re.DOTALL)
+if count == 0:
+    sys.stderr.write("lld patch anchor not found; leaving the file untouched\n")
+    sys.exit(0)
+path.write_text(new)
+print("patched lld: Mach-O output allowed on a non-Darwin host")
+PY
+}
+
+# Swift's top-level CMakeLists enables the Swift language before it knows the
+# host triple, so the compiler probe runs without -target and defaults to
+# macOS. The reference project injects CMAKE_Swift_COMPILER_TARGET; without it
+# the iphoneos-arm64 stage fails to load the stdlib.
+patch_swift_cmake_triple() {
+    local sentinel='# rustios: inject CMAKE_Swift_COMPILER_TARGET from SWIFT_HOST_TRIPLE'
+    local file="${SWIFT_SOURCE_DIR}/CMakeLists.txt"
+    [[ -f "${file}" ]] || die "missing ${file}"
+    if grep -qF "${sentinel}" "${file}"; then
+        return 0
+    fi
+    python3 - "${file}" "${sentinel}" <<'PY'
+import pathlib, re, sys
+path = pathlib.Path(sys.argv[1])
+sentinel = sys.argv[2]
+text = path.read_text()
+inject = (
+    f"{sentinel}\n"
+    "if(DEFINED SWIFT_HOST_TRIPLE AND NOT CMAKE_Swift_COMPILER_TARGET)\n"
+    "  set(CMAKE_Swift_COMPILER_TARGET \"${SWIFT_HOST_TRIPLE}\" CACHE STRING \"\")\n"
+    "endif()\n\n"
+)
+new, count = re.subn(r"(^[ \t]*enable_language\(\s*Swift\b)", inject + r"\1", text,
+                     count=1, flags=re.MULTILINE)
+if count == 0:
+    sys.stderr.write("could not locate enable_language(Swift) in CMakeLists.txt\n")
+    sys.exit(1)
+path.write_text(new)
+print("patched swift CMakeLists.txt: SWIFT_HOST_TRIPLE -> CMAKE_Swift_COMPILER_TARGET")
+PY
+}
+
+# compiler-rt's "macho_embedded" builtins (armv6m/armv7m/armv7em/armv7/
+# armv8m.main/armv8.1m.main, i386, x86_64 - bare-metal/embedded libraries no
+# rustios artifact uses) are gated on COMPILER_RT_SUPPORTED_ARCH listing an
+# armv* arch. That list is seeded from the *host linker's* capabilities and
+# reaches the builtins sub-build through the runtimes passthrough cache, so
+# the gate opens even when the LLVM being built has no ARM backend
+# (llvm-targets-to-build=AArch64), and every macho_embedded object then fails
+# with the just-built clang - both errors observed in CI:
+#   error: unable to create target: 'No available targets are compatible with
+#          triple "thumbv6m-apple-unknown-macho"'
+#   clang (LLVM option parsing): Unknown command line argument
+#          '-arm-add-build-attributes'
+# The upstream comment on the gate calls it a "hacky opt-out. If you can't
+# target both intel and arm architectures we bail here"; this patch implements
+# that intent by probing real codegen (-c instantiates a backend, unlike the
+# arch tests, which the builtins sub-build runs compile-only) for one arch per
+# backend family these libraries need. All-target builds (emexlab/LLVM-On-iOS)
+# pass the probes and behave exactly as upstream; the arm64/arm64e platform
+# builtins the toolchains do ship (clang_rt.builtins*_osx/_ios/_iossim) are
+# untouched - CI showed them building fine with an AArch64-only LLVM.
+patch_compiler_rt_macho_embedded() {
+    local file="${SWIFT_WORKSPACE_DIR}/llvm-project/compiler-rt/cmake/Modules/CompilerRTDarwinUtils.cmake"
+    [[ -f "${file}" ]] || die "missing ${file}; cannot apply the macho_embedded probe patch"
+    if grep -q "rustios_macho_embedded_ok" "${file}"; then
+        return 0
+    fi
+    python3 - "${file}" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+anchor = '  if(COMPILER_RT_SUPPORTED_ARCH MATCHES ".*armv.*")\n'
+if text.count(anchor) != 1:
+    sys.stderr.write("macho_embedded gate anchor not found in CompilerRTDarwinUtils.cmake\n")
+    sys.exit(1)
+probe = '''  # rustios: probe real codegen before configuring the macho_embedded
+  # builtins - see patch_compiler_rt_macho_embedded in
+  # Scripts/build-swift-toolchain.sh. The gate below keys off
+  # COMPILER_RT_SUPPORTED_ARCH, which can list armv* even when the LLVM being
+  # built has no ARM backend; the library builds then fail with the just-built
+  # clang. Bail out (as the "hacky opt-out" comment intends) unless the
+  # compiler can actually emit code for both backend families these libraries
+  # need (ARM and X86).
+  set(rustios_macho_embedded_ok TRUE)
+  set(rustios_probe_sysroot)
+  if(DARWIN_osx_SYSROOT)
+    set(rustios_probe_sysroot -isysroot "${DARWIN_osx_SYSROOT}")
+  endif()
+  foreach(rustios_probe_arch armv6m i386)
+    if(rustios_probe_arch STREQUAL "armv6m")
+      set(rustios_probe_flags -arch armv6m -mfloat-abi=soft)
+    else()
+      set(rustios_probe_flags -arch i386 -march=pentium)
+    endif()
+    set(rustios_probe_src
+        "${CMAKE_BINARY_DIR}${CMAKE_FILES_DIRECTORY}/rustios_macho_embedded_probe.c")
+    file(WRITE "${rustios_probe_src}"
+         "int rustios_macho_embedded_probe(void) { return 0; }")
+    execute_process(
+      COMMAND "${CMAKE_C_COMPILER}" -target arm64-apple-darwin
+              ${rustios_probe_flags} ${rustios_probe_sysroot}
+              -ffreestanding -w
+              -c "${rustios_probe_src}" -o "${rustios_probe_src}.o"
+      RESULT_VARIABLE rustios_probe_result
+      OUTPUT_QUIET ERROR_QUIET)
+    if(NOT rustios_probe_result EQUAL 0)
+      set(rustios_macho_embedded_ok FALSE)
+      message(STATUS "rustios: the compiler being built cannot emit "
+                     "${rustios_probe_arch} code (restricted "
+                     "llvm-targets-to-build); skipping macho_embedded builtins")
+      break()
+    endif()
+  endforeach()
+'''
+gate = '  if(COMPILER_RT_SUPPORTED_ARCH MATCHES ".*armv.*" AND rustios_macho_embedded_ok)\n'
+path.write_text(text.replace(anchor, probe + gate, 1))
+print("patched compiler-rt: macho_embedded builtins probe real codegen first")
+PY
+}
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+# build_swift <llvm|swift|all>
+#
+# Swift's build system builds the two LLVM trees and the two Swift compilers in
+# one invocation. `llvm` and `swift` split that into two invocations sharing
+# one build directory, so the LLVM artifacts can be handed to the Rust build
+# before the (much longer) Swift compiler build finishes.
+build_swift() {
+    local phase="${1:-all}"
+    require_cmd cmake
+    require_cmd ninja
+    require_cmd xcrun
+
+    [[ -x "${SWIFT_SOURCE_DIR}/utils/build-script" ]] || die "missing utils/build-script; run 'fetch' first"
+    [[ -f "${SWIFT_PRESET_FILE}" ]] || die "missing preset file ${SWIFT_PRESET_FILE}"
+    local sdk
+    sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+    [[ -d "${sdk}" ]] || die "could not find the iPhoneOS SDK"
+
+    case "${phase}" in
+        llvm|swift|all) ;;
+        *) die "unknown build phase: ${phase} (llvm|swift|all)" ;;
+    esac
+
+    # Swift 6.4's build-script expands the preset *before* it parses the
+    # product switches, so `--skip-build-swift` / `--skip-build-llvm` cannot be
+    # combined with `--preset` (they are rejected as unknown arguments). Both
+    # LLVM trees and both compilers are therefore built by one invocation; the
+    # build directory is incremental, so calling this again after a completed
+    # build is cheap. `phase` only decides what is *installed* afterwards.
+    local args=(--preset-file="${SWIFT_PRESET_FILE}" --preset="${SWIFT_CROSS_PRESET}")
+
+    refresh_cmark_cache
+
+    # ccache: when it is installed, every C/C++ compile of the build (both
+    # LLVM trees, clang, lld, cmark and the C++ sources of the Swift
+    # compiler) goes through it. CMake >= 3.17 initialises
+    # CMAKE_<LANG>_COMPILER_LAUNCHER from these environment variables, so the
+    # preset does not change and the produced objects are identical - only
+    # rebuilds get faster (CI caches CCACHE_DIR between runs; locally it just
+    # works if ccache is installed). sccache is deliberately not used: its
+    # GitHub Actions backend aborts compiler invocations on transient storage
+    # errors (docs/parity.md §5).
+    if command -v ccache >/dev/null 2>&1; then
+        export CMAKE_C_COMPILER_LAUNCHER="${CMAKE_C_COMPILER_LAUNCHER:-ccache}"
+        export CMAKE_CXX_COMPILER_LAUNCHER="${CMAKE_CXX_COMPILER_LAUNCHER:-ccache}"
+        log "ccache       : $(ccache --version | head -1)"
+    fi
+
+    log "iPhoneOS SDK : ${sdk}"
+    log "swift        : ${SWIFT_BRANCH} ($(swift_commit))"
+    log "llvm         : $(llvm_version) ($(llvm_commit))"
+    log "phase        : ${phase}"
+    log "running: utils/build-script ${args[*]}"
+
+    (
+        cd "${SWIFT_SOURCE_DIR}"
+        export IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}"
+        utils/build-script "${args[@]}"
+    )
+
+    if command -v ccache >/dev/null 2>&1; then
+        log "ccache statistics:"
+        ccache --show-stats 2>/dev/null | tail -n 12 || true
+    fi
+}
+
+# cmark's iPhoneOS CMake cache is kept across builds; if it was configured
+# before BUILD_TESTING was disabled, its test targets break the link.
+refresh_cmark_cache() {
+    local dir="${SWIFT_BUILD_ROOT}/${SWIFT_BUILD_SUBDIR}/cmark-iphoneos-arm64"
+    if [[ -f "${dir}/CMakeCache.txt" ]] && ! grep -q '^BUILD_TESTING:BOOL=OFF$' "${dir}/CMakeCache.txt"; then
+        log "discarding stale cmark build cache"
+        rm -rf "${dir}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# install: turn the build trees into relocatable trees
+# ---------------------------------------------------------------------------
+
+copy_tree() {
+    local source="$1" destination="$2"
+    if [[ -d "${source}" ]]; then
+        mkdir -p "${destination}"
+        cp -a "${source}/." "${destination}/"
+    fi
+}
+
+copy_archives() {
+    local source="$1" destination="$2"
+    if [[ -d "${source}" ]]; then
+        mkdir -p "${destination}"
+        find "${source}" -maxdepth 1 -type f -name '*.a' -exec cp -a {} "${destination}/" \;
+    fi
+}
+
+# install_llvm
+#
+# Writes <SWIFT_LLVM_DIR>/{macosx,ios}:
+#
+#   bin/llvm-config   host-runnable, relocatable (Scripts/llvm-config-shim.py)
+#   bin/llvm-ar ...   the real iOS tools (used by rustc on the device)
+#   include/          headers
+#   lib/*.a           static libraries
+#
+# `macosx` is what the rustc for the build machine links against, `ios` what
+# the rustc that runs on the iPhone links against.
+install_llvm() {
+    require_cmd python3
+    local host_llvm ios_llvm version
+    host_llvm="$(llvm_dir macosx)"
+    ios_llvm="$(llvm_dir iphoneos)"
+    version="$(llvm_version)"
+
+    [[ -f "${host_llvm}/bin/llvm-config" ]] || die "missing ${host_llvm}/bin/llvm-config; run 'llvm' first"
+    [[ -d "${ios_llvm}/lib" ]] || die "missing ${ios_llvm}/lib"
+
+    local macosx_prefix="${SWIFT_LLVM_DIR}/macosx"
+    local ios_prefix="${SWIFT_LLVM_DIR}/ios"
+    rm -rf "${macosx_prefix}" "${ios_prefix}"
+    mkdir -p "${macosx_prefix}/bin" "${macosx_prefix}/lib" \
+             "${ios_prefix}/bin" "${ios_prefix}/lib"
+
+    # A CMake build tree has no installed headers: the public ones live in the
+    # source tree and only the generated ones (llvm/Config/*, Targets.def, ...)
+    # are in the build tree. rustc_llvm compiles its C++ wrapper against these
+    # headers, so assemble an install-shaped include/ the way `make install`
+    # would: source headers first, then the generated ones (which win).
+    local llvm_source="${SWIFT_WORKSPACE_DIR}/llvm-project/llvm"
+    install_headers() {
+        local build_tree="$1" prefix="$2"
+        [[ -d "${llvm_source}/include" ]] || die "missing ${llvm_source}/include"
+        copy_tree "${llvm_source}/include" "${prefix}/include"
+        copy_tree "${build_tree}/include" "${prefix}/include"
+        [[ -f "${prefix}/include/llvm/Config/llvm-config.h" ]] \
+            || die "no generated llvm/Config/llvm-config.h in ${build_tree}/include"
+    }
+
+    # Both trees get the same shape: bin/llvm-config + the preset's LLVM
+    # component tools, include/, lib/*.a and lib/clang (resource headers and
+    # builtins). `macosx` is what the rustc for the build machine links
+    # against; `ios` is what the shipped rustc links against *and* where
+    # RustToolchain/usr/bin takes its LLVM tools from - the same tools, from
+    # the same build, that SwiftToolchain/usr/bin gets through the preset's
+    # llvm-install-components.
+    local count
+    log "installing the host LLVM"
+    install_headers "${host_llvm}" "${macosx_prefix}"
+    copy_archives "${host_llvm}/lib" "${macosx_prefix}/lib"
+    copy_tree "${host_llvm}/lib/clang" "${macosx_prefix}/lib/clang"
+    count="$(install_component_tools "${host_llvm}/bin" "${macosx_prefix}/bin")"
+    log "host LLVM: ${count} component tools in ${macosx_prefix}/bin"
+
+    log "installing the iOS LLVM"
+    install_headers "${ios_llvm}" "${ios_prefix}"
+    copy_archives "${ios_llvm}/lib" "${ios_prefix}/lib"
+    copy_tree "${ios_llvm}/lib/clang" "${ios_prefix}/lib/clang"
+    count="$(install_component_tools "${ios_llvm}/bin" "${ios_prefix}/bin")"
+    log "iOS LLVM: ${count} component tools in ${ios_prefix}/bin"
+    verify_component_tools "${ios_prefix}/bin" "SwiftLLVM (ios/bin)" \
+        || die "the iOS LLVM tree is missing preset component tools"
+
+    local description="swiftlang/llvm-project ${SWIFT_BRANCH} ($(llvm_commit))"
+
+    log "generating ${macosx_prefix}/bin/llvm-config (host)"
+    python3 "${SCRIPT_DIR}/llvm-config-shim.py" \
+        --source "${host_llvm}/bin/llvm-config" \
+        --mode host \
+        --host-target "$(uname -m | sed 's/^arm64$/aarch64/')-apple-darwin" \
+        --description "${description}" \
+        --out "${macosx_prefix}/bin/llvm-config"
+
+    log "generating ${ios_prefix}/bin/llvm-config (iOS)"
+    python3 "${SCRIPT_DIR}/llvm-config-shim.py" \
+        --source "${host_llvm}/bin/llvm-config" \
+        --mode ios \
+        --host-target "aarch64-apple-ios" \
+        --description "${description}" \
+        --out "${ios_prefix}/bin/llvm-config"
+
+    # Prove that both shims answer, and that the versions agree: this is the
+    # version the Rust compiler will be built against.
+    local host_version ios_version
+    host_version="$("${macosx_prefix}/bin/llvm-config" --version)"
+    ios_version="$("${ios_prefix}/bin/llvm-config" --version)"
+    [[ "${host_version}" == "${ios_version}" ]] \
+        || die "llvm-config shims disagree: host ${host_version} != ios ${ios_version}"
+    [[ "${host_version}" == "${version}" ]] \
+        || warn "llvm-config reports ${host_version}, llvm-project says ${version}"
+    log "LLVM ${host_version}: host and iOS trees installed in ${SWIFT_LLVM_DIR}"
+    report_line "swift LLVM: ${host_version} ($(llvm_commit)) for macOS and iOS"
+
+    # `--libs` falls back to `-lNAME` for anything the tree does not contain.
+    # That would only fail much later (when rustc is linked), so surface it
+    # here with the list of names.
+    local missing="" token
+    for token in $("${ios_prefix}/bin/llvm-config" --link-static --libs); do
+        case "${token}" in
+            -l*) missing="${missing} ${token#-l}" ;;
+        esac
+    done
+    if [[ -n "${missing}" ]]; then
+        warn "the iOS LLVM has no archive for:${missing}"
+        warn "rustc's link step will fail unless it is built by llvm-install-components"
+        report_line "swift LLVM: missing iOS archives:${missing}"
+    fi
+    count="$(find "${ios_prefix}/lib" -maxdepth 1 -name '*.a' | wc -l | tr -d ' ')"
+    log "the iOS LLVM provides ${count} static libraries"
+    report_line "swift LLVM: ${count} static libraries (ios/lib)"
+}
+
+# install_swift
+#
+# Collects the iOS Swift compiler from the build tree (the intermediate
+# install, when Swift produced one, otherwise the individual products) - the
+# same shape LLVM-On-iOS ships as SwiftToolchain.zip.
+install_swift() {
+    local build_dir candidate swift_build llvm_build
+    build_dir="${SWIFT_BUILD_ROOT}/${SWIFT_BUILD_SUBDIR}"
+    local prefix="Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr"
+    swift_build="$(swift_dir iphoneos)"
+    llvm_build="$(llvm_dir iphoneos)"
+
+    for candidate in "${build_dir}/intermediate-install/iphoneos-arm64/${prefix}" \
+                     "${build_dir}/toolchain-macosx-arm64/${prefix}"; do
+        if [[ -x "${candidate}/bin/swiftc" && -x "${candidate}/bin/swift-frontend" ]]; then
+            rm -rf "${SWIFT_INSTALL_DIR}"
+            mkdir -p "${SWIFT_INSTALL_DIR}"
+            cp -a "${candidate}/." "${SWIFT_INSTALL_DIR}/"
+            materialize_symlinks "${SWIFT_INSTALL_DIR}"
+            log "collected the iOS Swift toolchain from ${candidate}"
+            return
+        fi
+    done
+
+    if [[ -x "${swift_build}/bin/swiftc" && -x "${swift_build}/bin/swift-frontend" ]]; then
+        rm -rf "${SWIFT_INSTALL_DIR}"
+        mkdir -p "${SWIFT_INSTALL_DIR}/lib"
+        copy_tree "${swift_build}/bin" "${SWIFT_INSTALL_DIR}/bin"
+        copy_tree "${swift_build}/include" "${SWIFT_INSTALL_DIR}/include"
+        copy_tree "${swift_build}/share" "${SWIFT_INSTALL_DIR}/share"
+        copy_tree "${swift_build}/lib/swift" "${SWIFT_INSTALL_DIR}/lib/swift"
+        copy_tree "${swift_build}/lib/cmake" "${SWIFT_INSTALL_DIR}/lib/cmake"
+        copy_top_level_libs "${swift_build}/lib" "${SWIFT_INSTALL_DIR}/lib"
+        copy_tree "${llvm_build}/bin" "${SWIFT_INSTALL_DIR}/bin"
+        copy_tree "${llvm_build}/include" "${SWIFT_INSTALL_DIR}/include"
+        copy_tree "${llvm_build}/lib/clang" "${SWIFT_INSTALL_DIR}/lib/clang"
+        copy_tree "${llvm_build}/lib/cmake" "${SWIFT_INSTALL_DIR}/lib/cmake"
+        copy_top_level_libs "${llvm_build}/lib" "${SWIFT_INSTALL_DIR}/lib"
+        materialize_symlinks "${SWIFT_INSTALL_DIR}"
+        log "collected the iOS Swift toolchain from ${swift_build}"
+        return
+    fi
+
+    die "no iOS Swift compiler under ${build_dir}"
+}
+
+# A toolchain tarball must not contain symlinks pointing outside of it, so the
+# driver symlinks (swift, swiftc, clang, ...) become copies.
+materialize_symlinks() {
+    local root="$1" link target resolved tmp relative
+    while IFS= read -r link; do
+        target="$(readlink "${link}")"
+        relative="${link#"${root}/"}"
+        if [[ "${target}" != /* ]]; then
+            case "${relative}" in
+                bin/swift|bin/swiftc|bin/clang|bin/clang++|bin/clang-cpp| \
+                usr/bin/swift|usr/bin/swiftc|usr/bin/clang|usr/bin/clang++|usr/bin/clang-cpp)
+                    ;;
+                *) continue ;;
+            esac
+        fi
+        if [[ "${target}" = /* ]]; then
+            resolved="${target}"
+        else
+            resolved="$(cd "$(dirname "${link}")" && pwd)/${target}"
+        fi
+        [[ -e "${resolved}" ]] || die "dangling symlink ${link} -> ${target}"
+        tmp="${link}.materialized"
+        rm -rf "${tmp}"
+        cp -aL "${resolved}" "${tmp}"
+        rm -f "${link}"
+        mv "${tmp}" "${link}"
+    done < <(find "${root}" -type l -print)
+}
+
+# ---------------------------------------------------------------------------
+# packaging
+# ---------------------------------------------------------------------------
+
+# SwiftToolchain.zip - the same artifact (name, format, layout) as
+# emexlab/LLVM-On-iOS': a zip of SwiftToolchain/usr/{bin,include,lib,share},
+# with the driver symlinks (swift, swiftc, clang, ...) materialized and every
+# Mach-O verified to be iOS/arm64.
+package_swift() {
+    local version zip_file stage
+    version="${SWIFT_BRANCH#swift-}"
+    version="${version%-RELEASE}"
+    stage="${WORK_DIR}/${SWIFT_TOOLCHAIN_NAME}"
+
+    [[ -x "${SWIFT_INSTALL_DIR}/bin/swiftc" ]] || die "missing ${SWIFT_INSTALL_DIR}/bin/swiftc; run 'swift' first"
+
+    log "assembling ${stage}"
+    rm -rf "${stage}"
+    mkdir -p "${stage}/usr"
+    cp -a "${SWIFT_INSTALL_DIR}/." "${stage}/usr/"
+    materialize_symlinks "${stage}"
+
+    # The actual on-device compiler is swift-frontend. The cross-build can
+    # include macOS driver/support binaries next to it (the same layout as the
+    # pinned LLVM-On-iOS recipe), so classify them rather than falsely claim
+    # the entire directory is iOS-only.
+    is_ios_macho "${stage}/usr/bin/swift-frontend" \
+        || die "swift-frontend in SwiftToolchain is not an iOS/arm64 binary"
+    classify_tree "${stage}/usr/bin" "SwiftToolchain package (bin)"
+    classify_tree "${stage}/usr/lib" "SwiftToolchain package (lib)"
+    # The toolchain bin/ must carry the preset's LLVM component tools, exactly
+    # like LLVM-On-iOS' SwiftToolchain.zip (their llvm-install-components).
+    verify_component_tools "${stage}/usr/bin" "SwiftToolchain (bin)" \
+        || die "SwiftToolchain is missing LLVM component tools; not equivalent to LLVM-On-iOS"
+
+    zip_file="${ARTIFACTS_DIR}/${SWIFT_TOOLCHAIN_NAME}.zip"
+    log "creating ${zip_file}"
+    mkdir -p "${ARTIFACTS_DIR}"
+    rm -f "${zip_file}"
+    # -y: keep the remaining relative symlinks (lld flavours) as symlinks,
+    # exactly like LLVM-On-iOS' `zip -qry`.
+    ( cd "${WORK_DIR}" && zip -qry "${zip_file}" "${SWIFT_TOOLCHAIN_NAME}" )
+    checksum "${zip_file}"
+    log "swift toolchain: $(human_size "${zip_file}")"
+    report_line "SwiftToolchain ${version}: $(human_size "${zip_file}") (zip, SwiftToolchain/usr)"
+}
+
+# ---------------------------------------------------------------------------
+# install-nyxian: unpack SwiftToolchain.zip into nyxian's Shared resources
+#
+# emexlab/nyxian - the on-device IDE this toolchain is built for - keeps the
+# toolchains it ships inside its Shared/ folder, which its Xcode project
+# bundles into the app as a folder reference (Shared -> app Resources). This
+# is LLVM-On-iOS' `install-nyxian` contract: unzip the packaged toolchain to
+# ${NYXIAN_SHARED_DIR}/SwiftToolchain/usr/...
+#
+# NYXIAN_SHARED_DIR defaults to ../Shared, i.e. the parent checkout's Shared/
+# when rustios sits inside nyxian (as a submodule or a sibling clone).
+# ---------------------------------------------------------------------------
+install_nyxian() {
+    local zip nyxian_shared dest
+    zip="${ARTIFACTS_DIR}/${SWIFT_TOOLCHAIN_NAME}.zip"
+    [[ -f "${zip}" ]] || die "missing ${zip}; run 'package' first"
+    command -v unzip >/dev/null 2>&1 || die "missing required tool: unzip"
+
+    nyxian_shared="${NYXIAN_SHARED_DIR:-${REPO_ROOT}/../Shared}"
+    [[ -d "${nyxian_shared}" ]] \
+        || die "missing Nyxian Shared directory at ${nyxian_shared}; set NYXIAN_SHARED_DIR"
+    dest="${nyxian_shared}/${SWIFT_TOOLCHAIN_NAME}"
+
+    log "installing ${SWIFT_TOOLCHAIN_NAME} into ${nyxian_shared}"
+    rm -rf "${dest}"
+    unzip -q "${zip}" -d "${nyxian_shared}"
+
+    # The same shape verify-host checks, at the installed location.
+    [[ -x "${dest}/usr/bin/swiftc" ]] || die "install-nyxian: missing ${dest}/usr/bin/swiftc"
+    [[ -x "${dest}/usr/bin/swift-frontend" ]] \
+        || die "install-nyxian: missing ${dest}/usr/bin/swift-frontend"
+    [[ -d "${dest}/usr/lib/swift" ]] || die "install-nyxian: missing ${dest}/usr/lib/swift"
+    log "installed ${dest} (nyxian ships it inside the app via its Shared folder reference)"
+}
+
+# SwiftLLVM.tar.xz: the LLVM both compilers link (rustios addition - the
+# relocatable installed shape of the shared LLVM, with the llvm-config shims).
+package_llvm() {
+    local version tarball
+    version="$(llvm_version)"
+
+    [[ -x "${SWIFT_LLVM_DIR}/ios/bin/llvm-config" ]] || die "missing ${SWIFT_LLVM_DIR}; run 'llvm' first"
+
+    tarball="${ARTIFACTS_DIR}/${SWIFT_LLVM_TARBALL}"
+    log "creating ${tarball}"
+    tar_xz "${WORK_DIR}" "SwiftLLVM" "${tarball}"
+    checksum "${tarball}"
+    log "swift LLVM: $(human_size "${tarball}")"
+    report_line "SwiftLLVM ${version}: $(human_size "${tarball}")"
+}
+
+# LLVM.xcframework - the same artifact as emexlab/LLVM-On-iOS' Makefile
+# produces: one merged `llvm.a` plus one merged `Headers/` tree.
+#
+# The composition is theirs, step for step:
+#
+#   llvm.a  = libtool -static of the toolchain's libswift*.a,
+#             lib_CompilerRegexParser.a, libclang*.a, liblld*.a, libLLVM*.a
+#             and cmark's libcmark-gfm{,-extensions}.a     (SWIFT_STATIC_LIBS)
+#   Headers = toolchain include/, then lld/include, clang/include, llvm/include
+#             from the sources, then the generated clang headers from the iOS
+#             build tree, rm -rf Headers/swift/Bridging, then swift/include and
+#             swift/stdlib/public/SwiftShims
+#
+# Any category the collected toolchain does not provide is backfilled from the
+# iOS build trees it was collected from (deduplicated by file name), so the
+# archive holds the same library classes even when Swift produced no
+# intermediate install. REPORT.txt records what actually went in.
+llvm_xcframework() {
+    local version out_dir xcfw
+    version="$(llvm_version)"
+    out_dir="${WORK_DIR}/${LLVM_XCFRAMEWORK_NAME}.build"
+    xcfw="${out_dir}/${LLVM_XCFRAMEWORK_NAME}"
+
+    [[ -x "${SWIFT_INSTALL_DIR}/bin/swiftc" ]] \
+        || die "missing ${SWIFT_INSTALL_DIR}/bin/swiftc; run 'swift' first"
+
+    local swift_build ios_llvm cmark_build ws
+    swift_build="$(swift_dir iphoneos)"
+    ios_llvm="$(llvm_dir iphoneos)"
+    cmark_build="${SWIFT_BUILD_ROOT}/${SWIFT_BUILD_SUBDIR}/cmark-iphoneos-arm64"
+    ws="${SWIFT_WORKSPACE_DIR}"
+
+    log "merging llvm.a (LLVM-On-iOS' SWIFT_STATIC_LIBS composition)"
+    rm -rf "${out_dir}"
+    mkdir -p "${out_dir}/Headers"
+
+    # Seen-file bookkeeping for add_unique_libs (plain string: macOS bash 3.2
+    # has no associative arrays).
+    local seen_libs=" " static_libs=()
+    add_unique_libs() {
+        local f base
+        for f in "$@"; do
+            [[ -f "${f}" ]] || continue
+            base="$(basename "${f}")"
+            case "${seen_libs}" in *" ${base} "*) continue ;; esac
+            seen_libs="${seen_libs}${base} "
+            static_libs+=("${f}")
+        done
+    }
+
+    shopt -s nullglob
+    add_unique_libs "${SWIFT_INSTALL_DIR}"/lib/libswift*.a "${swift_build}"/lib/libswift*.a
+    add_unique_libs "${SWIFT_INSTALL_DIR}"/lib/lib_CompilerRegexParser.a "${swift_build}"/lib/lib_CompilerRegexParser.a
+    add_unique_libs "${SWIFT_INSTALL_DIR}"/lib/libclang*.a "${ios_llvm}"/lib/libclang*.a
+    add_unique_libs "${SWIFT_INSTALL_DIR}"/lib/liblld*.a "${ios_llvm}"/lib/liblld*.a
+    add_unique_libs "${SWIFT_INSTALL_DIR}"/lib/libLLVM*.a "${ios_llvm}"/lib/libLLVM*.a
+    add_unique_libs "${cmark_build}"/src/libcmark-gfm.a "${cmark_build}"/extensions/libcmark-gfm-extensions.a
+    shopt -u nullglob
+
+    [[ "${#static_libs[@]}" -gt 0 ]] || die "no static libraries to merge into llvm.a"
+    # An llvm.a without the LLVM archives would silently be a different
+    # artifact than LLVM-On-iOS'; fail instead.
+    local llvm_archives=0 category_counts f
+    for f in "${static_libs[@]}"; do
+        case "$(basename "${f}")" in libLLVM*) llvm_archives=$((llvm_archives + 1)) ;; esac
+    done
+    [[ "${llvm_archives}" -gt 0 ]] \
+        || die "no libLLVM*.a among the merge inputs; llvm.a would not be the LLVM-On-iOS artifact"
+    category_counts="$(for f in "${static_libs[@]}"; do basename "${f}"; done \
+        | sed -E 's/^(libswift).*/\1*.a/; s/^(libclang).*/\1*.a/; s/^(liblld).*/\1*.a/; s/^(libLLVM).*/\1*.a/' \
+        | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}')"
+    log "llvm.a inputs: ${#static_libs[@]} archives (${category_counts% })"
+
+    if ! command -v libtool >/dev/null 2>&1; then
+        die "libtool is required to merge llvm.a (macOS)"
+    fi
+    libtool -static -o "${out_dir}/llvm.a" "${static_libs[@]}" \
+        >"${WORK_DIR}/libtool-llvm.log" 2>&1 \
+        || die "libtool could not merge llvm.a (see ${WORK_DIR}/libtool-llvm.log)"
+    [[ -s "${out_dir}/llvm.a" ]] || die "llvm.a is empty"
+
+    # Headers, in LLVM-On-iOS' Makefile order (the rm of swift/Bridging before
+    # the source swift/include copy is theirs, kept verbatim so the resulting
+    # tree matches file for file).
+    merge_headers() {
+        local src="$1"
+        if [[ -d "${src}" ]]; then
+            cp -R "${src}/." "${out_dir}/Headers/"
+        else
+            warn "no header directory ${src}"
+        fi
+    }
+    log "merging Headers (toolchain, lld, clang, llvm, generated clang, swift, SwiftShims)"
+    merge_headers "${SWIFT_INSTALL_DIR}/include"
+    merge_headers "${ws}/llvm-project/lld/include"
+    merge_headers "${ws}/llvm-project/clang/include"
+    merge_headers "${ws}/llvm-project/llvm/include"
+    merge_headers "${ios_llvm}/tools/clang/include"
+    rm -rf "${out_dir}/Headers/swift/Bridging"
+    merge_headers "${SWIFT_SOURCE_DIR}/include"
+    merge_headers "${SWIFT_SOURCE_DIR}/stdlib/public/SwiftShims"
+
+    [[ -d "${out_dir}/Headers/llvm-c" ]] || die "Headers/llvm-c is missing (llvm/include not merged?)"
+    [[ -d "${out_dir}/Headers/clang-c" ]] || die "Headers/clang-c is missing (clang/include not merged?)"
+
+    rm -rf "${xcfw}"
+    xcodebuild -create-xcframework \
+        -library "${out_dir}/llvm.a" \
+        -headers "${out_dir}/Headers" \
+        -output "${xcfw}" >/dev/null
+
+    # The xcframework holds its own copies; drop the intermediates before the
+    # archive step so the runner does not keep llvm.a and Headers twice.
+    local members
+    members="$(ar -t "${out_dir}/llvm.a" 2>/dev/null | wc -l | tr -d ' ')"
+    rm -f "${out_dir}/llvm.a"
+    rm -rf "${out_dir}/Headers"
+
+    local tarball="${ARTIFACTS_DIR}/${LLVM_XCFRAMEWORK_NAME}.tar.xz"
+    log "creating ${tarball}"
+    tar_xz "${out_dir}" "${LLVM_XCFRAMEWORK_NAME}" "${tarball}"
+    checksum "${tarball}"
+    log "llvm.xcframework: $(human_size "${tarball}")"
+    report_line "LLVM.xcframework ${version}: $(human_size "${tarball}") (llvm.a: ${#static_libs[@]} archives, ${members} members; Headers: llvm-c clang-c lld swift SwiftShims)"
+}
+
+# CoreCompilerSupportLibs - the same artifact as LLVM-On-iOS': the host
+# compiler support dylibs (lib_Compiler*.dylib) of the collected iOS
+# toolchain, bundled as a flat directory.
+support_libs() {
+    local src dest tarball
+    src="${SWIFT_INSTALL_DIR}/lib/swift/host/compiler"
+    dest="${WORK_DIR}/${SUPPORT_LIBS_NAME}"
+
+    [[ -x "${SWIFT_INSTALL_DIR}/bin/swiftc" ]] \
+        || die "missing ${SWIFT_INSTALL_DIR}/bin/swiftc; run 'swift' first"
+    [[ -d "${src}" ]] || die "missing ${src}; LLVM-On-iOS bundles lib/swift/host/compiler/lib_Compiler*.dylib"
+
+    rm -rf "${dest}"
+    mkdir -p "${dest}"
+    shopt -s nullglob
+    local dylibs=("${src}"/lib_Compiler*.dylib)
+    shopt -u nullglob
+    [[ "${#dylibs[@]}" -gt 0 ]] \
+        || die "no lib_Compiler*.dylib in ${src}; cannot bundle ${SUPPORT_LIBS_NAME}"
+    cp -a "${dylibs[@]}" "${dest}/"
+
+    assert_ios_only "${dest}" "${SUPPORT_LIBS_NAME}"
+
+    tarball="${ARTIFACTS_DIR}/${SUPPORT_LIBS_NAME}.tar.xz"
+    log "creating ${tarball}"
+    tar_xz "${WORK_DIR}" "${SUPPORT_LIBS_NAME}" "${tarball}"
+    checksum "${tarball}"
+    log "support libs: $(human_size "${tarball}") (${#dylibs[@]} dylibs)"
+    report_line "CoreCompilerSupportLibs: $(human_size "${tarball}") (${#dylibs[@]} lib_Compiler*.dylib)"
+}
+
+tar_xz() {
+    local dir="$1" name="$2" out="$3"
+    mkdir -p "$(dirname "${out}")"
+    rm -f "${out}"
+    # -3, not -6: the LLVM tree is several GB of static archives, where -6
+    # costs minutes of CPU for a few percent. The job has a 6 h limit.
+    ( cd "${dir}" && XZ_OPT="-T0 -3" tar -cJf "${out}" "${name}" )
+}
+
+checksum() {
+    local file="$1"
+    mkdir -p "${ARTIFACTS_DIR}"
+    ( cd "${ARTIFACTS_DIR}" && shasum -a 256 "$(basename "${file}")" >> SHA256SUMS.txt )
+}
+
+# ---------------------------------------------------------------------------
+# verification
+# ---------------------------------------------------------------------------
+
+# macho_platform <file>: IOS, MACOS, ... or none (not a Mach-O).
+#
+# A Swift cross-toolchain intentionally has two categories of executable:
+# `swift-frontend` is the iOS compiler itself, while a host driver/tool can be
+# present beside it (this is also the layout LLVM-On-iOS packages). Distinguish
+# the Mach-O platform instead of relying on `file`, which prints only arm64.
+# Old deployment targets encode LC_VERSION_MIN_IPHONEOS rather than
+# LC_BUILD_VERSION, so account for both forms.
+macho_platform() {
+    local file="$1" desc info
+    desc="$(file -b "${file}" 2>/dev/null || true)"
+    case "${desc}" in
+        *Mach-O*) ;;
+        *) echo none; return 0 ;;
+    esac
+    if command -v vtool >/dev/null 2>&1; then
+        info="$(vtool -show-build "${file}" 2>/dev/null || true)"
+        case "${info}" in
+            *"platform IOS"*|*"LC_VERSION_MIN_IPHONEOS"*) echo IOS; return 0 ;;
+            *"platform MACOS"*|*"LC_VERSION_MIN_MACOSX"*) echo MACOS; return 0 ;;
+            *"platform TVOS"*)    echo TVOS; return 0 ;;
+            *"platform WATCHOS"*) echo WATCHOS; return 0 ;;
+        esac
+    fi
+    # vtool is expected on the CI image, but retain a useful fallback for a
+    # local Xcode installation which only provides otool.
+    case "$(otool -l "${file}" 2>/dev/null | sed -n 's/.*platform \([A-Z]*\).*/\1/p' | head -1)" in
+        IOS) echo IOS ;;
+        MACOS) echo MACOS ;;
+        *) echo unknown ;;
+    esac
+}
+
+# true for a non-Mach-O file, or an arm64 iOS executable/object. `unknown` is
+# accepted only when neither vtool nor otool can classify it; CI has vtool and
+# records all such cases in REPORT.txt through classify_tree().
+is_ios_macho() {
+    local file="$1" desc
+    desc="$(file -b "${file}" 2>/dev/null || true)"
+    [[ "${desc}" == *Mach-O* ]] || return 0
+    [[ "${desc}" == *arm64* ]] || return 1
+    case "$(macho_platform "${file}")" in
+        IOS|unknown) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# classify_tree <dir> <label>: report, rather than hide, host binaries that
+# accompany an iOS compiler. Any non-iOS/non-macOS Mach-O remains fatal.
+classify_tree() {
+    local dir="$1" label="$2" file platform
+    local ios=0 host=0 other=0
+    local host_files=() bad_files=()
+    [[ -d "${dir}" ]] || return 0
+    while IFS= read -r -d '' file; do
+        platform="$(macho_platform "${file}")"
+        case "${platform}" in
+            none) continue ;;
+            IOS) ios=$((ios + 1)) ;;
+            MACOS) host=$((host + 1)); host_files+=("${file}") ;;
+            *) other=$((other + 1)); bad_files+=("${file} (${platform})") ;;
+        esac
+    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.a' \) -print0)
+    if [[ "${#bad_files[@]}" -gt 0 ]]; then
+        printf '  %s\n' "${bad_files[@]}" >&2
+        die "${label}: binaries that are neither iOS nor macOS"
+    fi
+    log "${label}: ${ios} iOS/arm64 Mach-O file(s), ${host} host (macOS) file(s)"
+    if [[ "${#host_files[@]}" -gt 0 ]]; then
+        warn "${label}: ${host} host (macOS) binary/binaries are included (not iOS):"
+        printf '  %s\n' "${host_files[@]}" >&2
+    fi
+    report_line "${label}: ${ios} iOS/arm64 + ${host} host (macOS) Mach-O files"
+}
+
+# Static archives do not themselves have a Mach-O platform. Inspect a member;
+# this proves the iOS LLVM that rustc links is actually an iOS archive.
+verify_archive_is_ios() {
+    local archive="$1" label="$2" tmp member extracted platform
+    [[ -f "${archive}" ]] || die "missing ${archive}"
+    tmp="$(mktemp -d)"
+    member="$(ar -t "${archive}" 2>/dev/null | head -1)"
+    if [[ -z "${member}" ]] || ! (cd "${tmp}" && ar -x "${archive}" "${member}") >/dev/null 2>&1; then
+        rm -rf "${tmp}"
+        die "${label}: could not inspect an archive member in ${archive}"
+    fi
+    extracted="${tmp}/${member}"
+    platform="$(macho_platform "${extracted}")"
+    [[ "${platform}" == "IOS" || "${platform}" == "unknown" ]] \
+        || { rm -rf "${tmp}"; die "${label}: ${member} in ${archive##*/} is ${platform}, not IOS"; }
+    file -b "${extracted}" 2>/dev/null | grep -q arm64 \
+        || { rm -rf "${tmp}"; die "${label}: ${member} in ${archive##*/} is not arm64"; }
+    rm -rf "${tmp}"
+    log "${label}: ${archive##*/} member ${member} is ${platform}/arm64"
+}
+
+# Strict check for directories that must contain only device binaries (runtime
+# support libraries, for example). Archive platform verification is done by
+# verify_archive_is_ios(), because `file` sees an archive as a container.
+assert_ios_only() {
+    local dir="$1" label="$2"
+    local file bad=()
+    [[ -d "${dir}" ]] || return 0
+    while IFS= read -r -d '' file; do
+        if ! is_ios_macho "${file}"; then
+            bad+=("${file} ($(macho_platform "${file}"))")
+        fi
+    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' \) -print0)
+    if [[ "${#bad[@]}" -gt 0 ]]; then
+        printf '  %s\n' "${bad[@]}" >&2
+        die "${label} contains non-iOS binaries"
+    fi
+    log "${label}: every checked Mach-O file is iOS/arm64"
+}
+
+verify() {
+    require_macos
+    local swiftc swift_frontend driver_platform v tool
+
+    swiftc="${SWIFT_INSTALL_DIR}/bin/swiftc"
+    swift_frontend="${SWIFT_INSTALL_DIR}/bin/swift-frontend"
+
+    # `verify` also runs immediately after the LLVM phase, before the Swift
+    # compiler has been collected. In that phase only the shared LLVM checks
+    # below apply; after install-swift the frontend is mandatory.
+    if [[ -x "${swift_frontend}" ]]; then
+        # The frontend executes on the phone and is the non-negotiable product
+        # binary. The Swift driver may be a macOS helper in this cross-build
+        # layout (as it is in LLVM-On-iOS); do not mislabel it as iOS.
+        log "checking ${swift_frontend}"
+    file "${swift_frontend}"
+    is_ios_macho "${swift_frontend}" \
+        || die "swift-frontend is not an iOS/arm64 binary ($(macho_platform "${swift_frontend}"))"
+    if command -v vtool >/dev/null 2>&1; then
+        vtool -show-build "${swift_frontend}" 2>/dev/null | sed 's/^/    /'
+    fi
+    lipo -archs "${swift_frontend}" | grep -q arm64 \
+        || die "swift-frontend has no arm64 slice"
+    report_line "swift: ${SWIFT_BRANCH}, swift-frontend is $(macho_platform "${swift_frontend}")/arm64"
+
+    if [[ -x "${swiftc}" ]]; then
+        file "${swiftc}"
+        driver_platform="$(macho_platform "${swiftc}")"
+        case "${driver_platform}" in
+            IOS)
+                log "swiftc: iOS/arm64 (driver runs on the device)"
+                report_line "swiftc: IOS/arm64"
+                ;;
+            MACOS)
+                # This is an observed, intentional shape of the reference
+                # cross-build. Nyxian drives the compiler in process; it must
+                # never be advertised as a device-executable swiftc.
+                warn "swiftc is MACOS/arm64 (host driver); swift-frontend is the iOS compiler"
+                report_line "swiftc: MACOS/arm64 host driver (not an iOS artifact)"
+                ;;
+            *)
+                die "swiftc has unsupported Mach-O platform ${driver_platform}"
+                ;;
+        esac
+    else
+        warn "swiftc is missing; swift-frontend is present"
+        report_line "swiftc: missing"
+    fi
+
+    classify_tree "${SWIFT_INSTALL_DIR}/bin" "SwiftToolchain (bin)"
+    classify_tree "${SWIFT_INSTALL_DIR}/lib" "SwiftToolchain (lib)"
+    verify_component_tools "${SWIFT_INSTALL_DIR}/bin" "SwiftToolchain (bin)" \
+        || die "the Swift toolchain is missing LLVM component tools"
+    else
+        warn "no ${swift_frontend}; skipping Swift compiler checks until install-swift"
+    fi
+
+    if [[ -x "${SWIFT_LLVM_DIR}/ios/bin/llvm-config" ]]; then
+        v="$("${SWIFT_LLVM_DIR}/ios/bin/llvm-config" --version)"
+        log "llvm-config (iOS): ${v}"
+        [[ "$("${SWIFT_LLVM_DIR}/macosx/bin/llvm-config" --version)" == "${v}" ]] \
+            || die "the host and iOS llvm-config shims disagree"
+
+        # Static archives need a member-level check: `file` reports only an
+        # ar container, which does not establish the target platform.
+        verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMCore.a" "Swift LLVM (ios)"
+        verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMSupport.a" "Swift LLVM (ios)"
+        verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMAArch64CodeGen.a" "Swift LLVM (ios)"
+        for tool in llvm-ar llvm-nm llvm-ranlib llvm-objcopy; do
+            if [[ -x "${SWIFT_LLVM_DIR}/ios/bin/${tool}" ]]; then
+                is_ios_macho "${SWIFT_LLVM_DIR}/ios/bin/${tool}" \
+                    || die "${tool} in the iOS LLVM is $(macho_platform "${SWIFT_LLVM_DIR}/ios/bin/${tool}"), not IOS"
+            fi
+        done
+        verify_component_tools "${SWIFT_LLVM_DIR}/ios/bin" "SwiftLLVM (ios/bin)" \
+            || die "the shared iOS LLVM is missing component tools"
+        verify_component_tools "${SWIFT_LLVM_DIR}/macosx/bin" "SwiftLLVM (macosx/bin)" \
+            || die "the shared host LLVM is missing component tools"
+        report_line "llvm: ${v} ($(llvm_commit)); iOS archive members and component tools verified"
+    else
+        warn "no ${SWIFT_LLVM_DIR}/ios/bin/llvm-config; skipping the LLVM checks"
+    fi
+
+    # Fail early if the library set bootstrap asks llvm-config for is incomplete.
+    if [[ -d "${SWIFT_LLVM_DIR}/ios/lib" ]]; then
+        for tool in libLLVMCore.a libLLVMSupport.a libLLVMAArch64CodeGen.a libLLVMTargetParser.a; do
+            [[ -f "${SWIFT_LLVM_DIR}/ios/lib/${tool}" ]] \
+                || die "the iOS LLVM is missing ${tool}"
+        done
+        log "the iOS LLVM provides the libraries rustc links (LLVMCore, LLVMSupport, LLVMAArch64CodeGen, ...)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# info / main
+# ---------------------------------------------------------------------------
+
+info() {
+    cat <<EOF
+swift branch        : ${SWIFT_BRANCH}
+swift checkout      : ${SWIFT_SOURCE_DIR}
+swift commit        : $(swift_commit)
+llvm-project        : ${SWIFT_WORKSPACE_DIR}/llvm-project ($(llvm_commit))
+llvm version        : $(llvm_version)
+llvm targets        : ${LLVM_TARGETS}
+llvm comp. tools    : $(llvm_component_tools | paste -sd' ' -)
+ios deployment      : ${IOS_DEPLOYMENT_TARGET}
+build root          : ${SWIFT_BUILD_ROOT}
+build subdir        : ${SWIFT_BUILD_SUBDIR}
+preset              : ${SWIFT_CROSS_PRESET} (${SWIFT_PRESET_FILE})
+swift install dir   : ${SWIFT_INSTALL_DIR}
+llvm install dir    : ${SWIFT_LLVM_DIR}
+artifacts dir       : ${ARTIFACTS_DIR}
+artifacts           : ${SWIFT_TOOLCHAIN_NAME}.zip, ${LLVM_XCFRAMEWORK_NAME}.tar.xz,
+                      ${SUPPORT_LIBS_NAME}.tar.xz, ${SWIFT_LLVM_TARBALL}
+EOF
+}
+
+usage() {
+    cat <<EOF
+usage: $(basename "$0") <command>
+
+commands:
+  fetch             clone swift ${SWIFT_BRANCH} and its sibling repositories (llvm-project, ...)
+  llvm              build LLVM + Clang for macOS and iOS (needed by both compilers)
+  swift             build the Swift compiler for iOS and collect it in ${SWIFT_INSTALL_DIR}
+  install-swift     collect the iOS Swift compiler (after a build)
+  install-llvm      write the relocatable LLVM trees used by the Rust build
+  package           create ${SWIFT_TOOLCHAIN_NAME}.zip (the LLVM-On-iOS artifact)
+  package-llvm      create ${SWIFT_LLVM_TARBALL} (rustios: the shared LLVM trees)
+  llvm-xcframework  create ${LLVM_XCFRAMEWORK_NAME}.tar.xz (llvm.a + merged Headers)
+  support           create ${SUPPORT_LIBS_NAME}.tar.xz (lib_Compiler*.dylib)
+  verify            verify iOS/arm64 swift-frontend + LLVM (classify host helpers separately)
+  verify-host       alias of 'verify' (LLVM-On-iOS' name)
+  install-nyxian    unpack ${SWIFT_TOOLCHAIN_NAME}.zip into nyxian's Shared/
+                    resources (NYXIAN_SHARED_DIR, default ../Shared)
+  all               fetch + llvm + install-llvm + package-llvm + swift + package
+                    + llvm-xcframework + support + verify
+  info              print the effective configuration
+
+environment: SWIFT_BRANCH, IOS_DEPLOYMENT_TARGET, LLVM_TARGETS, SWIFT_SOURCE_DIR,
+             SWIFT_BUILD_ROOT, SWIFT_BUILD_SUBDIR, SWIFT_INSTALL_DIR, SWIFT_LLVM_DIR,
+             WORK_DIR, ARTIFACTS_DIR, NYXIAN_SHARED_DIR
+
+'llvm' and 'swift' run the same build-script invocation (Swift 6.4 builds the
+LLVM trees and the compilers in one go) and then collect the LLVM or the Swift
+compiler respectively. CI calls 'llvm' first and 'install-swift' afterwards, so
+the shared LLVM artifact exists before the Swift toolchain is packaged.
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    case "${cmd}" in
+        fetch)            fetch ;;
+        # both build the same thing (see build_swift); the name says what is
+        # collected afterwards
+        llvm)             build_swift llvm; install_llvm ;;
+        swift)            build_swift swift; install_llvm; install_swift ;;
+        install-swift)    install_swift ;;
+        install-llvm)     install_llvm ;;
+        package)          package_swift ;;
+        package-llvm)     package_llvm ;;
+        llvm-xcframework) llvm_xcframework ;;
+        support)          support_libs ;;
+        verify)           verify ;;
+        # nyxian interface (docs/nyxian.md): install into nyxian's Shared/
+        # resources; verify-host is LLVM-On-iOS' name for 'verify'.
+        install-nyxian)   install_nyxian ;;
+        verify-host)      verify ;;
+        all)
+            fetch
+            build_swift all
+            install_llvm
+            install_swift
+            verify
+            package_llvm
+            package_swift
+            llvm_xcframework
+            support_libs
+            ;;
+        info)             info ;;
+        ""|-h|--help|help) usage ;;
+        *) usage; die "unknown command: ${cmd}" ;;
+    esac
+}
+
+main "$@"
