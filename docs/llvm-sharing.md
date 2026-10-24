@@ -5,7 +5,8 @@
 ```
 swiftlang/llvm-project  (LLVM 21.1.6)
         │
-        ├── swift-frontend / swiftc   （iOS/arm64 で動く）
+        ├── swift-frontend            （iOS/arm64 で動く実コンパイラ）
+        ├── swiftc                    （参照クロスビルドでは macOS/arm64 driver が同居し得る）
         └── rustc                     （iOS/arm64 で動く）
 ```
 
@@ -193,8 +194,11 @@ Rust と噛み合わせるために意識している設定:
   `-fno-rtti` が cxxflags に混ざらない（rustc_llvm のラッパも同じ設定でコンパイルされる）。
 - `-DLLVM_ENABLE_ASSERTIONS=OFF` / `release` — 最適化ビルド同士で揃える。
 - `-DLLVM_ENABLE_EH:BOOL=OFF` — Rust 側も例外を使わない。
-- `cross-compile-hosts=iphoneos-arm64` — **Swift も LLVM も iOS/arm64 バイナリ**に
-  なる（macOS 用の成果物を iOS と称さないための大前提）。
+- `cross-compile-hosts=iphoneos-arm64` — `swift-frontend` と iOS LLVM は
+  **iOS/arm64** になる。LLVM-On-iOS と同じ出力には macOS/arm64 の `swiftc`
+  driver / helper が同居し得るため、CI は `LC_BUILD_VERSION`（旧形式なら
+  `LC_VERSION_MIN_IPHONEOS`）を読み、iOS frontend・LLVM archive member・LLVM
+  tools は厳密に検証し、host helper は明示的に報告する。
 
 `install_llvm` は CMake のビルドツリーから「インストール済みの形」を組み立てます。
 bin には llvm-config shim に加え、プリセットの `llvm-install-components` が

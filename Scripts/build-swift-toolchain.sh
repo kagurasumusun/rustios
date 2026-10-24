@@ -714,8 +714,14 @@ package_swift() {
     cp -a "${SWIFT_INSTALL_DIR}/." "${stage}/usr/"
     materialize_symlinks "${stage}"
 
-    assert_ios_only "${stage}/usr/bin" "SwiftToolchain (bin)"
-    assert_ios_only "${stage}/usr/lib" "SwiftToolchain (lib)"
+    # The actual on-device compiler is swift-frontend. The cross-build can
+    # include macOS driver/support binaries next to it (the same layout as the
+    # pinned LLVM-On-iOS recipe), so classify them rather than falsely claim
+    # the entire directory is iOS-only.
+    is_ios_macho "${stage}/usr/bin/swift-frontend" \
+        || die "swift-frontend in SwiftToolchain is not an iOS/arm64 binary"
+    classify_tree "${stage}/usr/bin" "SwiftToolchain package (bin)"
+    classify_tree "${stage}/usr/lib" "SwiftToolchain package (lib)"
     # The toolchain bin/ must carry the preset's LLVM component tools, exactly
     # like LLVM-On-iOS' SwiftToolchain.zip (their llvm-install-components).
     verify_component_tools "${stage}/usr/bin" "SwiftToolchain (bin)" \
@@ -960,93 +966,209 @@ checksum() {
 # verification
 # ---------------------------------------------------------------------------
 
-is_ios_macho() {
+# macho_platform <file>: IOS, MACOS, ... or none (not a Mach-O).
+#
+# A Swift cross-toolchain intentionally has two categories of executable:
+# `swift-frontend` is the iOS compiler itself, while a host driver/tool can be
+# present beside it (this is also the layout LLVM-On-iOS packages). Distinguish
+# the Mach-O platform instead of relying on `file`, which prints only arm64.
+# Old deployment targets encode LC_VERSION_MIN_IPHONEOS rather than
+# LC_BUILD_VERSION, so account for both forms.
+macho_platform() {
     local file="$1" desc info
     desc="$(file -b "${file}" 2>/dev/null || true)"
-    [[ "${desc}" == *Mach-O* ]] || return 0   # not a binary: nothing to check
-    [[ "${desc}" == *arm64* ]] || return 1
+    case "${desc}" in
+        *Mach-O*) ;;
+        *) echo none; return 0 ;;
+    esac
     if command -v vtool >/dev/null 2>&1; then
         info="$(vtool -show-build "${file}" 2>/dev/null || true)"
-        if [[ -n "${info}" && "${info}" != *"platform IOS"* ]]; then
-            return 1
-        fi
+        case "${info}" in
+            *"platform IOS"*|*"LC_VERSION_MIN_IPHONEOS"*) echo IOS; return 0 ;;
+            *"platform MACOS"*|*"LC_VERSION_MIN_MACOSX"*) echo MACOS; return 0 ;;
+            *"platform TVOS"*)    echo TVOS; return 0 ;;
+            *"platform WATCHOS"*) echo WATCHOS; return 0 ;;
+        esac
     fi
-    return 0
+    # vtool is expected on the CI image, but retain a useful fallback for a
+    # local Xcode installation which only provides otool.
+    case "$(otool -l "${file}" 2>/dev/null | sed -n 's/.*platform \([A-Z]*\).*/\1/p' | head -1)" in
+        IOS) echo IOS ;;
+        MACOS) echo MACOS ;;
+        *) echo unknown ;;
+    esac
 }
 
+# true for a non-Mach-O file, or an arm64 iOS executable/object. `unknown` is
+# accepted only when neither vtool nor otool can classify it; CI has vtool and
+# records all such cases in REPORT.txt through classify_tree().
+is_ios_macho() {
+    local file="$1" desc
+    desc="$(file -b "${file}" 2>/dev/null || true)"
+    [[ "${desc}" == *Mach-O* ]] || return 0
+    [[ "${desc}" == *arm64* ]] || return 1
+    case "$(macho_platform "${file}")" in
+        IOS|unknown) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# classify_tree <dir> <label>: report, rather than hide, host binaries that
+# accompany an iOS compiler. Any non-iOS/non-macOS Mach-O remains fatal.
+classify_tree() {
+    local dir="$1" label="$2" file platform
+    local ios=0 host=0 other=0
+    local host_files=() bad_files=()
+    [[ -d "${dir}" ]] || return 0
+    while IFS= read -r -d '' file; do
+        platform="$(macho_platform "${file}")"
+        case "${platform}" in
+            none) continue ;;
+            IOS) ios=$((ios + 1)) ;;
+            MACOS) host=$((host + 1)); host_files+=("${file}") ;;
+            *) other=$((other + 1)); bad_files+=("${file} (${platform})") ;;
+        esac
+    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.a' \) -print0)
+    if [[ "${#bad_files[@]}" -gt 0 ]]; then
+        printf '  %s\n' "${bad_files[@]}" >&2
+        die "${label}: binaries that are neither iOS nor macOS"
+    fi
+    log "${label}: ${ios} iOS/arm64 Mach-O file(s), ${host} host (macOS) file(s)"
+    if [[ "${#host_files[@]}" -gt 0 ]]; then
+        warn "${label}: ${host} host (macOS) binary/binaries are included (not iOS):"
+        printf '  %s\n' "${host_files[@]}" >&2
+    fi
+    report_line "${label}: ${ios} iOS/arm64 + ${host} host (macOS) Mach-O files"
+}
+
+# Static archives do not themselves have a Mach-O platform. Inspect a member;
+# this proves the iOS LLVM that rustc links is actually an iOS archive.
+verify_archive_is_ios() {
+    local archive="$1" label="$2" tmp member extracted platform
+    [[ -f "${archive}" ]] || die "missing ${archive}"
+    tmp="$(mktemp -d)"
+    member="$(ar -t "${archive}" 2>/dev/null | head -1)"
+    if [[ -z "${member}" ]] || ! (cd "${tmp}" && ar -x "${archive}" "${member}") >/dev/null 2>&1; then
+        rm -rf "${tmp}"
+        die "${label}: could not inspect an archive member in ${archive}"
+    fi
+    extracted="${tmp}/${member}"
+    platform="$(macho_platform "${extracted}")"
+    [[ "${platform}" == "IOS" || "${platform}" == "unknown" ]] \
+        || { rm -rf "${tmp}"; die "${label}: ${member} in ${archive##*/} is ${platform}, not IOS"; }
+    file -b "${extracted}" 2>/dev/null | grep -q arm64 \
+        || { rm -rf "${tmp}"; die "${label}: ${member} in ${archive##*/} is not arm64"; }
+    rm -rf "${tmp}"
+    log "${label}: ${archive##*/} member ${member} is ${platform}/arm64"
+}
+
+# Strict check for directories that must contain only device binaries (runtime
+# support libraries, for example). Archive platform verification is done by
+# verify_archive_is_ios(), because `file` sees an archive as a container.
 assert_ios_only() {
     local dir="$1" label="$2"
     local file bad=()
     [[ -d "${dir}" ]] || return 0
     while IFS= read -r -d '' file; do
         if ! is_ios_macho "${file}"; then
-            bad+=("${file}")
+            bad+=("${file} ($(macho_platform "${file}"))")
         fi
-    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.a' \) -print0)
+    done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' \) -print0)
     if [[ "${#bad[@]}" -gt 0 ]]; then
         printf '  %s\n' "${bad[@]}" >&2
         die "${label} contains non-iOS binaries"
     fi
-    log "${label}: every Mach-O file is iOS/arm64"
+    log "${label}: every checked Mach-O file is iOS/arm64"
 }
 
 verify() {
     require_macos
-    local swiftc swift_frontend clang
+    local swiftc swift_frontend driver_platform v tool
 
     swiftc="${SWIFT_INSTALL_DIR}/bin/swiftc"
     swift_frontend="${SWIFT_INSTALL_DIR}/bin/swift-frontend"
 
+    # `verify` also runs immediately after the LLVM phase, before the Swift
+    # compiler has been collected. In that phase only the shared LLVM checks
+    # below apply; after install-swift the frontend is mandatory.
+    if [[ -x "${swift_frontend}" ]]; then
+        # The frontend executes on the phone and is the non-negotiable product
+        # binary. The Swift driver may be a macOS helper in this cross-build
+        # layout (as it is in LLVM-On-iOS); do not mislabel it as iOS.
+        log "checking ${swift_frontend}"
+    file "${swift_frontend}"
+    is_ios_macho "${swift_frontend}" \
+        || die "swift-frontend is not an iOS/arm64 binary ($(macho_platform "${swift_frontend}"))"
+    if command -v vtool >/dev/null 2>&1; then
+        vtool -show-build "${swift_frontend}" 2>/dev/null | sed 's/^/    /'
+    fi
+    lipo -archs "${swift_frontend}" | grep -q arm64 \
+        || die "swift-frontend has no arm64 slice"
+    report_line "swift: ${SWIFT_BRANCH}, swift-frontend is $(macho_platform "${swift_frontend}")/arm64"
+
     if [[ -x "${swiftc}" ]]; then
-        log "checking ${swiftc}"
         file "${swiftc}"
-        is_ios_macho "${swiftc}" || die "swiftc is not an iOS/arm64 binary"
-        [[ -x "${swift_frontend}" ]] || die "swift-frontend is missing"
-        is_ios_macho "${swift_frontend}" || die "swift-frontend is not an iOS/arm64 binary"
-        if command -v vtool >/dev/null 2>&1; then
-            vtool -show-build "${swiftc}" | sed 's/^/    /'
-            vtool -show-build "${swiftc}" | grep -q "platform IOS" \
-                || die "swiftc was not linked for iOS"
-            vtool -show-build "${swiftc}" | grep -q "minos ${IOS_DEPLOYMENT_TARGET}" \
-                || warn "swiftc deployment target is not ${IOS_DEPLOYMENT_TARGET}"
-        fi
-        local archs
-        archs="$(lipo -archs "${swiftc}")"
-        [[ " ${archs} " == *" arm64 "* ]] || die "swiftc has no arm64 slice: ${archs}"
-        assert_ios_only "${SWIFT_INSTALL_DIR}/bin" "SwiftToolchain (bin)"
-        # The toolchain must carry the preset's LLVM component tools (clang,
-        # lld, llvm-ar, ...): the same set SwiftToolchain.zip ships in
-        # LLVM-On-iOS, and the same set RustToolchain/usr/bin mirrors.
-        verify_component_tools "${SWIFT_INSTALL_DIR}/bin" "SwiftToolchain (bin)" \
-            || die "the Swift toolchain is missing LLVM component tools"
-        log "swift compiler: iOS/arm64"
-        report_line "swift: ${SWIFT_BRANCH}, ${SWIFT_INSTALL_DIR}/bin/swiftc is iOS/arm64 (minos ${IOS_DEPLOYMENT_TARGET})"
+        driver_platform="$(macho_platform "${swiftc}")"
+        case "${driver_platform}" in
+            IOS)
+                log "swiftc: iOS/arm64 (driver runs on the device)"
+                report_line "swiftc: IOS/arm64"
+                ;;
+            MACOS)
+                # This is an observed, intentional shape of the reference
+                # cross-build. Nyxian drives the compiler in process; it must
+                # never be advertised as a device-executable swiftc.
+                warn "swiftc is MACOS/arm64 (host driver); swift-frontend is the iOS compiler"
+                report_line "swiftc: MACOS/arm64 host driver (not an iOS artifact)"
+                ;;
+            *)
+                die "swiftc has unsupported Mach-O platform ${driver_platform}"
+                ;;
+        esac
     else
-        warn "no ${swiftc}; skipping the Swift compiler checks"
+        warn "swiftc is missing; swift-frontend is present"
+        report_line "swiftc: missing"
+    fi
+
+    classify_tree "${SWIFT_INSTALL_DIR}/bin" "SwiftToolchain (bin)"
+    classify_tree "${SWIFT_INSTALL_DIR}/lib" "SwiftToolchain (lib)"
+    verify_component_tools "${SWIFT_INSTALL_DIR}/bin" "SwiftToolchain (bin)" \
+        || die "the Swift toolchain is missing LLVM component tools"
+    else
+        warn "no ${swift_frontend}; skipping Swift compiler checks until install-swift"
     fi
 
     if [[ -x "${SWIFT_LLVM_DIR}/ios/bin/llvm-config" ]]; then
-        local v
         v="$("${SWIFT_LLVM_DIR}/ios/bin/llvm-config" --version)"
         log "llvm-config (iOS): ${v}"
         [[ "$("${SWIFT_LLVM_DIR}/macosx/bin/llvm-config" --version)" == "${v}" ]] \
             || die "the host and iOS llvm-config shims disagree"
-        assert_ios_only "${SWIFT_LLVM_DIR}/ios/lib" "Swift LLVM (ios/lib)"
+
+        # Static archives need a member-level check: `file` reports only an
+        # ar container, which does not establish the target platform.
+        verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMCore.a" "Swift LLVM (ios)"
+        verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMSupport.a" "Swift LLVM (ios)"
+        verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMAArch64CodeGen.a" "Swift LLVM (ios)"
+        for tool in llvm-ar llvm-nm llvm-ranlib llvm-objcopy; do
+            if [[ -x "${SWIFT_LLVM_DIR}/ios/bin/${tool}" ]]; then
+                is_ios_macho "${SWIFT_LLVM_DIR}/ios/bin/${tool}" \
+                    || die "${tool} in the iOS LLVM is $(macho_platform "${SWIFT_LLVM_DIR}/ios/bin/${tool}"), not IOS"
+            fi
+        done
         verify_component_tools "${SWIFT_LLVM_DIR}/ios/bin" "SwiftLLVM (ios/bin)" \
             || die "the shared iOS LLVM is missing component tools"
         verify_component_tools "${SWIFT_LLVM_DIR}/macosx/bin" "SwiftLLVM (macosx/bin)" \
             || die "the shared host LLVM is missing component tools"
-        report_line "llvm: ${v} ($(llvm_commit)), host + iOS static libraries and component tools verified"
+        report_line "llvm: ${v} ($(llvm_commit)); iOS archive members and component tools verified"
     else
         warn "no ${SWIFT_LLVM_DIR}/ios/bin/llvm-config; skipping the LLVM checks"
     fi
 
-    # The iOS LLVM must be usable as the LLVM of a compiler: check that the
-    # archives rustc asks for are really there.
+    # Fail early if the library set bootstrap asks llvm-config for is incomplete.
     if [[ -d "${SWIFT_LLVM_DIR}/ios/lib" ]]; then
-        for lib in libLLVMCore.a libLLVMSupport.a libLLVMAArch64CodeGen.a libLLVMTargetParser.a; do
-            [[ -f "${SWIFT_LLVM_DIR}/ios/lib/${lib}" ]] \
-                || die "the iOS LLVM is missing ${lib}"
+        for tool in libLLVMCore.a libLLVMSupport.a libLLVMAArch64CodeGen.a libLLVMTargetParser.a; do
+            [[ -f "${SWIFT_LLVM_DIR}/ios/lib/${tool}" ]] \
+                || die "the iOS LLVM is missing ${tool}"
         done
         log "the iOS LLVM provides the libraries rustc links (LLVMCore, LLVMSupport, LLVMAArch64CodeGen, ...)"
     fi
@@ -1091,7 +1213,7 @@ commands:
   package-llvm      create ${SWIFT_LLVM_TARBALL} (rustios: the shared LLVM trees)
   llvm-xcframework  create ${LLVM_XCFRAMEWORK_NAME}.tar.xz (llvm.a + merged Headers)
   support           create ${SUPPORT_LIBS_NAME}.tar.xz (lib_Compiler*.dylib)
-  verify            check that the Swift compiler and the LLVM are iOS/arm64
+  verify            verify iOS/arm64 swift-frontend + LLVM (classify host helpers separately)
   verify-host       alias of 'verify' (LLVM-On-iOS' name)
   install-nyxian    unpack ${SWIFT_TOOLCHAIN_NAME}.zip into nyxian's Shared/
                     resources (NYXIAN_SHARED_DIR, default ../Shared)

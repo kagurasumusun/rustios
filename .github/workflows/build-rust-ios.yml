@@ -98,6 +98,9 @@ jobs:
     outputs:
       llvm_version: ${{ steps.versions.outputs.llvm_version }}
       swift_version: ${{ steps.versions.outputs.swift_version }}
+      # Rust can still validate the shared LLVM when a later Swift-toolchain
+      # packaging/verification step fails, provided SwiftLLVM.tar.xz exists.
+      llvm_ready: ${{ steps.llvm-ready.outputs.uploaded }}
 
     steps:
       - name: Checkout
@@ -255,6 +258,7 @@ jobs:
           Scripts/build-swift-toolchain.sh package-llvm 2>&1 | tee -a swift.log
 
       - name: Upload SwiftLLVM
+        id: upload-llvm
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -262,6 +266,20 @@ jobs:
           path: artifacts/SwiftLLVM.tar.xz
           if-no-files-found: error
           retention-days: 90
+
+      # A SwiftToolchain packaging/verification failure must not hide the
+      # separate shared-LLVM question: the Rust job can run if this artifact
+      # exists. It checks both the workspace file and the upload action's
+      # outcome, so a failed/absent upload never starts Rust accidentally.
+      - name: Record shared LLVM availability
+        if: always()
+        id: llvm-ready
+        run: |-
+          if [ -f artifacts/SwiftLLVM.tar.xz ] && [ "${{ steps.upload-llvm.outcome }}" = "success" ]; then
+            echo "uploaded=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "uploaded=false" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Collect the iOS Swift compiler
         if: steps.cache-swift-artifacts.outputs.cache-hit != 'true'
@@ -299,13 +317,18 @@ jobs:
       # On an artifacts-cache hit nothing was built, but the nyxian interface
       # must still hold: recreate the staging trees that the root directories
       # are copied from out of the cached tarballs.
-      - name: Restore nyxian staging from cached artifacts
+      - name: Restore and verify cached Swift artifacts
         if: steps.cache-swift-artifacts.outputs.cache-hit == 'true'
         run: |-
           set -euo pipefail
           mkdir -p work/LLVM.xcframework.build
+          tar -xJf artifacts/SwiftLLVM.tar.xz -C work
           tar -xJf artifacts/LLVM.xcframework.tar.xz -C work/LLVM.xcframework.build
           tar -xJf artifacts/CoreCompilerSupportLibs.tar.xz -C work
+          unzip -q artifacts/SwiftToolchain.zip -d work
+          echo "===== verify restored Swift artifacts =====" | tee -a swift.log
+          SWIFT_INSTALL_DIR="$PWD/work/SwiftToolchain/usr" \
+            Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
 
       # The nyxian contract (docs/nyxian.md): nyxian's Makefile cp -r's
       # CoreCompilerSupportLibs/ and LLVM.xcframework/ out of the repository
@@ -451,7 +474,10 @@ jobs:
     name: rustc for iOS (aarch64-apple-ios)
     # Everything this job produces is iOS/arm64 (macOS is only the build
     # environment). Non-iOS binaries make `verify`/`package` fail.
+    # Do not discard the Rust/LLVM result merely because subsequent Swift
+    # toolchain packaging failed: start whenever SwiftLLVM was uploaded.
     needs: swift
+    if: always() && needs.swift.outputs.llvm_ready == 'true'
     timeout-minutes: 300
     runs-on: ${{ vars.RUNNER_LABEL || 'macos-latest' }}
     outputs:
@@ -844,7 +870,7 @@ jobs:
           One LLVM (${{ needs.swift.outputs.llvm_version }}, the one Swift is built
           from) is shared by both compilers:
 
-          * \`SwiftToolchain.zip\` - the Swift compiler that runs on iOS
+          * \`SwiftToolchain.zip\` - iOS \`swift-frontend\` plus the LLVM-On-iOS cross-toolchain layout (which may include macOS driver helpers)
           * \`LLVM.xcframework.tar.xz\` - \`llvm.a\` + merged headers for iOS apps
           * \`CoreCompilerSupportLibs.tar.xz\` - the Swift host-compiler support dylibs
           * \`SwiftLLVM.tar.xz\` - the shared LLVM (macOS + iOS slices, llvm-config shims)

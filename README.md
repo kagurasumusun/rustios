@@ -67,7 +67,7 @@ Swift 側は LLVM-On-iOS と**同名**、Rust 側はそれと**同構造**です
 
 | ファイル | 対応 | 中身 |
 | --- | --- | --- |
-| `SwiftToolchain.zip` | = LLVM-On-iOS | `SwiftToolchain/usr/{bin,include,lib,share}` — iOS で動く `swiftc` / `swift-frontend` / clang / lld / llvm ツール |
+| `SwiftToolchain.zip` | = LLVM-On-iOS | `SwiftToolchain/usr/{bin,include,lib,share}` — **iOS/arm64 の実コンパイラは `swift-frontend`**。LLVM-On-iOS と同じクロスビルド構成のため、`swiftc` driver などの macOS/arm64 helper が同居し得る。CI は両者を Mach-O platform で分類し、host helper を iOS 成果物とは表示しない |
 | `LLVM.xcframework.tar.xz` | = LLVM-On-iOS | `llvm.a`（libswift\* + libclang\* + liblld\* + libLLVM\* + cmark を libtool 結合）+ 結合 `Headers/` |
 | `CoreCompilerSupportLibs.tar.xz` | = LLVM-On-iOS | `lib/swift/host/compiler/lib_Compiler*.dylib` のフラットなコピー |
 | `SwiftLLVM.tar.xz` | rustios 追加 | **共有 LLVM**。`SwiftLLVM/{macosx,ios}/{bin,include,lib}`（`bin/llvm-config` は shim、bin に LLVM ツール一式）。Rust のビルドはこれをそのまま使う |
