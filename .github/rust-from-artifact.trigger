@@ -12,3 +12,4 @@
 # (static xcframework: link the driver from bootstrap deps)
 # (capture the static-driver link error)
 # (static xcframework: also search the host deps dir)
+# (report: post the body, and record what the xcframework is)
