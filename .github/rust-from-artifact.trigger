@@ -13,3 +13,4 @@
 # (capture the static-driver link error)
 # (static xcframework: also search the host deps dir)
 # (report: post the body, and record what the xcframework is)
+# (static xcframework: search every deps dir under build/)
