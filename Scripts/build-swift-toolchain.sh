@@ -429,6 +429,19 @@ install_llvm() {
 # Collects the iOS Swift compiler from the build tree (the intermediate
 # install, when Swift produced one, otherwise the individual products) - the
 # same shape LLVM-On-iOS ships as SwiftToolchain.zip.
+# report_install_source <path> <kind>: what was collected, and what the two
+# binaries the toolchain is judged by actually are. Written to REPORT.txt
+# immediately, so it survives a later failure (the job log is not reachable
+# from everywhere).
+report_install_source() {
+    local from="$1" kind="$2" frontend driver
+    frontend="${SWIFT_INSTALL_DIR}/bin/swift-frontend"
+    driver="${SWIFT_INSTALL_DIR}/bin/swiftc"
+    report_line "swift install: ${kind} ${from}"
+    report_line "swift install: swift-frontend is $(macho_platform "${frontend}"), swiftc is $(macho_platform "${driver}")"
+    log "swift install: swift-frontend is $(macho_platform "${frontend}"), swiftc is $(macho_platform "${driver}")"
+}
+
 install_swift() {
     local build_dir candidate swift_build llvm_build
     build_dir="${SWIFT_BUILD_ROOT}/${SWIFT_BUILD_SUBDIR}"
@@ -444,6 +457,7 @@ install_swift() {
             cp -a "${candidate}/." "${SWIFT_INSTALL_DIR}/"
             materialize_symlinks "${SWIFT_INSTALL_DIR}"
             log "collected the iOS Swift toolchain from ${candidate}"
+            report_install_source "${candidate}" "install tree"
             return
         fi
     done
@@ -463,6 +477,7 @@ install_swift() {
         copy_archives "${llvm_build}/lib" "${SWIFT_INSTALL_DIR}/lib"
         materialize_symlinks "${SWIFT_INSTALL_DIR}"
         log "collected the iOS Swift toolchain from ${swift_build}"
+        report_install_source "${swift_build}" "build tree"
         return
     fi
 
@@ -664,7 +679,7 @@ is_ios_macho() {
 classify_tree() {
     local dir="$1" label="$2" required="${3:-}"
     local file platform ios=0 host=0 other=0
-    local host_files=() bad_files=()
+    local host_files=() bad_files=() unknown_files=()
     [[ -d "${dir}" ]] || return 0
 
     while IFS= read -r -d '' file; do
@@ -673,14 +688,25 @@ classify_tree() {
             none) continue ;;
             IOS)  ios=$((ios + 1)) ;;
             MACOS) host=$((host + 1)); host_files+=("${file}") ;;
+            UNKNOWN|unknown) other=$((other + 1)); unknown_files+=("${file}") ;;
             *)    other=$((other + 1)); bad_files+=("${file} (${platform})") ;;
         esac
     done < <(find "${dir}" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.a' \) -print0)
 
+    # A file whose platform cannot be read (vtool/otool print nothing useful) is
+    # reported, not fatal: that is a limit of the inspection, not evidence about
+    # the binary. A binary that *is* macOS is reported too (the cross build ships
+    # host tools on purpose, as LLVM-On-iOS does). Only a genuinely foreign
+    # platform - tvOS, watchOS, an unknown-but-parseable platform - is an error.
     [[ "${#bad_files[@]}" -eq 0 ]] || {
         printf '  %s\n' "${bad_files[@]}" >&2
         die "${label}: binaries that are neither iOS nor macOS"
     }
+    if [[ "${#unknown_files[@]}" -gt 0 ]]; then
+        warn "${label}: ${#unknown_files[@]} binary/binaries whose platform could not be read:"
+        printf '  %s\n' "${unknown_files[@]}" >&2
+        report_line "${label}: ${#unknown_files[@]} Mach-O files of unreadable platform"
+    fi
     if [[ -n "${required}" ]]; then
         is_ios_macho "${required}" || die "${required} is not an iOS/arm64 binary ($(macho_platform "${required}"))"
     fi

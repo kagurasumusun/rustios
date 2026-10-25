@@ -73,6 +73,11 @@ env:
   SWIFT_BRANCH: swift-6.4.0-RELEASE
   # Bump these to invalidate the caches below (e.g. after changing configure).
   CACHE_VERSION: "2"
+  # Bump when the *build* recipe changes (the llvm/install-llvm/install-swift
+  # steps of build-swift-toolchain.sh, or the build-script invocation). Edits to
+  # verification or packaging must not invalidate the built tree - that is what
+  # CACHE_VERSION used to do, at the price of a 5.5 h rebuild per typo fix.
+  SWIFT_BUILD_RECIPE: "1"
   # Never export SDKROOT: the build host is macOS, only the iOS compilation
   # should see the iPhoneOS SDK (the scripts handle that themselves).
   CARGO_INCREMENTAL: "0"
@@ -178,6 +183,13 @@ jobs:
       # (sources, preset, this script), so its *outputs* are cached. The build
       # trees are far too large for a cache; the two installed trees are not,
       # and they are what the rest of the pipeline uses.
+      # The key must describe the *build* only: SWIFT_BUILD_RECIPE is bumped by
+      # hand when the build steps change, and the presets decide what
+      # build-script is asked to build. Hashing the whole script (as this used)
+      # made every edit to a verification or packaging function throw away
+      # 5.5 hours of work. `restore-keys` is the prefix, so an entry saved with
+      # an older recipe suffix is still restored - and then checked below
+      # rather than trusted.
       - name: Restore the built LLVM and Swift compiler
         id: cache-swift-built
         uses: actions/cache/restore@v4
@@ -185,14 +197,37 @@ jobs:
           path: |
             work/SwiftLLVM
             work/SwiftToolchain
-          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini') }}
+          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ env.SWIFT_BUILD_RECIPE }}-${{ hashFiles('Scripts/swift-ios-toolchain-presets.ini') }}
+          restore-keys: |
+            swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-
+
+      # A restored tree may be incomplete (a cancelled run saves whatever it
+      # has). Decide from the contents, not from the cache key.
+      - name: Check the restored build
+        id: swift-built
+        run: |-
+          set -euo pipefail
+          complete=false
+          if [ -x work/SwiftToolchain/bin/swift-frontend ] \
+             && [ -d work/SwiftLLVM/ios/lib ] && [ -d work/SwiftLLVM/macosx/lib ] \
+             && [ -x work/SwiftLLVM/ios/bin/llvm-config ]; then
+            complete=true
+          fi
+          echo "complete=${complete}" >> "${GITHUB_OUTPUT}"
+          if [ "${complete}" = true ]; then
+            echo "reusing the cached Swift + LLVM build:" | tee -a swift.log
+            du -sh work/SwiftLLVM work/SwiftToolchain | tee -a swift.log
+            work/SwiftLLVM/ios/bin/llvm-config --version | tee -a swift.log
+          else
+            echo "no complete cached build; building Swift + LLVM" | tee -a swift.log
+          fi
 
       # Swift 6.4's build-script builds the two LLVM trees (macOS: the compiler
       # that does the work, iOS: the one that is shipped and that rustc links
       # against) and the two Swift compilers in one invocation; see
       # Scripts/build-swift-toolchain.sh. ~4 hours on a 3-core runner.
       - name: Build Swift + LLVM for iOS
-        if: steps.cache-swift-built.outputs.cache-hit != 'true'
+        if: steps.swift-built.outputs.complete != 'true'
         run: |-
           set -o pipefail
           echo "===== swift llvm =====" | tee -a swift.log
@@ -235,18 +270,15 @@ jobs:
           Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
 
       - name: Collect the iOS Swift compiler
-        if: steps.cache-swift-built.outputs.cache-hit != 'true'
+        if: steps.swift-built.outputs.complete != 'true'
         run: |-
           set -o pipefail
           echo "===== swift install-swift =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh install-swift 2>&1 | tee -a swift.log
 
-      - name: Verify the Swift toolchain
-        run: |-
-          set -o pipefail
-          echo "===== swift verify =====" | tee -a swift.log
-          Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
-
+      # Packaging comes *before* the verification: a bug in a check must never
+      # throw away a build that took hours (that is how the 5.5 h run
+      # 40150617119 ended with no SwiftToolchain artifact at all).
       - name: Package SwiftToolchain and LLVM.xcframework
         run: |-
           set -o pipefail
@@ -267,15 +299,21 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      - name: Verify the Swift toolchain
+        run: |-
+          set -o pipefail
+          echo "===== swift verify =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
+
       - name: Save the built LLVM and Swift compiler
         continue-on-error: true
-        if: always() && steps.cache-swift-built.outputs.cache-hit != 'true'
+        if: always() && steps.swift-built.outputs.complete != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             work/SwiftLLVM
             work/SwiftToolchain
-          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ hashFiles('Scripts/build-swift-toolchain.sh', 'Scripts/swift-ios-toolchain-presets.ini') }}
+          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ env.SWIFT_BUILD_RECIPE }}-${{ hashFiles('Scripts/swift-ios-toolchain-presets.ini') }}
 
       - name: Upload Swift logs
         if: always()
@@ -306,31 +344,56 @@ jobs:
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Report failure to pull request
-        # The rust job posts the full report; this one only makes a Swift-side
-        # failure visible (the rust job is skipped when this one fails).
-        if: failure() && github.event_name == 'pull_request'
+      # This job owns its own comment (Scripts/pr-report.sh finds it by a marker
+      # and edits it), so the Rust job's report cannot overwrite the reason why
+      # the Swift half failed - which is exactly what happened to run
+      # 40150617119, whose failure text was replaced by the Rust report.
+      - name: Report to pull request
+        if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          JOB_STATUS: ${{ job.status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |-
           set -euo pipefail
           {
-            echo "### rustios: swift stage failed"
+            echo "### rustios Swift half: ${JOB_STATUS}"
             echo
             echo "Run: ${RUN_URL}"
             echo
-            echo '```'
-            if [ -s swift.log ]; then
-              tail -c 50000 swift.log | tail -n 300
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "Swift 6.4 and its LLVM were built and verified for iOS/arm64."
             else
-              echo "(swift.log is empty - the failure happened before the first command)"
+              echo "The Swift half failed. Tail of swift.log:"
             fi
-            echo '```'
+            echo
+            if [ "${JOB_STATUS}" != "success" ]; then
+              echo '```'
+              if [ -s swift.log ]; then
+                # `swift.log` without the compiler's progress lines, which are
+                # thousands of lines long and hide the reason.
+                grep -v -E '^\[[0-9]+/[0-9]+\]|^\s*(Compiling|Building|Linking) ' swift.log \
+                  | tail -n 250 || tail -n 250 swift.log
+              else
+                echo "(swift.log is empty - the failure happened before the first command)"
+              fi
+              echo '```'
+            fi
+            if [ -s artifacts/REPORT.txt ]; then
+              echo
+              echo "<details><summary>artifact report</summary>"
+              echo
+              echo '```'
+              cat artifacts/REPORT.txt
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "Artifacts of this run: [swift-llvm](${RUN_URL}#artifacts) / swift-toolchain"
           } > swift-report.md
-          gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" \
-            --body-file swift-report.md --edit-last --create-if-none
+          Scripts/pr-report.sh "rustios-swift-report" swift-report.md
 
   # ---------------------------------------------------------------------------
   # rustc, linked against the Swift LLVM
@@ -618,8 +681,7 @@ jobs:
               fi
             fi
           } > report.md
-          gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" \
-            --body-file report.md --edit-last --create-if-none
+          Scripts/pr-report.sh "rustios-rust-report" report.md
 
       - name: Summary
         if: always()

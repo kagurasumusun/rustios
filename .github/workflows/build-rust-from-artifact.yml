@@ -430,8 +430,7 @@ jobs:
               fi
             fi
           } > report.md
-          gh pr comment "${pr}" --repo "${GITHUB_REPOSITORY}" \
-            --body-file report.md --edit-last --create-if-none
+          PR_NUMBER="${pr}" Scripts/pr-report.sh "rustios-rust-from-artifact-report" report.md
 
       - name: Summary
         if: always()
