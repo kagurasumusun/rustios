@@ -1594,13 +1594,26 @@ build_xcframework() {
     if find_target_rlib driver_rlib librustc_driver_impl; then
         log "building the static rustios driver (libRustCompiler.a)"
         log "  rustc_driver_impl: ${driver_rlib}"
-        # Every directory that can hold one of the driver's dependencies.
-        local dep_flags=() dep_dir
+        # Every directory that can hold one of the driver's dependencies. The
+        # fixed list covers the layouts bootstrap produces today; the deps
+        # directories found under build/ cover the rest (cargo decides where
+        # proc macros go, and guessing that wrong cost two runs already).
+        local dep_flags=() dep_dir discovered=()
         for dep_dir in "${XCFRAMEWORK_SEARCH_DIRS[@]}"; do
             if [[ -d "${dep_dir}" ]]; then
                 dep_flags+=("-L" "dependency=${dep_dir}")
             fi
         done
+        while IFS= read -r dep_dir; do
+            [[ -n "${dep_dir}" ]] || continue
+            case " ${XCFRAMEWORK_SEARCH_DIRS[*]} " in
+                *" ${dep_dir} "*) continue ;;
+            esac
+            dep_flags+=("-L" "dependency=${dep_dir}")
+            discovered+=("${dep_dir}")
+        done < <(find "${BUILD_DIR}" -maxdepth 8 -type d -name deps 2>/dev/null | sort)
+        log "  dependency search: ${#dep_flags[@]} -L entries (${#discovered[@]} discovered under ${BUILD_DIR})"
+        report_line "xcframework: ${#dep_flags[@]} dependency search paths for the static driver"
         if RUSTC_BOOTSTRAP=1 \
            RUSTIOS_VERSION="${RUST_VERSION}" \
            IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
@@ -1626,6 +1639,17 @@ build_xcframework() {
         else
             warn "could not build the static rustios driver"
             report_line "xcframework: the static driver did not build (rustc failed); falling back to the dylib"
+            # Where the crates the link could not find actually are: without
+            # this the only message is E0463 and the layout stays a guess.
+            {
+                echo "static driver: dependency layout under ${BUILD_DIR}:"
+                echo '```'
+                find "${BUILD_DIR}" -maxdepth 8 -name 'libderive_where*' -o -maxdepth 8 -name 'librustc_driver_impl*' 2>/dev/null | head -20
+                echo "-- deps directories searched:"
+                printf '%s\n' "${dep_flags[@]}" | grep -c dependency || true
+                find "${BUILD_DIR}" -maxdepth 8 -type d -name deps 2>/dev/null | head -20
+                echo '```'
+            } >> "${ARTIFACTS_DIR}/REPORT.txt"
             # The job log is not reachable from everywhere, so put the reason
             # where the report is: the tail of the failed rustc invocation.
             {
