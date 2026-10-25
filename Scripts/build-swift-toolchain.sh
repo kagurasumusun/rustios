@@ -533,9 +533,12 @@ package_swift() {
     materialize_symlinks "${stage}"
 
     # The compiler must be iOS; everything else is classified and recorded (a
-    # cross build also ships host tools, as LLVM-On-iOS does).
+    # cross build also ships host tools, as LLVM-On-iOS does). Record what the
+    # tree actually contains *before* asserting, so the report explains a
+    # failure even when the job log is out of reach.
+    report_line "swift package: swift-frontend is $(macho_platform "${stage}/usr/bin/swift-frontend"), swiftc is $(macho_platform "${stage}/usr/bin/swiftc")"
     is_ios_macho "${stage}/usr/bin/swift-frontend" \
-        || die "swift-frontend in the package is not an iOS/arm64 binary"
+        || die "swift-frontend in the package is $(macho_platform "${stage}/usr/bin/swift-frontend"), not an iOS/arm64 binary"
     classify_tree "${stage}/usr/bin" "SwiftToolchain package (bin)"
     classify_tree "${stage}/usr/lib" "SwiftToolchain package (lib)"
 

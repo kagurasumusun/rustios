@@ -32,10 +32,15 @@ trap 'rm -f "${tmp}"' EXIT
 id="$(gh api "repos/${repo}/issues/${pr}/comments?per_page=100" \
         --jq ".[] | select(.body | contains(\"${marker}\")) | .id" 2>/dev/null | head -1 || true)"
 
+# The body goes through JSON, not through `-f body=@file`: gh only expands
+# `@file` for typed fields, and a raw field made it post the literal path
+# ("@/var/folders/...") instead of the report.
+payload="$(jq -Rs '{body: .}' < "${tmp}")"
+
 if [[ -n "${id}" ]]; then
-    gh api -X PATCH "repos/${repo}/issues/comments/${id}" -f "body=@${tmp}" --silent \
-        && echo "pr-report: updated comment ${id}"
+    printf '%s' "${payload}" | gh api -X PATCH "repos/${repo}/issues/comments/${id}" \
+        --input - --silent && echo "pr-report: updated comment ${id}"
 else
-    gh api -X POST "repos/${repo}/issues/${pr}/comments" -f "body=@${tmp}" --silent \
-        && echo "pr-report: created a comment"
+    printf '%s' "${payload}" | gh api -X POST "repos/${repo}/issues/${pr}/comments" \
+        --input - --silent && echo "pr-report: created a comment"
 fi
