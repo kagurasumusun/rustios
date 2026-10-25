@@ -519,15 +519,24 @@ materialize_symlinks() {
 
 # SwiftToolchain-iphoneos-arm64-6.4.0.tar.xz  (LLVM-On-iOS' SwiftToolchain.zip)
 package_swift() {
-    local stage version tarball
+    local stage_root stage version tarball
     version="${SWIFT_BRANCH#swift-}"
     version="${version%-RELEASE}"
-    stage="${WORK_DIR}/${SWIFT_TOOLCHAIN_NAME}"
+    # SWIFT_INSTALL_DIR is work/SwiftToolchain, so the package must not be
+    # assembled inside work/SwiftToolchain itself: `cp -a src/. dst/usr` with
+    # dst inside src copies the tree into its own subdirectory and recurses
+    # (the run that found this produced paths of `usr/usr/usr/...` until
+    # "File name too long").
+    stage_root="${WORK_DIR}/package"
+    stage="${stage_root}/${SWIFT_TOOLCHAIN_NAME}"
 
     [[ -x "${SWIFT_INSTALL_DIR}/bin/swiftc" ]] || die "missing ${SWIFT_INSTALL_DIR}/bin/swiftc; run 'swift' first"
+    case "${stage}/" in
+        "${SWIFT_INSTALL_DIR}/"*) die "the package would be assembled inside ${SWIFT_INSTALL_DIR}" ;;
+    esac
 
     log "assembling ${stage}"
-    rm -rf "${stage}"
+    rm -rf "${stage_root}"
     mkdir -p "${stage}/usr"
     cp -a "${SWIFT_INSTALL_DIR}/." "${stage}/usr/"
     materialize_symlinks "${stage}"
@@ -544,7 +553,7 @@ package_swift() {
 
     tarball="${ARTIFACTS_DIR}/${SWIFT_TOOLCHAIN_NAME}-${PACKAGE_PREFIX}-${version}.tar.xz"
     log "creating ${tarball}"
-    tar_xz "${WORK_DIR}" "${SWIFT_TOOLCHAIN_NAME}" "${tarball}"
+    tar_xz "${stage_root}" "${SWIFT_TOOLCHAIN_NAME}" "${tarball}"
     checksum "${tarball}"
     log "swift toolchain: $(human_size "${tarball}")"
     report_line "SwiftToolchain ${version}: $(human_size "${tarball}")"
