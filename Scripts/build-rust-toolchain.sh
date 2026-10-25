@@ -1571,12 +1571,10 @@ build_xcframework() {
         "${libdir}"
         "${stage2}/lib"
         "${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
-        "${stage1}/lib"
         "${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/release/deps"
         "${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/${HOST_TRIPLE}/release/deps"
         "${BUILD_DIR}/${BUILD_TRIPLE}/stage2/release/deps"
         "${BUILD_DIR}/${BUILD_TRIPLE}/stage2/${HOST_TRIPLE}/release/deps"
-        "${BUILD_DIR}/${BUILD_TRIPLE}/stage1/release/deps"
     )
 
     log "assembling ${out_dir}"
@@ -1606,6 +1604,13 @@ build_xcframework() {
         done
         while IFS= read -r dep_dir; do
             [[ -n "${dep_dir}" ]] || continue
+            # Only this stage's graph. stage0/stage1 hold the same crates built
+            # by an older compiler, and rustc takes the first match it finds:
+            # searching them produced "found crate `derive_where` compiled by an
+            # incompatible version of rustc" (E0514) instead of a working link.
+            case "${dep_dir}" in
+                */stage0*|*/stage1*|*/bootstrap/*) continue ;;
+            esac
             case " ${XCFRAMEWORK_SEARCH_DIRS[*]} " in
                 *" ${dep_dir} "*) continue ;;
             esac

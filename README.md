@@ -68,9 +68,9 @@ iOS / ホストの **内訳を数えてレポートに明記** します（黙�
 
 | ファイル | 中身 |
 | --- | --- |
-| `SwiftToolchain-iphoneos-arm64-6.4.0.tar.xz` | iOS で動く `swiftc` / `swift-frontend`（LLVM-On-iOS の `SwiftToolchain.zip` 相当） |
+| `SwiftToolchain-iphoneos-arm64-6.4.0.tar.xz` | iOS で動くコンパイラ本体 `swift-frontend`（IOS/arm64）。`swiftc`/`swift-driver` は macOS のホストドライバで、LLVM-On-iOS の `SwiftToolchain.zip` と同じ構成。384 MB |
 | `SwiftLLVM-iphoneos-arm64-21.1.6.tar.xz` | **共有 LLVM**。`SwiftLLVM/{macosx,ios}/{bin/llvm-config,include,lib/*.a}`。Rust のビルドはこれをそのまま使う |
-| `LLVM.xcframework-iphoneos-arm64-21.1.6.tar.xz` | `llvm.a` + headers（LLVM-On-iOS の `LLVM.xcframework` 相当） |
+| `LLVM.xcframework-iphoneos-arm64-21.1.6.tar.xz` | `llvm.a` + headers（LLVM-On-iOS の `LLVM.xcframework` 相当）。44 MB |
 | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | `RustToolchain/usr/{bin,lib}` — iOS で動く `rustc`, `rustdoc`, codegen backend。**std は含みません** |
 | `RustStd-iphoneos-arm64-<ver>.tar.xz` | **std のみ**（`RustStd/usr/lib/rustlib/aarch64-apple-ios/lib/*.rlib`）。コンパイラとは別配布 |
 | `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `libRustCompiler.a`（rustc 本体 + C API の静的ライブラリ）と `rustios.h` を収めた `Rust.xcframework` |

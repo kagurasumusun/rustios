@@ -47,8 +47,8 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 
 | 要求 | 状態 |
 | --- | --- |
-| Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、4 時間 21 分、`swift-frontend` は iOS/arm64） |
-| Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 96 MB、iOS 側 `lib/*.a` のオブジェクトメンバーを `vtool` で検査） |
+| Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、`swift-frontend` は IOS/arm64、`SwiftToolchain` 384 MB。`swiftc`/`swift`/`swift-driver` は macOS のホストドライバ） |
+| Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 96 MB、`LLVM.xcframework` 44 MB。iOS 側 `lib/*.a` のメンバーを `vtool` で検査し `IOS/arm64` を確認） |
 | Rust を Swift の LLVM でビルドする | **CI で成功**（run 40144263022）。`RustToolchain` 35 MB + `RustStd` 256 MB + `Rust.xcframework` 30 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
 | Rust 専用の LLVM を別にビルドしない | **実装済み**（`src/llvm-project` を fetch しない、`llvm-config` を渡す、`llvm-tools=false`） |
 | バージョン整合の証拠 | §1 / §2 |
@@ -85,6 +85,17 @@ CI の履歴:
 7. 4.5 時間のビルドが push で消える問題への対処: `cancel-in-progress: false`
    （実行中の run は残り、待機中だけが置き換わる）と、`build-rust-from-artifact`
    の run ごとの concurrency グループ。
+8. Swift の検証が落ちた原因を特定して修正:
+   * `swiftc` は macOS（仕様どおり）。`swift-frontend` は IOS/arm64 で、要求は満たす。
+   * パッケージ先が `SWIFT_INSTALL_DIR` と同じで、自分自身を `usr/usr/usr/...` と
+     無限にコピーしていた（`File name too long`）→ `work/package/` に分離。
+   * 検証がパッケージより前で、5.5 時間のビルドが成果物ゼロで終わっていた
+     → パッケージ・アップロードを先に、検証を最後に。
+   * 2 ジョブが同じ PR コメントを奪い合い、失敗理由が消えていた → ジョブごとの
+     コメント（`Scripts/pr-report.sh`、マーカーで自分のコメントを探して編集）。
+   * ビルドキャッシュのキーがスクリプト全体のハッシュで、検証コードの修正でも
+     5.5 時間の再ビルドになっていた → プリセット＋手動の `SWIFT_BUILD_RECIPE`。
+     復元したツリーはキー一致ではなく**中身**で判定する。
 
 ---
 
@@ -386,7 +397,7 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | rust-lang 版 LLVM との API 差 | **2 件検出・パッチ適用**（`PGOOptions` の vfs 引数、`stdc++`→`libc++`）。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **未達**: `librustc_driver_impl` の rlib は見つかるようになったが、stage1 rustc による静的リンクが失敗し、dylib にフォールバックしている（run 40147495080 の REPORT.txt）。次回は rustc の出力をレポートに載せる |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **継続中**: `librustc_driver_impl` の rlib は見つかる。`derive_where`（proc-macro）の解決で 2 回失敗（E0463 → 探索範囲を広げすぎて E0514: stage0 の 1.93 ビルド版を掴んだ）。stage2 のグラフだけを探索するよう修正し、次回実行で確認する。今は静的リンクに失敗すると dylib にフォールバックし、理由を REPORT.txt に残す |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
 
