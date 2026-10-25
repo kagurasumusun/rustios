@@ -1556,17 +1556,27 @@ build_xcframework() {
     # Target artifacts live in the sysroot; the compiler dylibs in <sysroot>/lib.
     #
     # bootstrap does not copy the compiler's own rlibs into the sysroot - they
-    # stay in its build tree (build/<build>/stage2-rustc/<host>/release/deps) -
-    # so a static driver has to be linked from there. Without these two entries
-    # the static link could never find librustc_driver_impl and the framework
-    # silently fell back to the dylib.
+    # stay in its build tree - so a static driver has to be linked from there.
+    # cargo splits that tree in two, and both halves are needed:
+    #
+    #   .../stage2-rustc/<host>/release/deps   units for the target (the rlibs
+    #                                          of rustc_driver_impl and friends)
+    #   .../stage2-rustc/release/deps          units for the *build* machine,
+    #                                          i.e. proc macros such as
+    #                                          derive-where, which rustc needs
+    #                                          to resolve rustc_driver_impl's
+    #                                          dependencies ("can't find crate
+    #                                          for `derive_where`" otherwise)
     XCFRAMEWORK_SEARCH_DIRS=(
         "${libdir}"
         "${stage2}/lib"
         "${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
         "${stage1}/lib"
+        "${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/release/deps"
         "${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/${HOST_TRIPLE}/release/deps"
+        "${BUILD_DIR}/${BUILD_TRIPLE}/stage2/release/deps"
         "${BUILD_DIR}/${BUILD_TRIPLE}/stage2/${HOST_TRIPLE}/release/deps"
+        "${BUILD_DIR}/${BUILD_TRIPLE}/stage1/release/deps"
     )
 
     log "assembling ${out_dir}"

@@ -11,3 +11,4 @@
 # (libc++ patch for aarch64-apple-ios)
 # (static xcframework: link the driver from bootstrap deps)
 # (capture the static-driver link error)
+# (static xcframework: also search the host deps dir)
