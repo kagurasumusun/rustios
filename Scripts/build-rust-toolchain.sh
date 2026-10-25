@@ -1251,7 +1251,10 @@ EOF
     tar_xz "${WORK_DIR}" "${STD_NAME}" "${tarball}"
     checksum "${tarball}"
     log "std: $(human_size "${tarball}")"
-    report_line "RustStd: $(human_size "${tarball}") (${#std_rlibs[@]} std rlibs for ${HOST_TRIPLE})"
+    shopt -s nullglob
+    local all_rlibs=("${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib"/*.rlib)
+    shopt -u nullglob
+    report_line "RustStd: $(human_size "${tarball}") (${#all_rlibs[@]} rlibs for ${HOST_TRIPLE}, including libstd)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1551,11 +1554,19 @@ build_xcframework() {
     [[ -d "${libdir}" ]] || die "missing ${libdir}; run 'build' first"
 
     # Target artifacts live in the sysroot; the compiler dylibs in <sysroot>/lib.
+    #
+    # bootstrap does not copy the compiler's own rlibs into the sysroot - they
+    # stay in its build tree (build/<build>/stage2-rustc/<host>/release/deps) -
+    # so a static driver has to be linked from there. Without these two entries
+    # the static link could never find librustc_driver_impl and the framework
+    # silently fell back to the dylib.
     XCFRAMEWORK_SEARCH_DIRS=(
         "${libdir}"
         "${stage2}/lib"
         "${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
         "${stage1}/lib"
+        "${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/${HOST_TRIPLE}/release/deps"
+        "${BUILD_DIR}/${BUILD_TRIPLE}/stage2/${HOST_TRIPLE}/release/deps"
     )
 
     log "assembling ${out_dir}"
@@ -1573,6 +1584,13 @@ build_xcframework() {
     if find_target_rlib driver_rlib librustc_driver_impl; then
         log "building the static rustios driver (libRustCompiler.a)"
         log "  rustc_driver_impl: ${driver_rlib}"
+        # Every directory that can hold one of the driver's dependencies.
+        local dep_flags=() dep_dir
+        for dep_dir in "${XCFRAMEWORK_SEARCH_DIRS[@]}"; do
+            if [[ -d "${dep_dir}" ]]; then
+                dep_flags+=("-L" "dependency=${dep_dir}")
+            fi
+        done
         if RUSTC_BOOTSTRAP=1 \
            RUSTIOS_VERSION="${RUST_VERSION}" \
            IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
@@ -1584,7 +1602,7 @@ build_xcframework() {
                 --sysroot "${merged}" \
                 -C opt-level=2 \
                 -C debuginfo=0 \
-                -L "dependency=${libdir}" \
+                "${dep_flags[@]}" \
                 -o "${out_dir}/lib/libRustCompiler.a" \
                 "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"; then
             static_lib="true"
@@ -1596,9 +1614,11 @@ build_xcframework() {
             cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
         else
             warn "could not build the static rustios driver"
+            report_line "xcframework: the static driver did not build (rustc failed); falling back to the dylib"
         fi
     else
-        warn "no librustc_driver_impl-*.rlib in ${libdir}"
+        warn "no librustc_driver_impl-*.rlib in any of: ${XCFRAMEWORK_SEARCH_DIRS[*]}"
+        report_line "xcframework: **no librustc_driver_impl rlib** found; falling back to the dylib"
         warn "bootstrap did not keep the rustc rlibs; run 'configure' + a full rebuild"
     fi
 

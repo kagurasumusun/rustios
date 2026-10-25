@@ -9,3 +9,4 @@
 # (optimized-compiler-builtins = false)
 # (PGOOptions patch applied)
 # (libc++ patch for aarch64-apple-ios)
+# (static xcframework: link the driver from bootstrap deps)
