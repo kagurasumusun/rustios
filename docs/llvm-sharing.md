@@ -49,7 +49,7 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 | --- | --- |
 | Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、4 時間 21 分、`swift-frontend` は iOS/arm64） |
 | Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 96 MB、iOS 側 `lib/*.a` のオブジェクトメンバーを `vtool` で検査） |
-| Rust を Swift の LLVM でビルドする | **実装・ローカル検証済み**。実ビルドは次の Rust ジョブで確認する（Swift 側が失敗しても走るようにした） |
+| Rust を Swift の LLVM でビルドする | **CI で成功**（run 40144263022）。`RustToolchain` 35 MB + `RustStd` 256 MB + `Rust.xcframework` 30 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
 | Rust 専用の LLVM を別にビルドしない | **実装済み**（`src/llvm-project` を fetch しない、`llvm-config` を渡す、`llvm-tools=false`） |
 | バージョン整合の証拠 | §1 / §2 |
 | std をツールチェーンから分離 | **実装済み**（`RustStd`）。`RustToolchain` 側に std が漏れていないことを `package` が確認 |
@@ -72,6 +72,19 @@ CI の履歴:
    加えて、**パッケージとアップロードを検証より前に**移した（4.5 時間のビルドを
    検証のバグで捨てないため）。ビルド成果物（`work/SwiftLLVM` と
    `work/SwiftToolchain`）をキャッシュするようにもした。
+6. 「Swift を回さず、既存の `swift-llvm` で Rust だけをビルドする」
+   `build-rust-from-artifact` を追加（run 40019585601 の artifact を使用）。
+   Rust 側の修正を 4 回まわし、いずれも数分〜20 分で結果が出た:
+   * `FileCheck ... does not exist`（38 秒）→ `codegen-tests = false`
+   * `submodule src/llvm-project ... required`（34 秒）→
+     `optimized-compiler-builtins = false`
+   * `no matching constructor for 'PGOOptions'`（3 分 53 秒）→ patch 0001
+   * `ld: library 'stdc++' not found`（stage 2 のリンク）→ patch 0002
+   * **run 40144263022: 成功**（`RustToolchain` 35 MB / `RustStd` 256 MB /
+     `Rust.xcframework` 30 MB）。stage 1 + stage 2 でおよそ 30 分。
+7. 4.5 時間のビルドが push で消える問題への対処: `cancel-in-progress: false`
+   （実行中の run は残り、待機中だけが置き換わる）と、`build-rust-from-artifact`
+   の run ごとの concurrency グループ。
 
 ---
 
@@ -372,7 +385,8 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | rust-lang/llvm-project 固有パッチの全列挙 | **未完了**。`rustc/21.1-2025-08-01` は upstream `release/21.x` のマージが主で、bootstrap 側の分岐は `LLVM_RUSTLLVM` の定義だけ。ただし「1 つも無い」ことまでは確認できていない |
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
-| rust-lang 版 LLVM との API 差 | **1 件検出・パッチ適用**（`PGOOptions` の vfs 引数）。他にも同種の差があれば実ビルドで判明する |
+| rust-lang 版 LLVM との API 差 | **2 件検出・パッチ適用**（`PGOOptions` の vfs 引数、`stdc++`→`libc++`）。他にも同種の差があれば実ビルドで判明する |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **未達**: `librustc_driver_impl` の rlib は見つかるようになったが、stage1 rustc による静的リンクが失敗し、dylib にフォールバックしている（run 40147495080 の REPORT.txt）。次回は rustc の出力をレポートに載せる |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
 

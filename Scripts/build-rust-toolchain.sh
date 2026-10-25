@@ -1604,7 +1604,8 @@ build_xcframework() {
                 -C debuginfo=0 \
                 "${dep_flags[@]}" \
                 -o "${out_dir}/lib/libRustCompiler.a" \
-                "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs"; then
+                "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs" \
+                2>&1 | tee "${out_dir}/static-driver.log"; then
             static_lib="true"
             c_api="true"
             library="libRustCompiler.a"
@@ -1615,6 +1616,14 @@ build_xcframework() {
         else
             warn "could not build the static rustios driver"
             report_line "xcframework: the static driver did not build (rustc failed); falling back to the dylib"
+            # The job log is not reachable from everywhere, so put the reason
+            # where the report is: the tail of the failed rustc invocation.
+            {
+                echo "static driver: rustc failed, tail of the output:"
+                echo '```'
+                tail -n 15 "${out_dir}/static-driver.log" 2>/dev/null || echo "(no log)"
+                echo '```'
+            } >> "${ARTIFACTS_DIR}/REPORT.txt"
         fi
     else
         warn "no librustc_driver_impl-*.rlib in any of: ${XCFRAMEWORK_SEARCH_DIRS[*]}"
