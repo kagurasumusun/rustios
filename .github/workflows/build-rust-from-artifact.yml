@@ -88,7 +88,13 @@ env:
   # The Swift release whose llvm-project the artifact was built from.
   SWIFT_BRANCH: swift-6.4.0-RELEASE
   # Must match build-rust-ios.yml, or the rust source cache is not shared.
-  CACHE_VERSION: "2"
+  # 3: rustc's std now embeds compiler-rt (optimized-compiler-builtins) and
+  # the toolchain ships llvm-tools; both need the sources cache to be filled
+  # again, and the artifact has to come from a run of the same version.
+  # 4: matches build-rust-ios.yml (shared LLVM built with all backends). The
+  # swift-llvm artifact this workflow consumes must come from a run of the
+  # current CACHE_VERSION, i.e. one whose LLVM has every backend.
+  CACHE_VERSION: "4"
   CARGO_INCREMENTAL: "0"
 
 jobs:

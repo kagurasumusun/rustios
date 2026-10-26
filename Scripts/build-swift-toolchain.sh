@@ -60,10 +60,12 @@ SWIFT_INSTALL_DIR="${SWIFT_INSTALL_DIR:-${WORK_DIR}/SwiftToolchain}"
 # shim, include/, lib/*.a). build-rust-toolchain.sh consumes exactly this.
 SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${WORK_DIR}/SwiftLLVM}"
 
-# LLVM backends. AArch64 is what the shipped compilers use; ARM and X86 are
-# required by compiler-rt's embedded builtins (see the preset). Must match
-# `llvm-targets-to-build` there.
-LLVM_TARGETS="${LLVM_TARGETS:-AArch64;ARM;X86}"
+# LLVM backends, read from the preset so that `info`, the report and the CI
+# cache check cannot drift away from what is actually built (the preset - not
+# this variable - is what build-script is given). Override with LLVM_TARGETS=…
+# to see what another value would look like; the build still follows the preset.
+LLVM_TARGETS="${LLVM_TARGETS:-$(sed -n 's/^llvm-targets-to-build=//p' "${SWIFT_PRESET_FILE}" 2>/dev/null | head -1)}"
+LLVM_TARGETS="${LLVM_TARGETS:-all}"
 
 PACKAGE_PREFIX="iphoneos-arm64"
 SWIFT_TOOLCHAIN_NAME="SwiftToolchain"
@@ -116,6 +118,11 @@ llvm_version() {
 
 llvm_commit() {
     git -C "${SWIFT_WORKSPACE_DIR}/llvm-project" rev-parse --short HEAD 2>/dev/null || echo unknown
+}
+
+# Full 40-character commit: the Rust half fetches compiler-rt at this commit.
+llvm_commit_full() {
+    git -C "${SWIFT_WORKSPACE_DIR}/llvm-project" rev-parse HEAD 2>/dev/null || echo unknown
 }
 
 swift_commit() {
@@ -308,6 +315,71 @@ copy_archives() {
     fi
 }
 
+# Every tool the Rust half installs into `lib/rustlib/<host>/bin`
+# (`LLVM_TOOLS` in src/bootstrap/src/lib.rs), plus llvm-ranlib.
+#
+# bootstrap copies exactly this list out of the LLVM that `llvm-config`
+# names - for the iOS tree *and* for the macOS tree - and panics when one of
+# them is missing. Without the list the Rust toolchain would have an empty
+# `lib/rustlib/<host>/bin`, i.e. no `llvm-ar`/`rust-objcopy` on the device,
+# and rustc could not create static libraries there.
+LLVM_RUST_TOOLS=(
+    llvm-cov llvm-nm llvm-objcopy llvm-objdump llvm-profdata llvm-readobj
+    llvm-size llvm-strip llvm-ar llvm-as llvm-dis llvm-link llc opt
+    llvm-ranlib
+)
+
+# install_llvm_tools <build-tree> <prefix> <expected-platform> <label>
+#
+# Copies the tools above out of an LLVM build tree, dereferencing symlinks
+# (`llvm-strip` is usually a link to `llvm-objcopy`, and a package must not
+# contain links out of itself). Records what is missing instead of failing:
+# the Rust half checks the list again and only enables its llvm-tools step
+# when it is complete.
+install_llvm_tools() {
+    local source="$1" prefix="$2" platform="$3" label="$4"
+    local tool found=0 missing=() wrong=()
+    mkdir -p "${prefix}/bin"
+    for tool in "${LLVM_RUST_TOOLS[@]}"; do
+        if [[ -e "${source}/bin/${tool}" ]]; then
+            cp -aL "${source}/bin/${tool}" "${prefix}/bin/${tool}" \
+                || { missing+=("${tool}"); continue; }
+            found=$((found + 1))
+            if [[ "${platform}" == "IOS" ]] && ! is_ios_macho "${prefix}/bin/${tool}"; then
+                wrong+=("${tool}")
+            fi
+            if [[ "${platform}" == "MACOS" ]] \
+               && [[ "$(macho_platform "${prefix}/bin/${tool}")" == "IOS" ]]; then
+                wrong+=("${tool}")
+            fi
+        else
+            missing+=("${tool}")
+        fi
+    done
+    log "${label}: ${found}/${#LLVM_RUST_TOOLS[@]} LLVM tools for rustc"
+    report_line "swift LLVM (${label}): ${found}/${#LLVM_RUST_TOOLS[@]} rustc LLVM tools installed"
+    # macOS ships bash 3.2, where "${arr[@]}" on an empty array is an
+    # unbound variable under `set -u`.
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        warn "${label}: not built for this tree: ${missing[*]+${missing[*]}}"
+        report_line "swift LLVM (${label}): not built: ${missing[*]+${missing[*]}}"
+    fi
+    if [[ ${#wrong[@]} -gt 0 ]]; then
+        warn "${label}: wrong platform (expected ${platform}): ${wrong[*]+${wrong[*]}}"
+        report_line "swift LLVM (${label}): wrong platform: ${wrong[*]+${wrong[*]}}"
+    fi
+    # One line per tool that is present: the Rust job reads this to decide
+    # whether its llvm-tools step can run at all.
+    {
+        printf '%s\n' "${LLVM_RUST_TOOLS[@]}" | while IFS= read -r tool; do
+            if [[ -x "${prefix}/bin/${tool}" ]]; then
+                printf '%s\n' "${tool}"
+            fi
+        done
+    } > "${prefix}/rust-llvm-tools.txt"
+    return 0
+}
+
 # install_llvm
 #
 # Writes <SWIFT_LLVM_DIR>/{macosx,ios}:
@@ -353,26 +425,26 @@ install_llvm() {
     log "installing the host LLVM"
     install_headers "${host_llvm}" "${macosx_prefix}"
     copy_archives "${host_llvm}/lib" "${macosx_prefix}/lib"
-    # Tools that run on the build machine (the shim needs none, but a
-    # bootstrap that shells out to llvm-ar would find them here).
+    # The tools that run on the build machine. bootstrap installs the same
+    # list into the stage-1 (macOS) sysroot, so it has to be here too; it
+    # also holds FileCheck, which `x.py` requires next to an external LLVM
+    # when codegen tests are enabled.
+    install_llvm_tools "${host_llvm}" "${macosx_prefix}" MACOS "macosx/bin"
     local tool
-    for tool in llvm-ar llvm-nm llvm-ranlib llvm-objcopy llvm-strip; do
+    for tool in FileCheck not count llvm-lit; do
         if [[ -x "${host_llvm}/bin/${tool}" ]]; then
-            cp -a "${host_llvm}/bin/${tool}" "${macosx_prefix}/bin/"
+            cp -aL "${host_llvm}/bin/${tool}" "${macosx_prefix}/bin/${tool}" || true
         fi
     done
+    report_line "swift LLVM (macosx/bin): FileCheck $(if [[ -x "${macosx_prefix}/bin/FileCheck" ]]; then echo present; else echo absent; fi)"
 
     log "installing the iOS LLVM"
     install_headers "${ios_llvm}" "${ios_prefix}"
     copy_archives "${ios_llvm}/lib" "${ios_prefix}/lib"
-    # The tools run on the device; rustc uses llvm-ar/llvm-objcopy from its
-    # sysroot. Copy the small, useful ones (the rest are macOS-only tools or
-    # huge binaries).
-    for tool in llvm-ar llvm-nm llvm-ranlib llvm-objcopy llvm-strip; do
-        if [[ -f "${ios_llvm}/bin/${tool}" ]]; then
-            cp -a "${ios_llvm}/bin/${tool}" "${ios_prefix}/bin/"
-        fi
-    done
+    # These run on the device: they end up in the Rust toolchain's
+    # `lib/rustlib/aarch64-apple-ios/bin`, where rustc looks for `llvm-ar`
+    # and `rust-objcopy`. Every one of them is verified to be iOS/arm64.
+    install_llvm_tools "${ios_llvm}" "${ios_prefix}" IOS "ios/bin"
 
     local description="swiftlang/llvm-project ${SWIFT_BRANCH} ($(llvm_commit))"
 
@@ -403,6 +475,20 @@ install_llvm() {
         || warn "llvm-config reports ${host_version}, llvm-project says ${version}"
     log "LLVM ${host_version}: host and iOS trees installed in ${SWIFT_LLVM_DIR}"
     report_line "swift LLVM: ${host_version} ($(llvm_commit)) for macOS and iOS"
+    # The Rust half needs compiler-rt sources from the *same* llvm-project
+    # commit: rustc's std embeds C implementations of the compiler intrinsics
+    # taken from there, and they have to match the LLVM rustc links.
+    {
+        echo "repository=https://github.com/swiftlang/llvm-project"
+        echo "commit=$(llvm_commit_full)"
+        echo "tag=${SWIFT_BRANCH}"
+        echo "version=${version}"
+        # The backend list this tree was configured with: the Rust half and the
+        # CI cache check compare it with the preset, so a tree built with an
+        # older target list is never mistaken for the current one.
+        echo "targets=${LLVM_TARGETS}"
+        echo "targets_built=$("${ios_prefix}/bin/llvm-config" --targets-built | tr ' ' '\n' | paste -sd';' -)"
+    } > "${SWIFT_LLVM_DIR}/llvm-project.txt"
 
     # `--libs` falls back to `-lNAME` for anything the tree does not contain.
     # That would only fail much later (when rustc is linked), so surface it
@@ -842,15 +928,43 @@ verify() {
         verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMSupport.a" "Swift LLVM (ios)"
         verify_archive_is_ios "${SWIFT_LLVM_DIR}/ios/lib/libLLVMAArch64CodeGen.a" "Swift LLVM (ios)"
 
-        # The tools that ship with the iOS LLVM run on the device.
-        local tool
-        for tool in llvm-ar llvm-nm llvm-ranlib llvm-objcopy; do
+        # The tools that ship with the iOS LLVM run on the device, and the
+        # Rust half installs every one of them into its sysroot - so a macOS
+        # binary here would end up in the Rust toolchain.
+        local tool installed=0
+        for tool in "${LLVM_RUST_TOOLS[@]}"; do
             if [[ -x "${SWIFT_LLVM_DIR}/ios/bin/${tool}" ]]; then
                 is_ios_macho "${SWIFT_LLVM_DIR}/ios/bin/${tool}" \
                     || die "${tool} in the iOS LLVM is $(macho_platform "${SWIFT_LLVM_DIR}/ios/bin/${tool}"), not iOS"
+                installed=$((installed + 1))
             fi
         done
-        log "llvm-config (iOS), archive members and iOS tools verified"
+        log "${installed}/${#LLVM_RUST_TOOLS[@]} iOS LLVM tools verified as iOS/arm64"
+        report_line "swift LLVM: ${installed}/${#LLVM_RUST_TOOLS[@]} rustc LLVM tools present and iOS/arm64"
+
+        # The backends are the one capability that used to differ from a
+        # rust-built LLVM. Compare what the tree answers with the preset rather
+        # than trusting either side: `all` is a valid LLVM_TARGETS_TO_BUILD
+        # value, so expand it to the list llvm-config reports.
+        local built expected
+        built="$("${SWIFT_LLVM_DIR}/ios/bin/llvm-config" --targets-built | tr ' ' '\n' | sort | paste -sd';' -)"
+        expected="${LLVM_TARGETS}"
+        if [[ "${expected}" == "all" ]]; then
+            # Everything LLVM itself lists for this source tree.
+            expected="$("${SWIFT_LLVM_DIR}/macosx/bin/llvm-config" --targets-built | tr ' ' '\n' | sort | paste -sd';' -)"
+        else
+            expected="$(printf '%s' "${expected}" | tr ';' '\n' | sort | paste -sd';' -)"
+        fi
+        log "LLVM backends  : ${built}"
+        report_line "swift LLVM: $(printf '%s' "${built}" | tr ';' ' ' | wc -w | tr -d ' ') backends (${built})"
+        if [[ "${built}" != "${expected}" ]]; then
+            # Not die: a narrower tree still compiles iOS. It is a capability
+            # difference, and this is the line that admits it.
+            warn "the iOS LLVM has backends [${built}], expected [${expected}]"
+            report_line "swift LLVM: **backends differ** from the preset: built [${built}], expected [${expected}]"
+        else
+            report_line "swift LLVM: backends match the preset (llvm-targets-to-build=${LLVM_TARGETS})"
+        fi
         report_line "llvm: ${v} ($(llvm_commit)); ios/lib archives and tools are iOS/arm64"
     else
         warn "no ${SWIFT_LLVM_DIR}/ios/bin/llvm-config; skipping the LLVM checks"

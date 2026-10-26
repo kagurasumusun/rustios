@@ -51,6 +51,22 @@ STAGE="${STAGE:-2}"
 # LLVM backends. rustc only compiles for HOST_TRIPLE, so AArch64 is enough.
 LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
 
+# Code quality of the produced rustc. These are the values rust-lang/rust's
+# own distributed builds use (src/ci/github-actions/jobs.yml: `--set
+# rust.lto=thin --set rust.codegen-units=1`, and run.sh adds
+# `--set rust.codegen-units-std=1`). Anything less makes the shipped compiler
+# slower than the official one for no reason; see docs/llvm-parity.md.
+RUST_LTO="${RUST_LTO:-thin}"
+RUST_CODEGEN_UNITS="${RUST_CODEGEN_UNITS:-1}"
+
+# Every tool bootstrap copies into `lib/rustlib/<host>/bin` (LLVM_TOOLS in
+# src/bootstrap/src/lib.rs). It only does that when `llvm-tools` is enabled,
+# and it needs all of them in the LLVM tree that llvm-config names.
+LLVM_TOOLS_NEEDED=(
+    llvm-cov llvm-nm llvm-objcopy llvm-objdump llvm-profdata llvm-readobj
+    llvm-size llvm-strip llvm-ar llvm-as llvm-dis llvm-link llc opt
+)
+
 # Which LLVM the Rust compiler links against:
 #
 #   swift  (default) the LLVM that Scripts/build-swift-toolchain.sh built for
@@ -64,6 +80,12 @@ LLVM_TARGETS="${LLVM_TARGETS:-AArch64}"
 #   Scripts/build-swift-toolchain.sh fetch llvm
 RUST_LLVM_MODE="${RUST_LLVM_MODE:-swift}"
 SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${REPO_ROOT}/work/SwiftLLVM}"
+# The Swift checkout (llvm-project lives next to it), used to copy
+# compiler-rt without a second download when both halves run in one job.
+SWIFT_WORKSPACE_DIR="${SWIFT_WORKSPACE_DIR:-${REPO_ROOT}/swift-source}"
+# Tag that the shared LLVM was built from; only used to retry the
+# compiler-rt fetch when the recorded commit cannot be fetched directly.
+SWIFT_BRANCH="${SWIFT_BRANCH:-swift-6.4.0-RELEASE}"
 
 # Where things live.
 RUST_SOURCE_DIR="${RUST_SOURCE_DIR:-${REPO_ROOT}/rust-source}"
@@ -146,6 +168,24 @@ llvm_lib_dir() {
 
 # True when the Rust compiler must build its own LLVM.
 llvm_is_in_tree() { [[ "${RUST_LLVM_MODE}" != "swift" ]]; }
+
+# llvm_shared_commit: full llvm-project commit of the shared LLVM, as written
+# by Scripts/build-swift-toolchain.sh (empty when unknown).
+llvm_shared_commit() {
+    local f="${SWIFT_LLVM_DIR}/llvm-project.txt"
+    [[ -f "${f}" ]] || return 0
+    sed -n 's/^commit=//p' "${f}" | head -1
+}
+
+# llvm_missing_tools: tools of LLVM_TOOLS_NEEDED that the iOS LLVM tree does
+# not provide. Empty means bootstrap's llvm-tools step can run.
+llvm_missing_tools() {
+    local prefix="$1" tool missing=""
+    for tool in "${LLVM_TOOLS_NEEDED[@]}"; do
+        [[ -x "${prefix}/bin/${tool}" ]] || missing="${missing} ${tool}"
+    done
+    printf '%s' "${missing}"
+}
 
 # Human-readable description of the LLVM that is linked (recorded in
 # build-info.json and the report).
@@ -242,6 +282,10 @@ write_build_info() {
         '"ios_deployment_target": "'${IOS_DEPLOYMENT_TARGET}'"'
         '"llvm_targets": "'${LLVM_TARGETS}'"'
         '"llvm_source": "'"$(llvm_description)"'"'
+        '"rustc_lto": "'"${RUST_LTO}"'"'
+        '"rustc_codegen_units": '${RUST_CODEGEN_UNITS}
+        '"optimized_compiler_builtins": '$(if [[ -d "${RUST_SOURCE_DIR}/src/llvm-project/compiler-rt/lib/builtins" ]]; then echo true; else echo false; fi)
+        '"llvm_tools": '$(if [[ -d "$(stage_dir)/lib/rustlib/${HOST_TRIPLE}/bin" ]]; then echo true; else echo false; fi)
         '"stage": '${STAGE}
         '"built_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"'
     )
@@ -409,9 +453,85 @@ fetch() {
         || die "library/backtrace is empty; submodule checkout failed"
     [[ -f "${RUST_SOURCE_DIR}/x.py" ]] || die "x.py not found in ${RUST_SOURCE_DIR}"
 
+    fetch_compiler_rt
     apply_rust_patches
 
     log "rust sources ready ($(git -C "${RUST_SOURCE_DIR}" rev-parse --short HEAD))"
+}
+
+# ---------------------------------------------------------------------------
+# compiler-rt: the C implementations of the compiler intrinsics
+#
+# rustc's std is normally built with `compiler-builtins-c`, which compiles the
+# C versions of memcpy/memset/__divti3/... out of LLVM's compiler-rt. That is
+# what every released toolchain does (`build.optimized-compiler-builtins`
+# defaults to `BuildLLVMFuncs`), and without it the pure-Rust fallbacks are
+# slower. bootstrap looks for the sources in src/llvm-project/compiler-rt and
+# refuses to continue when the directory is missing.
+#
+# rustios does not check out rust-lang/llvm-project (the LLVM is Swift's), so
+# the directory is filled from the llvm-project commit the shared LLVM was
+# built from - the same commit, which is stricter than upstream (where
+# compiler-rt and LLVM can drift apart). Only lib/builtins is needed.
+# ---------------------------------------------------------------------------
+
+fetch_compiler_rt() {
+    local dest="${RUST_SOURCE_DIR}/src/llvm-project"
+    local commit repo marker="${dest}/compiler-rt/lib/builtins"
+
+    if [[ -d "${marker}" ]]; then
+        log "compiler-rt sources already present ($(find "${marker}" -name '*.c' | wc -l | tr -d ' ') C files)"
+        return 0
+    fi
+
+    if llvm_is_in_tree; then
+        # The in-tree LLVM brings its own compiler-rt through the submodule.
+        return 0
+    fi
+
+    repo="https://github.com/swiftlang/llvm-project"
+    commit="$(llvm_shared_commit)"
+    local from_workspace=""
+    if [[ -d "${SWIFT_WORKSPACE_DIR}/llvm-project/compiler-rt/lib/builtins" ]]; then
+        from_workspace="${SWIFT_WORKSPACE_DIR}/llvm-project/compiler-rt/lib/builtins"
+    fi
+
+    mkdir -p "${dest}"
+    if [[ -n "${from_workspace}" ]]; then
+        # The Swift sources are already here (the Swift job runs in the same
+        # checkout), so no second clone is needed.
+        log "copying compiler-rt/lib/builtins from ${from_workspace}"
+        rm -rf "${dest}/compiler-rt"
+        mkdir -p "${dest}/compiler-rt/lib"
+        cp -a "${from_workspace}" "${dest}/compiler-rt/lib/builtins"
+        [[ -d "${marker}" ]] || die "could not copy compiler-rt sources"
+        return 0
+    fi
+
+    if [[ -z "${commit}" ]]; then
+        # An artifact from before this file existed: keep going, but say that
+        # std will not have the compiler-rt intrinsics.
+        warn "${SWIFT_LLVM_DIR}/llvm-project.txt is missing: cannot tell which llvm-project commit to take compiler-rt from"
+        report_line "compiler-rt: **not fetched** (no llvm-project.txt in ${SWIFT_LLVM_DIR}); std uses the pure-Rust intrinsics"
+        return 0
+    fi
+
+    log "fetching compiler-rt/lib/builtins from ${repo} at ${commit:0:12}"
+    rm -rf "${dest}"
+    mkdir -p "${dest}"
+    git -C "${dest}" init -q
+    git -C "${dest}" remote add origin "${repo}"
+    git -C "${dest}" config core.sparseCheckout true
+    mkdir -p "${dest}/.git/info"
+    echo "compiler-rt/lib/builtins" > "${dest}/.git/info/sparse-checkout"
+    if ! git -C "${dest}" fetch -q --depth 1 origin "${commit}"; then
+        git -C "${dest}" fetch -q --depth 1 origin "${SWIFT_BRANCH}" \
+            || die "could not fetch compiler-rt from ${repo}"
+    fi
+    git -C "${dest}" checkout -q FETCH_HEAD
+    [[ -d "${marker}" ]] \
+        || die "compiler-rt/lib/builtins is missing after checking out ${commit:0:12}"
+    log "compiler-rt sources ready ($(find "${marker}" -name '*.c' | wc -l | tr -d ' ') C files, $(git -C "${dest}" rev-parse --short HEAD))"
 }
 
 # ---------------------------------------------------------------------------
@@ -635,6 +755,8 @@ configure() {
     # Idempotent: needed when the sources come from a cache that predates a
     # patch, and it fails loudly if a patch stopped applying.
     apply_rust_patches
+    # Same for compiler-rt: a restored source cache may predate it.
+    fetch_compiler_rt
 
     local cfg="${RUST_SOURCE_DIR}/bootstrap.toml"
     local jobs_line="" ccache_line=""
@@ -667,6 +789,7 @@ configure() {
     # returns it as "already built"), so src/llvm-project is never configured
     # and no Rust-specific LLVM is produced.
     local llvm_section="" llvm_tools_line="llvm-tools = true"
+    local compiler_builtins_line="" codegen_tests_line="" filecheck_line=""
     if [[ "${RUST_LLVM_MODE}" == "swift" ]]; then
         # The Swift LLVM is built for arm64 macOS; linking it into an x86_64
         # rustc would produce a corrupt binary, so reject that combination
@@ -687,7 +810,8 @@ configure() {
             -e "s|@BUILD_TRIPLE@|${BUILD_TRIPLE}|g" \
             -e "s|@HOST_TRIPLE@|${HOST_TRIPLE}|g" \
             -e "s|@HOST_LLVM_CONFIG@|${host_llvm_config}|g" \
-            -e "s|@IOS_LLVM_CONFIG@|${ios_llvm_config}|g" <<'LLVMCFG'
+            -e "s|@IOS_LLVM_CONFIG@|${ios_llvm_config}|g" \
+            -e "s|@FILECHECK_LINE@|${filecheck_line}|g" <<'LLVMCFG'
 
 # rustios: the LLVM that Swift is built against owns this build.
 # `llvm-has-rust-patches = false` tells bootstrap that these are not
@@ -696,16 +820,58 @@ configure() {
 [target."@BUILD_TRIPLE@"]
 llvm-config = "@HOST_LLVM_CONFIG@"
 llvm-has-rust-patches = false
+@FILECHECK_LINE@
 
 [target."@HOST_TRIPLE@"]
 llvm-config = "@IOS_LLVM_CONFIG@"
 llvm-has-rust-patches = false
 LLVMCFG
 )"
-        # An external LLVM ships none of the llvm-tools, and `Assemble` would
-        # try to install every one of them; the tools we need (llvm-ar, ...)
-        # are shipped by build-swift-toolchain.sh instead.
-        llvm_tools_line="llvm-tools = false"
+        # `llvm-tools`: bootstrap copies LLVM_TOOLS out of the LLVM that
+        # llvm-config names into lib/rustlib/<host>/bin - the iOS tools into
+        # the iOS sysroot, the macOS ones into the stage-1 sysroot - and
+        # panics when one is missing. build-swift-toolchain.sh installs the
+        # same list, so this is normally on; if a tool was not built for the
+        # tree, stay off and say so instead of failing after stage 1.
+        # bootstrap copies them for the stage-1 (macOS) sysroot as well, so
+        # both trees have to be complete.
+        local ios_prefix="${SWIFT_LLVM_DIR}/ios"
+        local macosx_prefix="${SWIFT_LLVM_DIR}/macosx"
+        local missing_ios missing_macosx
+        missing_ios="$(llvm_missing_tools "${ios_prefix}")"
+        missing_macosx="$(llvm_missing_tools "${macosx_prefix}")"
+        if [[ -n "${missing_ios}${missing_macosx}" ]]; then
+            llvm_tools_line="llvm-tools = false"
+            warn "llvm-tools stays disabled; missing from the iOS tree:${missing_ios:- none}; from the macOS tree:${missing_macosx:- none}"
+            report_line "configure: llvm-tools disabled (iOS tree missing:${missing_ios:- none}; macOS tree missing:${missing_macosx:- none})"
+        else
+            log "llvm-tools: all ${#LLVM_TOOLS_NEEDED[@]} tools are in ${ios_prefix}/bin and ${macosx_prefix}/bin"
+            report_line "configure: llvm-tools = true (${#LLVM_TOOLS_NEEDED[@]} tools from the shared LLVM, macOS and iOS)"
+        fi
+
+        # `optimized-compiler-builtins`: the default, and what released
+        # toolchains use. It needs compiler-rt sources; `fetch` puts them in
+        # src/llvm-project/compiler-rt, at the same commit as the shared LLVM.
+        if [[ -d "${RUST_SOURCE_DIR}/src/llvm-project/compiler-rt/lib/builtins" ]]; then
+            compiler_builtins_line="optimized-compiler-builtins = true"
+            report_line "configure: optimized-compiler-builtins = true (compiler-rt $(git -C "${RUST_SOURCE_DIR}/src/llvm-project" rev-parse --short HEAD 2>/dev/null || echo unknown))"
+        else
+            compiler_builtins_line="optimized-compiler-builtins = false"
+            warn "no compiler-rt sources; compiler_builtins falls back to pure Rust intrinsics"
+            report_line "configure: optimized-compiler-builtins = **false** (no compiler-rt sources)"
+        fi
+
+        # `codegen-tests`: only affects whether `x.py test` can run LLVM's
+        # FileCheck-based codegen tests. It is switched on when the shared
+        # LLVM shipped a FileCheck for the build machine.
+        if [[ -x "${SWIFT_LLVM_DIR}/macosx/bin/FileCheck" ]]; then
+            codegen_tests_line="codegen-tests = true"
+            filecheck_line="llvm-filecheck = \"${SWIFT_LLVM_DIR}/macosx/bin/FileCheck\""
+            report_line "configure: codegen-tests = true (FileCheck from the shared LLVM)"
+        else
+            codegen_tests_line="codegen-tests = false"
+            report_line "configure: codegen-tests = false (no FileCheck in the shared LLVM)"
+        fi
         log "LLVM for Rust: the Swift LLVM (${SWIFT_LLVM_DIR})"
     fi
 
@@ -732,13 +898,11 @@ locked-deps = true
 # Sanitizer runtimes need compiler-rt built for the target, which this
 # toolchain does not ship.
 sanitizers = false
-# compiler-rt lives in src/llvm-project, which is never checked out here (the
-# LLVM is Swift's). For a release channel the default asks for the C
-# implementations of a few intrinsics (CompilerBuiltins::BuildLLVMFuncs) and
-# fails with "submodule src/llvm-project does not appear to be checked out";
-# build compiler_builtins in Rust instead. Only the speed of those intrinsics
-# is affected, not correctness.
-optimized-compiler-builtins = false
+# The C implementations of the compiler intrinsics (memcpy, __divti3, ...),
+# from compiler-rt. `fetch` fills src/llvm-project/compiler-rt from the same
+# llvm-project commit as the shared LLVM, so this is the default
+# (CompilerBuiltins::BuildLLVMFuncs) that released toolchains use.
+${compiler_builtins_line}
 ${jobs_line}
 ${ccache_line}
 
@@ -752,20 +916,23 @@ debug = false
 debuginfo-level = 0
 debuginfo-level-rustc = 0
 debuginfo-level-std = 0
-codegen-units = 16
+# Same code generation as the released compiler (see RUST_LTO /
+# RUST_CODEGEN_UNITS above): -Clto=thin and one codegen unit per crate.
+# This costs build time, not runtime - a lower setting makes the shipped
+# rustc slower than the official one.
+lto = "${RUST_LTO}"
+codegen-units = ${RUST_CODEGEN_UNITS}
+codegen-units-std = ${RUST_CODEGEN_UNITS}
 incremental = false
 download-rustc = false
-# Ship llvm-tools (llvm-ar, llvm-objcopy, ...) next to the compiler when LLVM
-# is built in-tree: they are built as part of LLVM anyway and are needed to
-# produce archives on device. With an external LLVM they are shipped by
-# build-swift-toolchain.sh (ios/bin/), so bootstrap must not look for them.
+# llvm-tools: install LLVM_TOOLS (llvm-ar, llvm-objcopy, llvm-profdata, ...)
+# into lib/rustlib/<host>/bin. Released toolchains ship them, and rustc needs
+# llvm-ar/rust-objcopy there to build static libraries on the device.
+# build-swift-toolchain.sh installs the same list into the shared LLVM.
 ${llvm_tools_line}
-# Bootstrap's sanity check requires a FileCheck executable next to an external
-# LLVM whenever codegen tests are enabled (sanity.rs: "Externally configured
-# LLVM requires FileCheck to exist"), and the default is `true`. No test of
-# tests/codegen is run here, so turn it off instead of shipping a tool the
-# toolchain would never use.
-codegen-tests = false
+# Codegen tests are only used by `x.py test`; they need FileCheck next to an
+# external LLVM (sanity.rs), which the shared LLVM provides when built.
+${codegen_tests_line}
 
 [llvm]
 # The LLVM that ends up inside the iOS rustc must be an iOS library, so the
@@ -847,6 +1014,26 @@ build() {
     # rustc must not pick up the SDK for *host* (macOS) compilations, so
     # SDKROOT is deliberately not exported. It queries xcrun itself when
     # compiling for iOS.
+
+    # The C compiler for the *target*. compiler-builtins compiles compiler-rt's
+    # C sources (memcpy, __divti3, the aarch64 out-of-line atomics) for
+    # aarch64-apple-ios; bootstrap passes CC_<target>/CFLAGS_<target> to
+    # cargo, so naming the SDK and the triple here is what makes those objects
+    # iOS objects instead of macOS ones - the same objects a released std has.
+    local clang cxx
+    clang="$(xcrun --sdk iphoneos -f clang)"
+    cxx="$(xcrun --sdk iphoneos -f clang++)"
+    local target_flags="-target arm64-apple-ios${IOS_DEPLOYMENT_TARGET} -isysroot ${sdk} -mios-version-min=${IOS_DEPLOYMENT_TARGET}"
+    export CC_aarch64_apple_ios="${clang}"
+    export CXX_aarch64_apple_ios="${cxx}"
+    export CFLAGS_aarch64_apple_ios="${target_flags}"
+    export CXXFLAGS_aarch64_apple_ios="${target_flags}"
+    # The archiver runs on the build machine, so it is the macOS one: it only
+    # has to write the objects into an archive.
+    if [[ -x "${SWIFT_LLVM_DIR}/macosx/bin/llvm-ar" ]]; then
+        export AR_aarch64_apple_ios="${SWIFT_LLVM_DIR}/macosx/bin/llvm-ar"
+    fi
+    log "C compiler for ${HOST_TRIPLE}: ${clang} ${target_flags}"
 
     case "${RUSTIOS_BUILD_PHASE:-all}" in
         host)
@@ -1128,6 +1315,44 @@ verify() {
         warn "librustc_driver-*.dylib is missing from ${sysroot}/lib"
     fi
 
+    # 4. the LLVM tools rustc uses on the device. A released toolchain has
+    # lib/rustlib/<host>/bin/{llvm-ar,rust-objcopy,...}; without them rustc
+    # cannot write a static library on the device.
+    local tool_bin="${sysroot}/lib/rustlib/${HOST_TRIPLE}/bin"
+    if [[ -d "${tool_bin}" ]]; then
+        local tools_present=0 tool
+        for tool in "${LLVM_TOOLS_NEEDED[@]}"; do
+            [[ -x "${tool_bin}/${tool}" ]] && tools_present=$((tools_present + 1))
+        done
+        log "llvm-tools: ${tools_present}/${#LLVM_TOOLS_NEEDED[@]} in lib/rustlib/${HOST_TRIPLE}/bin"
+        report_line "llvm-tools: ${tools_present}/${#LLVM_TOOLS_NEEDED[@]} tools in lib/rustlib/${HOST_TRIPLE}/bin ($( [[ -x "${tool_bin}/rust-objcopy" ]] && echo "rust-objcopy present" || echo "rust-objcopy missing"))"
+        [[ -x "${tool_bin}/llvm-ar" ]] \
+            || warn "llvm-ar is missing from the iOS sysroot: rustc falls back to the system 'ar'"
+        [[ -x "${tool_bin}/rust-objcopy" ]] \
+            || warn "rust-objcopy is missing: -C strip will not work on the device"
+    else
+        warn "no lib/rustlib/${HOST_TRIPLE}/bin: the toolchain has no llvm-tools"
+        report_line "llvm-tools: **none** (lib/rustlib/${HOST_TRIPLE}/bin is missing)"
+    fi
+
+    # 5. compiler_builtins: were the compiler-rt C intrinsics actually used?
+    # `compiler-builtins-c` links libcompiler-rt.a into the rlib, so the
+    # archive member is visible from the outside. Without it std runs the
+    # pure-Rust fallbacks, which is slower than a released toolchain.
+    local cb_rt cb_cfg=""
+    cb_rt="$(find "${BUILD_DIR}" -maxdepth 8 -name 'libcompiler-rt.a' 2>/dev/null | head -1)"
+    cb_cfg="$(find "${BUILD_DIR}" -maxdepth 9 -type f -name output -path '*compiler_builtins*' 2>/dev/null -exec grep -l 'optimized-c' {} + 2>/dev/null | head -1)"
+    if [[ -n "${cb_rt}" ]]; then
+        log "compiler_builtins: compiler-rt C sources were compiled (${cb_rt})"
+        report_line "compiler_builtins: compiler-rt C intrinsics built ($(basename "$(dirname "${cb_rt}")")/libcompiler-rt.a, $(ar -t "${cb_rt}" 2>/dev/null | wc -l | tr -d ' ') objects)"
+    else
+        warn "compiler_builtins was built without compiler-rt: pure-Rust intrinsics"
+        report_line "compiler_builtins: **pure Rust** (no libcompiler-rt.a under ${BUILD_DIR})"
+    fi
+    if [[ -n "${cb_cfg}" ]]; then
+        report_line "compiler_builtins: build script emitted the optimized-c cfg"
+    fi
+
     assert_ios_only "${sysroot}/bin" "the iOS toolchain (bin)"
     # bootstrap links the build machine's std (macOS) into the compiler
     # sysroot; packaging deletes it, so it is not part of the product.
@@ -1175,6 +1400,13 @@ package() {
     local leaked=("${dest}/usr/lib/rustlib/${HOST_TRIPLE}/lib/"*.rlib)
     shopt -u nullglob
     [[ "${#leaked[@]}" -eq 0 ]] || die "std leaked into ${dest}; it belongs in ${STD_NAME}"
+
+    # llvm-tools stay in the sysroot (that is where rustc looks for llvm-ar),
+    # exactly like `x.py install` puts them there.
+    local tool_bin="${dest}/usr/lib/rustlib/${HOST_TRIPLE}/bin"
+    if [[ -d "${tool_bin}" ]]; then
+        report_line "RustToolchain: llvm-tools $(human_size "${tool_bin}") ($(find "${tool_bin}" -maxdepth 1 -type f | wc -l | tr -d ' ') files in lib/rustlib/${HOST_TRIPLE}/bin)"
+    fi
 
     write_usage_doc "${dest}"
     write_build_info "${dest}"
@@ -2067,6 +2299,32 @@ preflight() {
         warn "${ios_prefix}/bin/llvm-ar is missing: rustc on the device cannot create archives"
     fi
 
+    # Backends. The shared LLVM is built with `llvm-targets-to-build=all` (the
+    # list rust-lang/rust's own LLVM uses) so that neither compiler loses a
+    # backend - see docs/llvm-parity.md. Report what the tree actually has, and
+    # refuse only when the one backend this compiler emits for is missing.
+    local built_targets expected_targets recorded_targets backend_count backend_line
+    built_targets="$("${ios_config}" --targets-built 2>/dev/null | tr ' ' '\n' | paste -sd';' -)"
+    [[ -n "${built_targets}" ]] || built_targets="unknown"
+    if [[ ";${built_targets};" != *";AArch64;"* ]]; then
+        die "the shared LLVM has no AArch64 backend (backends: ${built_targets}); rustc could not emit arm64 code"
+    fi
+    expected_targets="$(sed -n 's/^llvm-targets-to-build=//p' \
+        "${REPO_ROOT}/Scripts/swift-ios-toolchain-presets.ini" 2>/dev/null | head -1)"
+    recorded_targets="$(sed -n 's/^targets=//p' "${SWIFT_LLVM_DIR}/llvm-project.txt" 2>/dev/null | head -1)"
+    backend_count="$(printf '%s' "${built_targets}" | tr ';' ' ' | wc -w | tr -d ' ')"
+    log "backends (${backend_count}): ${built_targets}"
+    if [[ -n "${expected_targets}" && "${recorded_targets}" != "${expected_targets}" ]]; then
+        # Usually an artifact from before the preset was widened. The build can
+        # go on (aarch64-apple-ios is there), but the report must not claim a
+        # parity it does not have.
+        warn "the shared LLVM was built with targets '${recorded_targets:-unknown}', the preset asks for '${expected_targets}'"
+        backend_line="shared LLVM backends: **${backend_count}** (${built_targets}); built with '${recorded_targets:-unknown}', the preset asks for '${expected_targets}' - not full parity"
+    else
+        backend_line="shared LLVM backends: ${backend_count} (${built_targets}) = llvm-targets-to-build=${expected_targets}"
+    fi
+    grep -qxF "${backend_line}" "${ARTIFACTS_DIR}/REPORT.txt" 2>/dev/null || report_line "${backend_line}"
+
     # One line of evidence in REPORT.txt; the workflow runs preflight twice
     # (unpack step and configure), so do not append it twice.
     local slice="iOS slice not inspected"
@@ -2110,7 +2368,11 @@ rustios build configuration
   product compiles for    : ${HOST_TRIPLE} (iOS/arm64)
   build machine (macOS)   : ${BUILD_TRIPLE} (not shipped)
   stage                   : ${STAGE}
-  LLVM targets            : ${LLVM_TARGETS}
+  LLVM targets (intree)   : ${LLVM_TARGETS}
+  LLVM targets (shared)   : $(sed -n 's/^llvm-targets-to-build=//p' "${REPO_ROOT}/Scripts/swift-ios-toolchain-presets.ini" 2>/dev/null | head -1) (what Swift's LLVM is built with)
+  rustc code generation    : lto=${RUST_LTO}, codegen-units=${RUST_CODEGEN_UNITS}
+  compiler intrinsics      : $(if [[ -d "${RUST_SOURCE_DIR}/src/llvm-project/compiler-rt/lib/builtins" ]]; then echo "compiler-rt (C)"; else echo "pure Rust (no compiler-rt sources)"; fi)
+  llvm-tools in sysroot    : $(llvm_missing_tools "${SWIFT_LLVM_DIR}/ios" | grep -q . && echo "incomplete" || echo "all ${#LLVM_TOOLS_NEEDED[@]} present")
   LLVM for rustc          : $(llvm_description) [RUST_LLVM_MODE=${RUST_LLVM_MODE}]
   LLVM for rustc (config) : $(if llvm_is_in_tree; then echo "built by bootstrap"; else echo "${SWIFT_LLVM_DIR}/{macosx,ios}/bin/llvm-config"; fi)
   rustc patches           : $(if llvm_is_in_tree; then echo "none"; else (cd "${PATCH_DIR}" 2>/dev/null && ls *.patch 2>/dev/null | tr '\n' ' ') || echo "none"; fi)

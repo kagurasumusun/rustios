@@ -16,6 +16,8 @@ Rust 側から見ると「LLVM を自分でビルドする代わりに、Swift �
 - Swift 側: `Scripts/build-swift-toolchain.sh`
 - Rust 側: `Scripts/build-rust-toolchain.sh`（`RUST_LLVM_MODE=swift` が既定）
 - CI: `.github/workflows/build-rust-ios.yml` の `swift` ジョブ → `build` ジョブ
+- **どちらのコンパイラも機能を失わないこと**（LLVM の CMake 構成、llvm-tools、
+  compiler-rt、`lto`/`codegen-units` の突き合わせ）: [llvm-parity.md](llvm-parity.md)
 
 ---
 
@@ -50,7 +52,7 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 | Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、`swift-frontend` は IOS/arm64、`SwiftToolchain` 384 MB。`swiftc`/`swift`/`swift-driver` は macOS のホストドライバ） |
 | Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 96 MB、`LLVM.xcframework` 44 MB。iOS 側 `lib/*.a` のメンバーを `vtool` で検査し `IOS/arm64` を確認） |
 | Rust を Swift の LLVM でビルドする | **CI で成功**（run 40144263022）。`RustToolchain` 35 MB + `RustStd` 256 MB + `Rust.xcframework` 30 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
-| Rust 専用の LLVM を別にビルドしない | **実装済み**（`src/llvm-project` を fetch しない、`llvm-config` を渡す、`llvm-tools=false`） |
+| Rust 専用の LLVM を別にビルドしない | **実装済み**（`src/llvm-project` の LLVM は fetch しない、`llvm-config` を渡す）。`compiler-rt` だけは同じコミットから取る（[llvm-parity.md](llvm-parity.md)） |
 | バージョン整合の証拠 | §1 / §2 |
 | std をツールチェーンから分離 | **実装済み**（`RustStd`）。`RustToolchain` 側に std が漏れていないことを `package` が確認 |
 | 未完了項目の明示 | §6 |
@@ -202,7 +204,7 @@ darwin では C++ ランタイムとして `c++`（libc++）をリンクしま�
 | `[llvm] download-ci-llvm` | `false` | 配布 LLVM は macOS 用で、iOS 用 rustc には使えない |
 | `[llvm] link-shared` | `false` | 静的ライブラリをリンク（`LLVM_LINK_SHARED` を立てない） |
 | `[llvm] targets` | `AArch64` | 外部 LLVM を使う場合は未使用（bootstrap が LLVM をビルドしないため） |
-| `[rust] llvm-tools` | `false` | 外部 LLVM に llvm-tools は無い。必要な `llvm-ar` 等は `SwiftLLVM/ios/bin` に同梱 |
+| `[rust] llvm-tools` | `true`（共有 LLVM に 14 個揃っている場合） | bootstrap が `SwiftLLVM/{ios,macosx}/bin` から `lib/rustlib/<host>/bin` へ導入する。揃っていない場合は `false` にして理由をレポート |
 | `[build] build` | `aarch64-apple-darwin` | ビルドマシン |
 | `[target."aarch64-apple-darwin"]` | `llvm-config = <SwiftLLVM>/macosx/bin/llvm-config` | stage1 rustc（macOS で動く）用 |
 | `[target."aarch64-apple-ios"]` | `llvm-config = <SwiftLLVM>/ios/bin/llvm-config` | 出荷する rustc 用 |
@@ -234,15 +236,21 @@ API 変更がそのままコンパイルエラーになります（実ビルド�
 `nyxian_iphoneos_arm64_crosscompiler` を元にしたプリセットで、LLVM を 2 回
 ビルドします（同じソース、同じターゲット構成）。
 
-`llvm-targets-to-build=AArch64;ARM;X86` です。rustc と iOS の Swift が使うのは
-AArch64 だけですが、compiler-rt は runtimes の一部として `macho_embedded` 向け
-builtins を armv6m / armv7m / armv7em（ARM）と i386 / x86_64（X86）について
-ビルドします。ARM バックエンドが登録する `-arm-add-build-attributes` を clang が
-使うため、ARM を外すとそのステップが
-`Unknown command line argument '-arm-add-build-attributes'` で失敗します
-（CI で確認）。反対に LLVM 既定の全ターゲットでは 1 回のビルドが 6 時間の
-ジョブ上限に収まらなかったため（実測 約 5 時間 45 分でタイムアウト）、
-必要な 3 つに絞っています。
+`llvm-targets-to-build=all` です（[llvm-parity.md](llvm-parity.md) §2）。
+
+共有 LLVM は**どちらのコンパイラも機能を失わない**ように構成します。rust が
+自前でビルドする LLVM の `llvm.targets` は既定で `all`、Swift の既定は
+`X86;ARM;AArch64;PowerPC;SystemZ;Mips;RISCV;WebAssembly;AVR;BPF` で、
+`all` は両方を含む上位集合です。途中の値は実測で却下しました:
+
+* `AArch64` だけ: compiler-rt の builtins が `-arm-add-build-attributes`
+  （ARM バックエンドが登録するオプション）で失敗;
+* `AArch64;ARM;X86`: 約 4 時間で通るが、AMDGPU/NVPTX/RISCV/WebAssembly/… が
+  無く、**rustc がそれらのターゲット向けにコードを生成できない**;
+* `all`: 両ツリーで約 5 時間 30 分。同じジョブでパッケージまで行うと 6 時間の
+  ジョブ上限に当たる（実測 5 時間 55 分でパッケージ中に打ち切り）ため、
+  CI を「ビルド」と「パッケージ」の 2 ジョブに分けています
+  （[llvm-parity.md](llvm-parity.md) §4.5）。
 
 | 出力 | 用途 |
 | --- | --- |
@@ -306,7 +314,7 @@ shim は呼ばれるたびに `<prefix>/llvm-config.log` に引数を記録し�
 | `Scripts/build-swift-toolchain.sh` | 新規。Swift 6.4 + LLVM 21.1.6 を iOS 向けにビルドし、`SwiftLLVM/{macosx,ios}` と `SwiftToolchain` を作る |
 | `Scripts/swift-ios-toolchain-presets.ini` | 新規。LLVM-On-iOS 相当のプリセット（RTTI 有効、AArch64 のみ、iOS 16.0） |
 | `Scripts/llvm-config-shim.py` | 新規。再配置可能な `llvm-config` の生成 |
-| `Scripts/build-rust-toolchain.sh` | `RUST_LLVM_MODE=swift` を追加。`bootstrap.toml` に `[target.*] llvm-config` と `llvm-has-rust-patches=false` を書き、`src/llvm-project` を fetch せず、`llvm-tools=false` にし、`verify` で LLVM の出所を証明する。既定 `RUST_VERSION=1.94.0` |
+| `Scripts/build-rust-toolchain.sh` | `RUST_LLVM_MODE=swift` を追加。`bootstrap.toml` に `[target.*] llvm-config` と `llvm-has-rust-patches=false` を書き、`src/llvm-project` の LLVM は fetch せず、`verify` で LLVM の出所を証明する。`compiler-rt` は共有 LLVM と同じコミットから取り、`llvm-tools` は共有 LLVM に揃っている時だけ有効化する。既定 `RUST_VERSION=1.94.0` |
 | `.github/workflows/build-rust-ios.yml` | `swift` ジョブ（Swift + LLVM）→ `build` ジョブ（Rust）の 2 段構成。LLVM のキャッシュを廃止し、`SwiftLLVM` artifact で受け渡す |
 | `Makefile` | `make llvm` / `make swift` を追加、`RUST_VERSION=1.94.0`、`RUST_LLVM_MODE=swift` |
 | `Scripts/build-rust-toolchain.sh`（パッケージ） | `RustSupportLibs` を廃止し、`RustToolchain`（コンパイラのみ）と `RustStd`（std のみ）に分割 |
@@ -397,9 +405,9 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | rust-lang 版 LLVM との API 差 | **2 件検出・パッチ適用**（`PGOOptions` の vfs 引数、`stdc++`→`libc++`）。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **一部達成**: run 40258441852 で rlib のオブジェクトをまとめた**静的アーカイブ**（`libRustCompiler.a`、展開 685 MB / xz 96 MB）を確認。ただし **C API（`rustios.h` / `rustios_run`）は未達**（`"c_api": false`）。C シムが失敗する理由は下の「静的ドライバ」節 |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **一部達成**: run 40258441852 と 40269093072 で rlib のオブジェクトをまとめた**静的アーカイブ**（`libRustCompiler.a`、展開 685 MB / xz 96 MB、4831 objects / 329 rlibs）を確認。ただし **C API（`rustios.h` / `rustios_run`）は未達**（`"c_api": false`、4 通りすべて `E0463`）。理由は下の「静的ドライバ」節 |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
-| ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
+| ビルド時間 | Swift 4 h 29 m（`AArch64;ARM;X86` で実測）、`all` では約 5 h 30 m（実測 5 h 55 m でパッケージ中に打ち切り）→ CI をビルド/パッケージの 2 ジョブに分割。Rust は stage1 + stage2 で 1 h 02 m（実測、キャッシュ利用の warm ビルド） |
 
 静的ドライバの試行錯誤（すべて CI で実測）:
 
@@ -432,25 +440,45 @@ stage2 のツリーには `libderive_where-720e60ae…dylib`（iOS 側）と
 3. sysroot 優先（従来の順序）
 4. stage2 の `deps` 優先
 
-の 4 通りを実装したが、この実行では**どれも `error: unknown unstable option:
-`verbose`` で即座に落ちた**。`-Z verbose` は rustc 1.94 のオプションではない
-（診断は `-Z verbose-internals`）。試行そのものが走っていないので、上の
-E0463/E0514 の原因分析はまだ検証されていない。修正して再実行する。
+の 4 通りを実装した。ただし最初の実行（40258441852）では**どれも
+`error: unknown unstable option: `verbose`` で即座に落ちた**。`-Z verbose` は
+rustc 1.94 のオプションではない（診断は `-Z verbose-internals`）。
 
-一方、**フォールバックは機能した**: 4 通りが失敗したあと、rlib の中の
+修正後（`-Z verbose-internals`、run 40269093072）は **4 通りすべてが実際に
+走り、4 通りすべて `E0463`** だった:
+
+```
+attempt 0: --extern for the cargo-built driver, cargo directories first
+attempt 1: cargo directories first
+attempt 2: the sysroot first
+attempt 3: stage-2 compiler directories first
+  -> error[E0463]: can't find crate for `derive_where` which `rustc_driver_impl`
+     depends on
+```
+
+候補として見えているのは `librustc_driver_impl-8212aa2c….rlib`（stage2 の
+iOS 用）と `libderive_where-*.dylib`（macOS 用、stage1/stage2 の 3 種類）だけで、
+**要求された hash の `derive_where` がどこにも無い**。`derive_where` は
+proc-macro crate なので `.dylib` しか作られず、iOS 向け `rustc_driver_impl` の
+メタデータが要求する版と一致しない。探索範囲を広げても解決しないため、
+この経路は**未達のまま**にしている（下の静的アーカイブで代替）。
+
+一方、**フォールバックは機能した**（run 40269093072 でも同じ）: 4 通りが失敗したあと、rlib の中の
 オブジェクトを `libtool -static` で 1 本の `libRustCompiler.a` にまとめ、
 `Rust.xcframework` を**静的スライス**として出せた（`"library": "static"`,
 `"c_api": false`、展開 685 MB → xz 96 MB、`ar -t` に `rustc_driver_impl` の
-オブジェクトを含むことを確認）。オブジェクトは crate メタデータを必要と
-しないので、C シムが失敗しても「静的ライブラリ」という要求は満たせる。
-C API 付き（第 1 段）は継続課題。
+オブジェクトを含むことを確認。4831 objects / 329 rlibs）。オブジェクトは
+crate メタデータを必要としないので、C シムが失敗しても「静的ライブラリ」
+という要求は満たせる。**C API 付き（第 1 段）は未達**で、`rustios.h` /
+`rustios_run()` は現時点では使えない。
 
 既知の割り切り:
 
 - **macOS 用 LLVM も Swift のビルド成果物から取ります。** 別の LLVM を作らないためで、
   rust-lang 版との混在はありません。
 - `llvm-tools`（`llvm-ar` 等）は Swift のビルド成果物（iOS バイナリ）を
-  `SwiftLLVM/ios/bin` に置いて使います。bootstrap には `llvm-tools = false` を渡します。
+  `SwiftLLVM/ios/bin` に置き、bootstrap の `Sysroot` ステップに
+  `lib/rustlib/aarch64-apple-ios/bin` へ入れさせます（`llvm-parity.md` §1）。
 - `SwiftLLVM` artifact は macOS/iOS 両方の静的ライブラリを含みます（実測 96 MB）。
   これは「LLVM を 2 回ビルドしない」ための必要経費です。
 - **Swift ツールチェーンにはホスト（macOS）バイナリが混ざります。** `lib/swift/host/`

@@ -15,7 +15,9 @@
 さらに rustios は、**Swift コンパイラと LLVM を共有**します。Swift 6.4 をビルドする
 LLVM（`swiftlang/llvm-project` 21.1.6）をそのまま Rust のコンパイラにもリンクさせ、
 rust-lang 版 LLVM を別にビルドしません。詳細とバージョンの根拠は
-[docs/llvm-sharing.md](docs/llvm-sharing.md)。
+[docs/llvm-sharing.md](docs/llvm-sharing.md)、**どちらのコンパイラも機能を
+失わないこと**（LLVM の CMake 構成・バックエンド・llvm-tools・compiler-rt）は
+[docs/llvm-parity.md](docs/llvm-parity.md)。
 
 | | LLVM-On-iOS | rustios |
 | --- | --- | --- |
@@ -71,8 +73,8 @@ iOS / ホストの **内訳を数えてレポートに明記** します（黙�
 | `SwiftToolchain-iphoneos-arm64-6.4.0.tar.xz` | iOS で動くコンパイラ本体 `swift-frontend`（IOS/arm64）。`swiftc`/`swift-driver` は macOS のホストドライバで、LLVM-On-iOS の `SwiftToolchain.zip` と同じ構成。384 MB |
 | `SwiftLLVM-iphoneos-arm64-21.1.6.tar.xz` | **共有 LLVM**。`SwiftLLVM/{macosx,ios}/{bin/llvm-config,include,lib/*.a}`。Rust のビルドはこれをそのまま使う |
 | `LLVM.xcframework-iphoneos-arm64-21.1.6.tar.xz` | `llvm.a` + headers（LLVM-On-iOS の `LLVM.xcframework` 相当）。44 MB |
-| `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | `RustToolchain/usr/{bin,lib}` — iOS で動く `rustc`, `rustdoc`, codegen backend。**std は含みません** |
-| `RustStd-iphoneos-arm64-<ver>.tar.xz` | **std のみ**（`RustStd/usr/lib/rustlib/aarch64-apple-ios/lib/*.rlib`）。コンパイラとは別配布 |
+| `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | `RustToolchain/usr/{bin,lib}` — iOS で動く `rustc`, `rustdoc`, codegen backend, **`lib/rustlib/aarch64-apple-ios/bin` の LLVM ツール**（`llvm-ar`, `rust-objcopy`, `llvm-profdata` …）。**std は含みません** |
+| `RustStd-iphoneos-arm64-<ver>.tar.xz` | **std のみ**（`RustStd/usr/lib/rustlib/aarch64-apple-ios/lib/*.rlib`）。compiler-rt の C 実装（`memcpy`/`__divti3` など）もここに入ります |
 | `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `Rust.xcframework`。静的 `libRustCompiler.a` を目指し、(1) C API 付き静的 → (2) C API なしの静的（rlib のオブジェクトを 1 本に）→ (3) 動的スライスの順に試します。どれになったかは `build-info.json` の `"c_api"` / `"library"`（docs/llvm-sharing.md §6） |
 | `SHA256SUMS.txt` | 上記の SHA-256 |
 
@@ -92,6 +94,12 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain
 ```
 
 分けたまま使うなら `rustc --sysroot="$PWD/RustStd/usr" ...` を毎回渡します。
+
+**LLVM ツールは同梱します。** 公式ツールチェーンと同じく、`llvm-ar` /
+`llvm-objcopy`（`rust-objcopy` として複製）/ `llvm-profdata` など 14 個を
+`lib/rustlib/aarch64-apple-ios/bin` に置きます。端末上の rustc はここから
+`llvm-ar` を探すため、無いと静的ライブラリを作れません。中身は Swift の
+LLVM がビルドした iOS バイナリそのものです（`docs/llvm-parity.md` §1）。
 
 `Rust.xcframework` は `rustc_private`（コンパイラ内部 API）に依存するため、
 Rust のバージョンに強く依存します。ビルドに失敗した場合はワークフローが
@@ -207,7 +215,7 @@ make RUST_LLVM_MODE=intree   # 比較用: rust-lang 版 LLVM を bootstrap に�
 | `OS_VER` / `IOS_DEPLOYMENT_TARGET` | `16.0` | iOS deployment target（LLVM-On-iOS と同じ） |
 | `HOST_TRIPLE` | `aarch64-apple-ios` | 生成する rustc が動くプラットフォーム |
 | `STAGE` | `2` | bootstrap のステージ |
-| `LLVM_TARGETS` | `AArch64` | `intree` モードで bootstrap がビルドする LLVM のバックエンド（`swift` モードでは未使用） |
+| `LLVM_TARGETS` | `AArch64` | `intree` モードで bootstrap がビルドする LLVM のバックエンド。`swift` モードではプリセットの `llvm-targets-to-build`（`all`）が使われ、この変数は `info` の表示にだけ効く |
 | `JOBS` | CPU 数 | 並列度 |
 
 ---
@@ -454,11 +462,13 @@ int rc = rustios_run(7, argv);   /* RUSTIOS_OK=0, RUSTIOS_FAILED=1, ... */
   リンクできなかったビルドでは `"c_api": false` の静的アーカイブ（C API
   なし）、rlib すら残せなかったビルドでは動的スライスになります。どれも
   `build-info.json` の `"library"` / `"c_api"` を見れば分かります。
-* ビルドには macOS ランナーと 1 時間以上の時間が必要です（LLVM を 2 回
-  ビルドするため）。コールドビルドは GitHub Actions の 6 時間制限に
-  収まらないことがあるので、キャッシュを温めてから実行してください。
-* `LLVM_TARGETS` は既定で `AArch64` のみです。他のアーキテクチャ向けにも
-  コンパイルしたい場合は `make LLVM_TARGETS="AArch64;X86"` のように指定します。
+* ビルドには macOS ランナーと 5 時間以上の時間が必要です（LLVM を 2 回、
+  全バックエンド付きでビルドするため）。CI ではビルドとパッケージを別ジョブに
+  分けて 6 時間のジョブ上限に収めています（`docs/llvm-parity.md` §4.5）。
+* `swift` モード（既定）の共有 LLVM は `llvm-targets-to-build=all` で、
+  rust が自前でビルドする LLVM と同じバックエンド集合を持ちます。`intree`
+  モードでの `LLVM_TARGETS` の既定は `AArch64` のみです（
+  `make LLVM_TARGETS="AArch64;X86"` のように指定できます）。
 
 ---
 
