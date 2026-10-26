@@ -397,7 +397,7 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | rust-lang 版 LLVM との API 差 | **2 件検出・パッチ適用**（`PGOOptions` の vfs 引数、`stdc++`→`libc++`）。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **継続課題**。直近の実行では C シム（`libRustCompiler.a` + `rustios.h`）がリンクできず、動的スライス（`librustc_driver-*.dylib`、C API なし）にフォールバックしていた。原因の見立てと新しい試行は下の「静的ドライバ」節。**シムが失敗しても rlib のオブジェクトをまとめた静的アーカイブ（`c_api=false`）を出す**実装を追加（結果は次回実行で確認） |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **一部達成**: run 40258441852 で rlib のオブジェクトをまとめた**静的アーカイブ**（`libRustCompiler.a`、展開 685 MB / xz 96 MB）を確認。ただし **C API（`rustios.h` / `rustios_run`）は未達**（`"c_api": false`）。C シムが失敗する理由は下の「静的ドライバ」節 |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
 
@@ -424,7 +424,7 @@ stage2 のツリーには `libderive_where-720e60ae…dylib`（iOS 側）と
   与えない限り sysroot のコピーが `-L` より優先される。要求された hash の
   `derive_where` が stage2 側に無ければ `E0463`、stage0 側に見えれば `E0514`。
 
-対処（実装済み・CI の結果待ち）:
+対処と結果（run 40258441852）:
 
 1. `--extern rustc_driver_impl=<stage2-rustc/<host>/release/deps の rlib>` で stage 1 が
    ビルドしたドライバを明示し、`-L` は cargo の stage2 ディレクトリを先に置く
@@ -432,10 +432,18 @@ stage2 のツリーには `libderive_where-720e60ae…dylib`（iOS 側）と
 3. sysroot 優先（従来の順序）
 4. stage2 の `deps` 優先
 
-4 つすべて失敗した場合は、**rlib の中のオブジェクトを `libtool -static` で 1 本の
-`libRustCompiler.a` にまとめる**。オブジェクトは crate メタデータを必要としないので、
-シム（C ABI）だけが失敗する状況でも「静的ライブラリ」という要求は満たせる。
-その場合 `c_api=false`・ヘッダ無しで、その旨を `build-info.json` と REPORT.txt に残す。
+の 4 通りを実装したが、この実行では**どれも `error: unknown unstable option:
+`verbose`` で即座に落ちた**。`-Z verbose` は rustc 1.94 のオプションではない
+（診断は `-Z verbose-internals`）。試行そのものが走っていないので、上の
+E0463/E0514 の原因分析はまだ検証されていない。修正して再実行する。
+
+一方、**フォールバックは機能した**: 4 通りが失敗したあと、rlib の中の
+オブジェクトを `libtool -static` で 1 本の `libRustCompiler.a` にまとめ、
+`Rust.xcframework` を**静的スライス**として出せた（`"library": "static"`,
+`"c_api": false`、展開 685 MB → xz 96 MB、`ar -t` に `rustc_driver_impl` の
+オブジェクトを含むことを確認）。オブジェクトは crate メタデータを必要と
+しないので、C シムが失敗しても「静的ライブラリ」という要求は満たせる。
+C API 付き（第 1 段）は継続課題。
 
 既知の割り切り:
 

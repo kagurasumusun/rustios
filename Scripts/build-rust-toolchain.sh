@@ -1546,7 +1546,7 @@ build_xcframework() {
     local stage1 stage2 libdir out_dir merged xcfw slice
     local runtime_driver runtime_std driver_rlib library
     local has_headers="false" c_api="false" static_lib="false"
-    local desc archs build_info
+    local desc archs build_info merged_objects=0 merged_rlibs=0
     stage1="$(build_host_dir)"
     stage2="$(stage_dir)"
     libdir="${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
@@ -1684,7 +1684,7 @@ build_xcframework() {
                 --sysroot "${merged}" \
                 -C opt-level=2 \
                 -C debuginfo=0 \
-                -Z verbose \
+                -Z verbose-internals \
                 "$@" \
                 -o "${out_dir}/lib/libRustCompiler.a" \
                 "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs" \
@@ -1730,7 +1730,9 @@ build_xcframework() {
                 rm -f "${dest}"
                 return 1
             fi
-            log "  $(basename "${dest}"): $(wc -l < "${list}" | tr -d ' ') objects from ${i} rlibs"
+            merged_objects="$(wc -l < "${list}" | tr -d ' ')"
+            merged_rlibs="${i}"
+            log "  $(basename "${dest}"): ${merged_objects} objects from ${merged_rlibs} rlibs"
             return 0
         }
 
@@ -1836,7 +1838,7 @@ build_xcframework() {
                 c_api="false"
                 library="libRustCompiler.a"
                 has_headers="false"
-                report_line "xcframework: static archive assembled from the rustc rlibs (no C API; the shim needs crate metadata bootstrap does not keep together)"
+                report_line "xcframework: static archive = ${merged_objects} objects from ${merged_rlibs} rlibs (no C API: the shim needs the driver's crate metadata)"
                 bundle_llvm "${out_dir}/lib/${library}"
             else
                 report_line "xcframework: **no static archive either**; falling back to the dylib"
@@ -2072,7 +2074,20 @@ preflight() {
         slice="iOS slice confirmed (${ios_seen} sampled)"
     fi
     local line
-    line="shared LLVM preflight: ${ios_version}, ${count} libraries, ${slice}"
+    local configured=""
+    local version_header="${ios_prefix}/include/llvm/Config/llvm-config.h"
+    if [[ -f "${version_header}" ]]; then
+        configured="$(sed -n -E 's/^#define LLVM_VERSION_(MAJOR|MINOR|PATCH) ([0-9]+).*/\2/p' \
+            "${version_header}" | head -3 | paste -sd. -)"
+    fi
+    if [[ -n "${configured}" && "${configured}" != "${ios_version}" ]]; then
+        # Swift's build sets the version string itself, so llvm-config and the
+        # configured headers can disagree; both are recorded rather than
+        # quietly picking the nicer one.
+        line="shared LLVM preflight: ${ios_version} (llvm-config) / ${configured} (llvm-config.h), ${count} libraries, ${slice}"
+    else
+        line="shared LLVM preflight: ${ios_version}, ${count} libraries, ${slice}"
+    fi
     grep -qxF "${line}" "${ARTIFACTS_DIR}/REPORT.txt" 2>/dev/null || report_line "${line}"
     log "preflight passed: the shared LLVM ${ios_version} can be consumed by rustc"
 }

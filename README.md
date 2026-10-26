@@ -103,11 +103,11 @@ Rust のバージョンに強く依存します。ビルドに失敗した場合
 段階は 3 つあり、上から順に試して、成立したものを配布します。
 
 1. **C API 付きの静的ライブラリ** — `rustios.h` + `libRustCompiler.a`。
-   `rustc_driver_impl` を静的リンクし、`rustios_run()` を公開します。
-2. **C API なしの静的ライブラリ** — 1 が成立しない場合。rlib の中の
-   オブジェクトを `libtool -static` で 1 本にまとめます（`"c_api": false`）。
-   crate のメタデータが要るのは C シムだけなので、オブジェクトの結合は
-   通ります。
+   `rustc_driver_impl` を静的リンクし、`rustios_run()` を公開します。**未達**。
+2. **C API なしの静的ライブラリ** — rlib の中のオブジェクトを
+   `libtool -static` で 1 本にまとめます（`"c_api": false`）。crate の
+   メタデータが要るのは C シムだけなので、オブジェクトの結合は通ります。
+   **現在はこれ**（展開 685 MB、xz 96 MB）。
 3. **動的スライス** — 上記が両方失敗した場合のみ（`librustc_driver-*.dylib`）。
 
 1 が失敗してきた理由: `rustc_driver_impl` の rlib は見つかるのですが、その
@@ -404,9 +404,8 @@ jailbreak / TrollStore 環境や、Nyxian のような IDE の中では、その
 ```sh
 tar -xJf Rust.xcframework-iphoneos-arm64-1.94.0.tar.xz
 ls Rust.xcframework/ios-arm64
-# 1 が成立: Headers/rustios.h + libRustCompiler.a
-# 2 が成立: libRustCompiler.a のみ（C API なし）
-# 3 のみ:   librustc_driver-*.dylib
+# 現在:   libRustCompiler.a のみ（C API なし）
+# 目標:   Headers/rustios.h + libRustCompiler.a
 ```
 
 ```sh
