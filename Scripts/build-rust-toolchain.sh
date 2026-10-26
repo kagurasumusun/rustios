@@ -177,11 +177,33 @@ llvm_shared_commit() {
     sed -n 's/^commit=//p' "${f}" | head -1
 }
 
-# llvm_missing_tools: tools of LLVM_TOOLS_NEEDED that the iOS LLVM tree does
-# not provide. Empty means bootstrap's llvm-tools step can run.
+# llvm_tools_required: the tool list of the rustc that is about to be built,
+# read out of its own source (`const LLVM_TOOLS` in src/bootstrap/src/lib.rs)
+# so that a Rust version bump cannot silently disagree with the list above.
+# Falls back to the built-in list when the source is not there yet.
+llvm_tools_required() {
+    local lib="${RUST_SOURCE_DIR}/src/bootstrap/src/lib.rs" tools=""
+    if [[ -f "${lib}" ]]; then
+        tools="$(awk '
+            /LLVM_TOOLS *: *&\[&str\] *= *&\[/ { inside = 1; next }
+            inside && /^\];/ { exit }
+            inside { sub(/\/\/.*/, ""); print }
+        ' "${lib}" | grep -o '"[^"]*"' | tr -d '"' | tr '\n' ' ')"
+    fi
+    tools="${tools%"${tools##*[![:space:]]}"}"
+    if [[ -n "${tools}" ]]; then
+        printf '%s' "${tools}"
+    else
+        printf '%s' "${LLVM_TOOLS_NEEDED[*]}"
+    fi
+}
+
+# llvm_missing_tools <prefix> [tools]: the tools (default: LLVM_TOOLS_NEEDED)
+# that the tree does not provide. Empty means bootstrap's llvm-tools step can
+# run.
 llvm_missing_tools() {
-    local prefix="$1" tool missing=""
-    for tool in "${LLVM_TOOLS_NEEDED[@]}"; do
+    local prefix="$1" list="${2:-${LLVM_TOOLS_NEEDED[*]}}" tool missing=""
+    for tool in ${list}; do
         [[ -x "${prefix}/bin/${tool}" ]] || missing="${missing} ${tool}"
     done
     printf '%s' "${missing}"
@@ -837,16 +859,25 @@ LLVMCFG
         # both trees have to be complete.
         local ios_prefix="${SWIFT_LLVM_DIR}/ios"
         local macosx_prefix="${SWIFT_LLVM_DIR}/macosx"
+        local required_tools required_count
+        required_tools="$(llvm_tools_required)"
+        required_count="$(printf '%s' "${required_tools}" | wc -w | tr -d ' ')"
+        if [[ "${required_tools}" != "${LLVM_TOOLS_NEEDED[*]}" ]]; then
+            # Rust changed the list (this would otherwise surface as a panic
+            # inside bootstrap, an hour into the build).
+            warn "bootstrap requires a different LLVM tool list than the built-in one: [${required_tools}]"
+            report_line "configure: bootstrap requires [${required_tools}] (built-in list: [${LLVM_TOOLS_NEEDED[*]}])"
+        fi
         local missing_ios missing_macosx
-        missing_ios="$(llvm_missing_tools "${ios_prefix}")"
-        missing_macosx="$(llvm_missing_tools "${macosx_prefix}")"
+        missing_ios="$(llvm_missing_tools "${ios_prefix}" "${required_tools}")"
+        missing_macosx="$(llvm_missing_tools "${macosx_prefix}" "${required_tools}")"
         if [[ -n "${missing_ios}${missing_macosx}" ]]; then
             llvm_tools_line="llvm-tools = false"
             warn "llvm-tools stays disabled; missing from the iOS tree:${missing_ios:- none}; from the macOS tree:${missing_macosx:- none}"
             report_line "configure: llvm-tools disabled (iOS tree missing:${missing_ios:- none}; macOS tree missing:${missing_macosx:- none})"
         else
-            log "llvm-tools: all ${#LLVM_TOOLS_NEEDED[@]} tools are in ${ios_prefix}/bin and ${macosx_prefix}/bin"
-            report_line "configure: llvm-tools = true (${#LLVM_TOOLS_NEEDED[@]} tools from the shared LLVM, macOS and iOS)"
+            log "llvm-tools: all ${required_count} tools are in ${ios_prefix}/bin and ${macosx_prefix}/bin"
+            report_line "configure: llvm-tools = true (${required_count} tools from the shared LLVM, macOS and iOS)"
         fi
 
         # `optimized-compiler-builtins`: the default, and what released
