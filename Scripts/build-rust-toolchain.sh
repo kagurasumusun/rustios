@@ -1414,23 +1414,30 @@ write_xcframework_plist() {
 EOF
 }
 
-# check_static_library <path>: the archive must be an arm64 static library
-# that defines the C API.
+# check_static_library <path> [c-api]: the archive must be an arm64 static
+# library. With c-api=true it must also define the rustios C API; without it
+# (the archive assembled from the rlibs) it must contain rustc objects, so an
+# empty or half-written archive is not shipped as "static".
 check_static_library() {
-    local lib="$1" desc archs symbols
+    local lib="$1" c_api="${2:-true}" desc archs symbols members
     desc="$(file -b "${lib}")"
     [[ "${desc}" == *"ar archive"* ]] || die "$(basename "${lib}") is not a static archive: ${desc}"
     archs="$(lipo -info "${lib}" 2>&1 || true)"
     [[ "${archs}" == *arm64* ]] \
         || die "$(basename "${lib}") has no arm64 objects: ${archs}"
-    if command -v nm >/dev/null 2>&1; then
+    if [[ "${c_api}" == "true" ]] && command -v nm >/dev/null 2>&1; then
         symbols="$(nm -g "${lib}" 2>/dev/null || true)"
         [[ "${symbols}" == *"_rustios_run"* ]] \
             || die "$(basename "${lib}") does not export rustios_run"
         [[ "${symbols}" == *"_rustios_version"* ]] \
             || die "$(basename "${lib}") does not export rustios_version"
+        log "static library: arm64, exports the rustios C API"
+        return 0
     fi
-    log "static library: arm64, exports the rustios C API"
+    members="$(ar -t "${lib}" 2>/dev/null | grep -c 'rustc_driver_impl' || true)"
+    [[ "${members}" -gt 0 ]] \
+        || die "$(basename "${lib}") contains no rustc_driver_impl objects"
+    log "static library: arm64, ${members} rustc_driver_impl objects, no C API"
 }
 
 # report_line <text>: append a line to the report that ends up in the PR
@@ -1591,27 +1598,45 @@ build_xcframework() {
 
     if find_target_rlib driver_rlib librustc_driver_impl; then
         log "building the static rustios driver (libRustCompiler.a)"
-        log "  rustc_driver_impl: ${driver_rlib}"
+        log "  rustc_driver_impl in the sysroot: ${driver_rlib}"
 
-        # rustc resolves rustc_driver_impl's dependencies from -L search paths,
-        # and one crate can exist there twice: for the target (ios) and for the
-        # build machine (darwin, where proc macros must run). Which one rustc
-        # wants depends on the dependency kind, and it stops at the first
-        # candidate it considers - so the order decides between
+        # Where the crates come from, and why the order matters.
         #
-        #   E0463  can't find crate for `derive_where`        (only ios seen)
-        #   E0514  compiled by an incompatible version of rustc (stage0 seen)
-        #   success (the stage-2 artifact it recorded)
+        # bootstrap runs cargo several times, and the same crate name exists
+        # once per run with an *identical file hash* but different contents:
         #
-        # Both orders are tried; the one that works is reported. stage0/stage1
-        # are never searched: they hold the same crates built by rustc 1.93.
-        local host_deps=() target_deps=() dep_dir discovered=()
-        host_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/release/deps")
-        host_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2/release/deps")
-        target_deps+=("${libdir}")
-        target_deps+=("${stage2}/lib")
-        target_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/${HOST_TRIPLE}/release/deps")
-        target_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2/${HOST_TRIPLE}/release/deps")
+        #   build/<build>/stage2-rustc/<host>/release/deps
+        #       the stage-2 compiler's units for the target, compiled by the
+        #       stage-1 compiler. rustc_driver_impl lives here, and so do the
+        #       proc macros it was compiled against (derive_where): one cargo
+        #       run, one consistent set.
+        #   build/<build>/stage2-rustc/release/deps
+        #       the same for the build machine.
+        #   build/<host>/stage2/lib/rustlib/<host>/lib
+        #       the finished sysroot. Its rustc rlibs are copied from the
+        #       *stage-1* sysroot, which stage 0 (rustc 1.93) produced.
+        #   build/<build>/stage2/{,<host>/}release/deps
+        #       the stage-2 units.
+        #
+        # `extern crate rustc_driver_impl` is a rustc_private lookup, and the
+        # sysroot copy wins over -L unless the crate is named with --extern.
+        # The sysroot copy wants derive_where as built by rustc 1.93, which
+        # exists in no stage-2 directory:
+        #
+        #   E0463  can't find crate for `derive_where`   (stage-0 copy picked)
+        #   E0514  compiled by an incompatible rustc     (stage-0 copy found)
+        #
+        # The first attempt therefore names the stage-1-built driver with
+        # --extern and searches cargo's own stage-2 directory first.
+        local cargo_target="${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/${HOST_TRIPLE}/release/deps"
+        local cargo_host="${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/release/deps"
+        local stage2_target="${BUILD_DIR}/${BUILD_TRIPLE}/stage2/${HOST_TRIPLE}/release/deps"
+        local stage2_host="${BUILD_DIR}/${BUILD_TRIPLE}/stage2/release/deps"
+        local cargo_deps=("${cargo_target}" "${cargo_host}")
+        local sysroot_deps=("${libdir}" "${stage2}/lib")
+        local target_deps=("${stage2_target}" "${stage2_host}")
+        local discovered=() dep_dir
+
         while IFS= read -r dep_dir; do
             [[ -n "${dep_dir}" ]] || continue
             case "${dep_dir}" in
@@ -1620,15 +1645,34 @@ build_xcframework() {
             discovered+=("${dep_dir}")
         done < <(find "${BUILD_DIR}" -maxdepth 8 -type d -name deps 2>/dev/null | sort)
 
-        # try_static_driver <label> <dir...>: one rustc run, log kept.
-        try_static_driver() {
-            local label="$1"
+        # The driver cargo built for the target, when it is there at all.
+        local cargo_driver=""
+        if [[ -d "${cargo_target}" ]]; then
+            shopt -s nullglob
+            local driver_matches=("${cargo_target}"/librustc_driver_impl-*.rlib)
+            shopt -u nullglob
+            if [[ ${#driver_matches[@]} -gt 0 ]]; then
+                cargo_driver="${driver_matches[0]}"
+            fi
+        fi
+
+        # append_dependency_flags <array-name> <dir...>: append
+        # "-L dependency=<dir>" for every directory that exists.
+        append_dependency_flags() {
+            local var="$1"
             shift
-            local flags=() d
+            local d
             for d in "$@"; do
-                [[ -d "${d}" ]] && flags+=("-L" "dependency=${d}")
+                [[ -d "${d}" ]] || continue
+                eval "${var}+=( \"-L\" \"dependency=\${d}\" )"
             done
-            log "  static driver attempt: ${label} (${#flags} -L entries)"
+        }
+
+        # try_static_driver <log> <flags...>: one rustc run, log kept.
+        try_static_driver() {
+            local log_path="$1"
+            shift
+            : > "${log_path}"
             RUSTC_BOOTSTRAP=1 \
             RUSTIOS_VERSION="${RUST_VERSION}" \
             IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
@@ -1640,27 +1684,114 @@ build_xcframework() {
                 --sysroot "${merged}" \
                 -C opt-level=2 \
                 -C debuginfo=0 \
-                "${flags[@]}" \
+                -Z verbose \
+                "$@" \
                 -o "${out_dir}/lib/libRustCompiler.a" \
                 "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs" \
-                >> "${out_dir}/static-driver.log" 2>&1
+                > "${log_path}" 2>&1
         }
 
-        : > "${out_dir}/static-driver.log"
-        local attempt
-        if try_static_driver "target directories first" \
-                "${target_deps[@]}" "${host_deps[@]}" "${discovered[@]}"; then
-            attempt="target first"
-        elif try_static_driver "host directories first" \
-                "${host_deps[@]}" "${target_deps[@]}" "${discovered[@]}"; then
-            attempt="host first"
-        else
-            attempt=""
+        # merge_static_archive <dest> <dir...>: assemble an archive out of the
+        # objects inside every rlib, first directory wins for a given file
+        # name. Objects do not need crate metadata, only the C shim does, so
+        # this still yields a static library when the shim cannot be resolved.
+        merge_static_archive() {
+            local dest="$1"
+            shift
+            local work="${out_dir}/merge" list="${out_dir}/merge-files.txt"
+            local seen="${out_dir}/merge-seen.txt"
+            local dir f name i=0
+            rm -rf "${work}" "${dest}"
+            mkdir -p "${work}"
+            : > "${seen}"
+            for dir in "$@"; do
+                [[ -d "${dir}" ]] || continue
+                shopt -s nullglob
+                local rlibs=("${dir}"/*.rlib)
+                shopt -u nullglob
+                for f in ${rlibs[@]+"${rlibs[@]}"}; do
+                    name="$(basename "${f}")"
+                    if grep -qxF "${name}" "${seen}"; then
+                        continue
+                    fi
+                    printf '%s\n' "${name}" >> "${seen}"
+                    i=$((i + 1))
+                    mkdir -p "${work}/${i}"
+                    if ! ( cd "${work}/${i}" && ar -x "${f}" ) >/dev/null 2>&1; then
+                        warn "could not unpack ${name}"
+                    fi
+                done
+            done
+            find "${work}" -type f -name '*.o' | sort > "${list}"
+            [[ -s "${list}" ]] || return 1
+            libtool -static -o "${dest}" -filelist "${list}" \
+                >"${out_dir}/libtool-static.log" 2>&1 || true
+            if [[ ! -s "${dest}" ]]; then
+                rm -f "${dest}"
+                return 1
+            fi
+            log "  $(basename "${dest}"): $(wc -l < "${list}" | tr -d ' ') objects from ${i} rlibs"
+            return 0
+        }
+
+        # first_error <log>: the first rustc error with its notes, which is
+        # where the reason is; the tail only repeats the summary.
+        first_error() {
+            local log_path="$1" start
+            start="$(grep -n -m1 -E '^error(\[|:)' "${log_path}" 2>/dev/null | cut -d: -f1 || true)"
+            if [[ -z "${start}" ]]; then
+                tail -n 8 "${log_path}" 2>/dev/null || echo "(no log)"
+                return 0
+            fi
+            sed -n "${start},$((start + 13))p" "${log_path}"
+        }
+
+        local flags_cargo=() flags_sysroot=() flags_stage2=()
+        append_dependency_flags flags_cargo ${cargo_deps[@]+"${cargo_deps[@]}"} \
+            ${sysroot_deps[@]+"${sysroot_deps[@]}"} ${target_deps[@]+"${target_deps[@]}"} \
+            ${discovered[@]+"${discovered[@]}"}
+        append_dependency_flags flags_sysroot ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
+            ${target_deps[@]+"${target_deps[@]}"} ${cargo_deps[@]+"${cargo_deps[@]}"} \
+            ${discovered[@]+"${discovered[@]}"}
+        append_dependency_flags flags_stage2 ${target_deps[@]+"${target_deps[@]}"} \
+            ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
+            ${discovered[@]+"${discovered[@]}"}
+
+        local attempt="" attempt_log="" attempt_names=() attempt_logs=()
+        try_attempt() {
+            local slug="$1" description="$2"
+            shift 2
+            attempt_log="${out_dir}/static-driver-${slug}.log"
+            attempt_names+=("${description}")
+            attempt_logs+=("${attempt_log}")
+            log "  static driver attempt: ${description}"
+            if try_static_driver "${attempt_log}" "$@"; then
+                attempt="${description}"
+                return 0
+            fi
+            return 1
+        }
+
+        if [[ -n "${cargo_driver}" ]] \
+            && try_attempt "pinned-driver" \
+                "--extern for the cargo-built driver, cargo directories first" \
+                "--extern" "rustc_driver_impl=${cargo_driver}" \
+                ${flags_cargo[@]+"${flags_cargo[@]}"}; then
+            :
+        elif try_attempt "cargo-first" "cargo directories first" \
+                ${flags_cargo[@]+"${flags_cargo[@]}"}; then
+            :
+        elif try_attempt "sysroot-first" "the sysroot first" \
+                ${flags_sysroot[@]+"${flags_sysroot[@]}"}; then
+            :
+        elif try_attempt "stage2-first" "stage-2 compiler directories first" \
+                ${flags_stage2[@]+"${flags_stage2[@]}"}; then
+            :
         fi
 
         if [[ -n "${attempt}" ]]; then
             log "  static driver linked (${attempt})"
-            report_line "xcframework: static driver linked (${attempt} search order)"
+            report_line "xcframework: static driver linked (${attempt})"
             static_lib="true"
             c_api="true"
             library="libRustCompiler.a"
@@ -1670,32 +1801,52 @@ build_xcframework() {
             cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
         else
             warn "could not build the static rustios driver"
-            report_line "xcframework: the static driver did not build (rustc failed); falling back to the dylib"
-            # Where the crates the link could not find actually are: without
-            # this the only message is E0463 and the layout stays a guess.
+            report_line "xcframework: the C shim did not compile (rustc could not resolve the driver's crates)"
+            local i=0
+            while [[ ${i} -lt ${#attempt_names[@]} ]]; do
+                report_line ""
+                report_line "attempt ${i}: ${attempt_names[${i}]}"
+                report_line '```'
+                report_line "$(first_error "${attempt_logs[${i}]}")"
+                report_line '```'
+                i=$((i + 1))
+            done
+
+            # Which copy of each crate the search could see: the same file name
+            # exists for every cargo run, so the stage is invisible without it.
             {
-                echo "static driver: dependency layout under ${BUILD_DIR}:"
+                echo "static driver: candidate crates (kind, path):"
                 echo '```'
-                find "${BUILD_DIR}" -maxdepth 8 -name 'libderive_where*' -o -maxdepth 8 -name 'librustc_driver_impl*' 2>/dev/null | head -20
-                echo "-- deps directories under build/ (stage 2 only):"
-                printf '  %s\n' "${host_deps[@]}" "${target_deps[@]}" "${discovered[@]}" 2>/dev/null | grep -v '^$' | head -20
+                for d in ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
+                         ${target_deps[@]+"${target_deps[@]}"}; do
+                    [[ -d "${d}" ]] || continue
+                    for f in "${d}"/librustc_driver_impl-*.rlib "${d}"/libderive_where-*.dylib; do
+                        [[ -f "${f}" ]] || continue
+                        printf '  %s  %s\n' "$(file -b "${f}" | cut -d, -f1)" "${f}"
+                    done
+                done | head -40
                 echo '```'
             } >> "${ARTIFACTS_DIR}/REPORT.txt"
-            # The job log is not reachable from everywhere, so put the reason
-            # where the report is: the tail of the failed rustc invocation.
-            {
-                echo "static driver: rustc failed, tail of the output:"
-                echo '```'
-                tail -n 15 "${out_dir}/static-driver.log" 2>/dev/null || echo "(no log)"
-                echo '```'
-            } >> "${ARTIFACTS_DIR}/REPORT.txt"
+
+            # Still a static library, just without the C ABI on top: the shim
+            # is the only part that needs rustc_driver_impl's metadata.
+            if merge_static_archive "${out_dir}/lib/libRustCompiler.a" \
+                    ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"}; then
+                static_lib="true"
+                c_api="false"
+                library="libRustCompiler.a"
+                has_headers="false"
+                report_line "xcframework: static archive assembled from the rustc rlibs (no C API; the shim needs crate metadata bootstrap does not keep together)"
+                bundle_llvm "${out_dir}/lib/${library}"
+            else
+                report_line "xcframework: **no static archive either**; falling back to the dylib"
+            fi
         fi
     else
         warn "no librustc_driver_impl-*.rlib in any of: ${XCFRAMEWORK_SEARCH_DIRS[*]}"
         report_line "xcframework: **no librustc_driver_impl rlib** found; falling back to the dylib"
         warn "bootstrap did not keep the rustc rlibs; run 'configure' + a full rebuild"
     fi
-
     if [[ "${static_lib}" != "true" ]]; then
         # Fallback: ship the compiler dylib itself. It is an iOS shared library
         # (rustc_driver is a dylib crate upstream), so the framework stays
@@ -1734,9 +1885,11 @@ build_xcframework() {
     write_xcframework_plist "${xcfw}/Info.plist" "ios-arm64" "${library}" "${has_headers}"
 
     if [[ "${static_lib}" == "true" ]]; then
-        check_static_library "${slice}/${library}"
-        [[ -f "${slice}/Headers/rustios.h" ]] || die "Headers/rustios.h is missing"
-        link_check_static "${slice}/${library}" "${slice}/Headers"
+        check_static_library "${slice}/${library}" "${c_api}"
+        if [[ "${c_api}" == "true" ]]; then
+            [[ -f "${slice}/Headers/rustios.h" ]] || die "Headers/rustios.h is missing"
+            link_check_static "${slice}/${library}" "${slice}/Headers"
+        fi
     else
         desc="$(file -b "${slice}/${library}")"
         [[ "${desc}" == *"Mach-O 64-bit dynamically linked shared library arm64"* ]] \

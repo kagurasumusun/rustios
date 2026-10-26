@@ -22,7 +22,7 @@ rust-lang 版 LLVM を別にビルドしません。詳細とバージョンの�
 | Swift ツールチェーン | `SwiftToolchain.zip` | `SwiftToolchain-iphoneos-arm64-6.4.0.tar.xz` |
 | 共有 LLVM | `LLVM.xcframework`（`llvm.a` + headers） | `SwiftLLVM-iphoneos-arm64-21.1.6.tar.xz` + `LLVM.xcframework` |
 | Rust ツールチェーン本体 | — | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` |
-| アプリに組み込むライブラリ | `LLVM.xcframework` | `Rust.xcframework`（現状は dylib スライス。静的化は継続課題） |
+| アプリに組み込むライブラリ | `LLVM.xcframework` | `Rust.xcframework`（`libRustCompiler.a`。静的化の段階は実行ごとに `build-info.json`） |
 | サポートライブラリ | `CoreCompilerSupportLibs` | `RustStd-iphoneos-arm64-<ver>.tar.xz`（std。LLVM は `SwiftLLVM` を共有） |
 | ターゲット | `arm64-apple-ios16.0` | `aarch64-apple-ios`（deployment target 16.0） |
 | LLVM | 21.1.6（Swift 6.4） | **同じ 21.1.6 を両方のコンパイラで共有** |
@@ -73,7 +73,7 @@ iOS / ホストの **内訳を数えてレポートに明記** します（黙�
 | `LLVM.xcframework-iphoneos-arm64-21.1.6.tar.xz` | `llvm.a` + headers（LLVM-On-iOS の `LLVM.xcframework` 相当）。44 MB |
 | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | `RustToolchain/usr/{bin,lib}` — iOS で動く `rustc`, `rustdoc`, codegen backend。**std は含みません** |
 | `RustStd-iphoneos-arm64-<ver>.tar.xz` | **std のみ**（`RustStd/usr/lib/rustlib/aarch64-apple-ios/lib/*.rlib`）。コンパイラとは別配布 |
-| `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `Rust.xcframework`。**現状は動的スライス**（`librustc_driver-*.dylib`）。静的 `libRustCompiler.a` + `rustios.h` は継続課題（docs/llvm-sharing.md §6） |
+| `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `Rust.xcframework`。静的 `libRustCompiler.a` を目指し、(1) C API 付き静的 → (2) C API なしの静的（rlib のオブジェクトを 1 本に）→ (3) 動的スライスの順に試します。どれになったかは `build-info.json` の `"c_api"` / `"library"`（docs/llvm-sharing.md §6） |
 | `SHA256SUMS.txt` | 上記の SHA-256 |
 
 **std はツールチェーンに入れません。** サイズの大半を占めるうえ、デバイス上で
@@ -100,14 +100,25 @@ Rust のバージョンに強く依存します。ビルドに失敗した場合
 
 `Rust.xcframework` は LLVM-On-iOS の `llvm.a` と同じく **静的ライブラリ**に
 することを目標にしています（`libRustCompiler.a` = rustc 本体 + C API）。
-ただし **現在は静的リンクが成立しておらず、動的スライスにフォールバック
-しています**（`build-info.json` の `"c_api": false`、`REPORT.txt` に理由）。
-アプリへのリンク手順としては `librustc_driver-*.dylib` を同梱する形になります。
+段階は 3 つあり、上から順に試して、成立したものを配布します。
 
-理由: `rustc_driver_impl` の rlib はビルドツリーに残るので見つかるのですが、
-その依存 `derive_where`（proc-macro）を rustc が解決できません
-（`E0463 can't find crate for 'derive_where'`）。探索範囲を変えた 4 通りの
-試行はいずれも失敗しており、詳細は
+1. **C API 付きの静的ライブラリ** — `rustios.h` + `libRustCompiler.a`。
+   `rustc_driver_impl` を静的リンクし、`rustios_run()` を公開します。
+2. **C API なしの静的ライブラリ** — 1 が成立しない場合。rlib の中の
+   オブジェクトを `libtool -static` で 1 本にまとめます（`"c_api": false`）。
+   crate のメタデータが要るのは C シムだけなので、オブジェクトの結合は
+   通ります。
+3. **動的スライス** — 上記が両方失敗した場合のみ（`librustc_driver-*.dylib`）。
+
+1 が失敗してきた理由: `rustc_driver_impl` の rlib は見つかるのですが、その
+依存 `derive_where`（proc-macro）を rustc が解決できません。sysroot にある
+`librustc_driver_impl` は stage 1 の sysroot からコピーされたもので、stage 0
+（rustc 1.93）がビルドした `derive_where` を要求する一方、crate hash は cargo
+の unit から決まるため **ファイル名が同じで中身の stage だけが違う**コピーが
+並びます。そのため探索範囲を広げても正しい組を選べず、`E0463`（見つからない）
+か `E0514`（rustc 1.93 製）になります。現在は `--extern` で stage 2 の
+ドライバを明示する方式を試しています。結果は `build-info.json` と `REPORT.txt`
+に残ります。詳細は
 [docs/llvm-sharing.md §6](docs/llvm-sharing.md) に記録しています。
 
 上流の Rust は `rustc_driver` を `crate-type = ["dylib"]` とし、ビルドした
@@ -393,8 +404,9 @@ jailbreak / TrollStore 環境や、Nyxian のような IDE の中では、その
 ```sh
 tar -xJf Rust.xcframework-iphoneos-arm64-1.94.0.tar.xz
 ls Rust.xcframework/ios-arm64
-# 現在: librustc_driver-*.dylib（動的スライス）
-# 目標: Headers/ と libRustCompiler.a（静的。未達、docs/llvm-sharing.md §6）
+# 1 が成立: Headers/rustios.h + libRustCompiler.a
+# 2 が成立: libRustCompiler.a のみ（C API なし）
+# 3 のみ:   librustc_driver-*.dylib
 ```
 
 ```sh
@@ -439,9 +451,10 @@ int rc = rustios_run(7, argv);   /* RUSTIOS_OK=0, RUSTIOS_FAILED=1, ... */
 * `Rust.xcframework` は静的ライブラリ（`libRustCompiler.a`）です。ただし
   実行時に **コード生成バックエンド** を読み込むため、`RustToolchain` の
   `usr/lib/rustlib/aarch64-apple-ios/codegen-backends/*.dylib` をアプリに
-  同梱して署名し、`--sysroot` でそのディレクトリを渡してください。rlib が
-  残せなかったビルドでは、警告を出してコンパイラ dylib を収めた動的スライスに
-  フォールバックします（`build-info.json` の `"c_api": false`）。
+  同梱して署名し、`--sysroot` でそのディレクトリを渡してください。C シムが
+  リンクできなかったビルドでは `"c_api": false` の静的アーカイブ（C API
+  なし）、rlib すら残せなかったビルドでは動的スライスになります。どれも
+  `build-info.json` の `"library"` / `"c_api"` を見れば分かります。
 * ビルドには macOS ランナーと 1 時間以上の時間が必要です（LLVM を 2 回
   ビルドするため）。コールドビルドは GitHub Actions の 6 時間制限に
   収まらないことがあるので、キャッシュを温めてから実行してください。

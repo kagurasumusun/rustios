@@ -397,7 +397,7 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | rust-lang 版 LLVM との API 差 | **2 件検出・パッチ適用**（`PGOOptions` の vfs 引数、`stdc++`→`libc++`）。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **未達（継続課題）**。`librustc_driver_impl` の rlib は見つかるが、その依存 `derive_where`（proc-macro）を rustc が解決できない。試したことと結果は下の表。現状は動的スライス（`librustc_driver-*.dylib`、C API なし）にフォールバックし、理由を REPORT.txt に残す |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **継続課題**。直近の実行では C シム（`libRustCompiler.a` + `rustios.h`）がリンクできず、動的スライス（`librustc_driver-*.dylib`、C API なし）にフォールバックしていた。原因の見立てと新しい試行は下の「静的ドライバ」節。**シムが失敗しても rlib のオブジェクトをまとめた静的アーカイブ（`c_api=false`）を出す**実装を追加（結果は次回実行で確認） |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
 
@@ -412,10 +412,30 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 
 stage2 のツリーには `libderive_where-720e60ae…dylib`（iOS 側）と
 `libderive_where-d4b8fe3f…dylib`（darwin 側）、`librustc_driver_impl-8212aa2c….rlib`
-が実在することをレポートで確認済み。それでも解決しないため、rustc が要求する
-正確なメタデータ（crate hash）と一致していないと判断している。次に試す価値が
-あるのは、bootstrap 自身の Cargo 呼び出し（`RUSTFLAGS` / `--extern`）を再現して
-同じ target dir で cargo にリンクさせる方法。
+が実在することをレポートで確認済み。それでも解決しなかった理由の見立て:
+
+- `build/<host>/stage2/lib/rustlib/<host>/lib` の `librustc_driver_impl-8212aa2c…rlib`
+  は **stage 1 の sysroot からコピーされたもの**で、stage 0（rustc 1.93）がビルドした
+  `derive_where` を要求する。
+- crate hash は cargo の unit から決まるので、コピー元の stage が違っても**ファイル名は
+  同じ**になる。中身が違う同じ名前のファイルが並ぶため、探索範囲を広げても
+  「正しい stage のコピー」を選べない。
+- `extern crate rustc_driver_impl` は `rustc_private` の解決なので、`--extern` を
+  与えない限り sysroot のコピーが `-L` より優先される。要求された hash の
+  `derive_where` が stage2 側に無ければ `E0463`、stage0 側に見えれば `E0514`。
+
+対処（実装済み・CI の結果待ち）:
+
+1. `--extern rustc_driver_impl=<stage2-rustc/<host>/release/deps の rlib>` で stage 1 が
+   ビルドしたドライバを明示し、`-L` は cargo の stage2 ディレクトリを先に置く
+2. 同じ `-L` で `--extern` なし（sysroot 優先の確認）
+3. sysroot 優先（従来の順序）
+4. stage2 の `deps` 優先
+
+4 つすべて失敗した場合は、**rlib の中のオブジェクトを `libtool -static` で 1 本の
+`libRustCompiler.a` にまとめる**。オブジェクトは crate メタデータを必要としないので、
+シム（C ABI）だけが失敗する状況でも「静的ライブラリ」という要求は満たせる。
+その場合 `c_api=false`・ヘッダ無しで、その旨を `build-info.json` と REPORT.txt に残す。
 
 既知の割り切り:
 
