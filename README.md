@@ -22,7 +22,7 @@ rust-lang 版 LLVM を別にビルドしません。詳細とバージョンの�
 | Swift ツールチェーン | `SwiftToolchain.zip` | `SwiftToolchain-iphoneos-arm64-6.4.0.tar.xz` |
 | 共有 LLVM | `LLVM.xcframework`（`llvm.a` + headers） | `SwiftLLVM-iphoneos-arm64-21.1.6.tar.xz` + `LLVM.xcframework` |
 | Rust ツールチェーン本体 | — | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` |
-| アプリに組み込むライブラリ | `LLVM.xcframework` | `Rust.xcframework`（`libRustCompiler.a` + headers） |
+| アプリに組み込むライブラリ | `LLVM.xcframework` | `Rust.xcframework`（現状は dylib スライス。静的化は継続課題） |
 | サポートライブラリ | `CoreCompilerSupportLibs` | `RustStd-iphoneos-arm64-<ver>.tar.xz`（std。LLVM は `SwiftLLVM` を共有） |
 | ターゲット | `arm64-apple-ios16.0` | `aarch64-apple-ios`（deployment target 16.0） |
 | LLVM | 21.1.6（Swift 6.4） | **同じ 21.1.6 を両方のコンパイラで共有** |
@@ -73,7 +73,7 @@ iOS / ホストの **内訳を数えてレポートに明記** します（黙�
 | `LLVM.xcframework-iphoneos-arm64-21.1.6.tar.xz` | `llvm.a` + headers（LLVM-On-iOS の `LLVM.xcframework` 相当）。44 MB |
 | `RustToolchain-iphoneos-arm64-<ver>.tar.xz` | `RustToolchain/usr/{bin,lib}` — iOS で動く `rustc`, `rustdoc`, codegen backend。**std は含みません** |
 | `RustStd-iphoneos-arm64-<ver>.tar.xz` | **std のみ**（`RustStd/usr/lib/rustlib/aarch64-apple-ios/lib/*.rlib`）。コンパイラとは別配布 |
-| `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `libRustCompiler.a`（rustc 本体 + C API の静的ライブラリ）と `rustios.h` を収めた `Rust.xcframework` |
+| `Rust.xcframework-iphoneos-arm64-<ver>.tar.xz` | `Rust.xcframework`。**現状は動的スライス**（`librustc_driver-*.dylib`）。静的 `libRustCompiler.a` + `rustios.h` は継続課題（docs/llvm-sharing.md §6） |
 | `SHA256SUMS.txt` | 上記の SHA-256 |
 
 **std はツールチェーンに入れません。** サイズの大半を占めるうえ、デバイス上で
@@ -98,19 +98,24 @@ Rust のバージョンに強く依存します。ビルドに失敗した場合
 失敗として扱われ、**中途半端な成果物が配布されることはありません**
 （アップロードは `if-no-files-found: error`）。
 
-`Rust.xcframework` は LLVM-On-iOS の `llvm.a` と同じく **静的ライブラリ**です。
-`libRustCompiler.a` に rustc 本体（`rustc_driver_impl` 以降のクレート）と
-C API がすべて入っていて、アプリにそのままリンクできます。
+`Rust.xcframework` は LLVM-On-iOS の `llvm.a` と同じく **静的ライブラリ**に
+することを目標にしています（`libRustCompiler.a` = rustc 本体 + C API）。
+ただし **現在は静的リンクが成立しておらず、動的スライスにフォールバック
+しています**（`build-info.json` の `"c_api": false`、`REPORT.txt` に理由）。
+アプリへのリンク手順としては `librustc_driver-*.dylib` を同梱する形になります。
+
+理由: `rustc_driver_impl` の rlib はビルドツリーに残るので見つかるのですが、
+その依存 `derive_where`（proc-macro）を rustc が解決できません
+（`E0463 can't find crate for 'derive_where'`）。探索範囲を変えた 4 通りの
+試行はいずれも失敗しており、詳細は
+[docs/llvm-sharing.md §6](docs/llvm-sharing.md) に記録しています。
 
 上流の Rust は `rustc_driver` を `crate-type = ["dylib"]` とし、ビルドした
-rustc のクレートを `.rmeta` だけで配るため、素の状態では静的リンクできません
-（`librustc_driver.a` は存在しません）。rustios は `configure` 時に
-`patch_bootstrap_rustc_artifacts()` で bootstrap の
+rustc のクレートを `.rmeta` だけで配るため（`librustc_driver.a` は存在しません）、
+rustios は `configure` 時に `patch_bootstrap_rustc_artifacts()` で bootstrap の
 `ArtifactKeepMode::Custom` を書き換え、**rlib（オブジェクトファイル込み）を
-sysroot に残す** ことで、stage1 の rustc から `--crate-type staticlib` で
-1 本の `.a` を作れるようにしています。rlib が無い場合は、警告を出して
-コンパイラ dylib をそのまま収めた動的スライスにフォールバックします
-（`build-info.json` の `"c_api": false`）。
+sysroot に残す**ようにしています。これで rlib は揃うので、残る課題は
+上記の依存解決だけです。
 
 ---
 
@@ -388,11 +393,9 @@ jailbreak / TrollStore 環境や、Nyxian のような IDE の中では、その
 ```sh
 tar -xJf Rust.xcframework-iphoneos-arm64-1.94.0.tar.xz
 ls Rust.xcframework/ios-arm64
-# Headers/  libRustCompiler.a
+# 現在: librustc_driver-*.dylib（動的スライス）
+# 目標: Headers/ と libRustCompiler.a（静的。未達、docs/llvm-sharing.md §6）
 ```
-
-`libRustCompiler.a` は `llvm.a` と同じ使い方です。アプリにリンクし、
-`Headers/rustios.h` の `rustios_run()` に `rustc` と同じ引数を渡します。
 
 ```sh
 clang main.c Rust.xcframework/ios-arm64/libRustCompiler.a \
