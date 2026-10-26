@@ -397,9 +397,25 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | rust-lang 版 LLVM との API 差 | **2 件検出・パッチ適用**（`PGOOptions` の vfs 引数、`stdc++`→`libc++`）。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **継続中**: `librustc_driver_impl` の rlib は見つかる。`derive_where`（proc-macro）の解決で 2 回失敗（E0463 → 探索範囲を広げすぎて E0514: stage0 の 1.93 ビルド版を掴んだ）。stage2 のグラフだけを探索するよう修正し、次回実行で確認する。今は静的リンクに失敗すると dylib にフォールバックし、理由を REPORT.txt に残す |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **未達（継続課題）**。`librustc_driver_impl` の rlib は見つかるが、その依存 `derive_where`（proc-macro）を rustc が解決できない。試したことと結果は下の表。現状は動的スライス（`librustc_driver-*.dylib`、C API なし）にフォールバックし、理由を REPORT.txt に残す |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（実測）。Rust は stage1 + stage2 の 2 回で、ジョブ上限はランナー最大の 6 h に拡大した。**Rust 側の実測はまだ無い** |
+
+静的ドライバの試行錯誤（すべて CI で実測）:
+
+| 探索範囲 | 結果 |
+| --- | --- |
+| 明示 6 ディレクトリ（sysroot + `stage2-rustc/<host>`） | `E0463 can't find crate for derive_where` |
+| `build/` 配下の全 `deps`（28 個） | `E0514 derive_where は rustc 1.93 でコンパイル済み`（stage0 版を掴んだ） |
+| stage2 のみ（10 個） | `E0463` |
+| stage2 のみ・**ホスト優先**（proc-macro はホスト用なので darwin を先に） | `E0463`（両順序を 1 回の実行で試す実装） |
+
+stage2 のツリーには `libderive_where-720e60ae…dylib`（iOS 側）と
+`libderive_where-d4b8fe3f…dylib`（darwin 側）、`librustc_driver_impl-8212aa2c….rlib`
+が実在することをレポートで確認済み。それでも解決しないため、rustc が要求する
+正確なメタデータ（crate hash）と一致していないと判断している。次に試す価値が
+あるのは、bootstrap 自身の Cargo 呼び出し（`RUSTFLAGS` / `--extern`）を再現して
+同じ target dir で cargo にリンクさせる方法。
 
 既知の割り切り:
 
