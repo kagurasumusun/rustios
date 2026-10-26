@@ -95,7 +95,10 @@ jobs:
     timeout-minutes: 360
     runs-on: macos-latest
     outputs:
-      llvm_version: ${{ steps.versions.outputs.llvm_version }}
+      # Read from the LLVM that was packaged, not from the source tree: with a
+      # restored build the checkout may not carry the version file, and
+      # "unknown" in the report hides which LLVM rustc was linked against.
+      llvm_version: ${{ steps.llvm-version.outputs.llvm_version }}
       swift_version: ${{ steps.versions.outputs.swift_version }}
       # Whether the shared LLVM artifact exists. The rust job only needs that,
       # so it runs even when the Swift toolchain part of this job fails (each
@@ -242,6 +245,14 @@ jobs:
           echo "===== swift package-llvm =====" | tee -a swift.log
           Scripts/build-swift-toolchain.sh package-llvm 2>&1 | tee -a swift.log
 
+      - name: Record the shared LLVM version
+        id: llvm-version
+        run: |-
+          set -euo pipefail
+          v="$(work/SwiftLLVM/ios/bin/llvm-config --version)"
+          echo "llvm_version=${v}" >> "${GITHUB_OUTPUT}"
+          echo "llvm-config (iOS) reports ${v}" | tee -a swift.log
+
       - name: Upload SwiftLLVM
         id: upload-llvm
         if: always()
@@ -335,7 +346,7 @@ jobs:
             echo "| item | value |"
             echo "| --- | --- |"
             echo "| Swift | \`${SWIFT_BRANCH}\` |"
-            echo "| LLVM | \`${{ steps.versions.outputs.llvm_version }}\` (macOS + iOS) |"
+            echo "| LLVM | \`${{ steps.llvm-version.outputs.llvm_version }}\` (macOS + iOS) |"
             echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
             echo "| cache hit (sources) | \`${{ steps.cache-swift-src.outputs.cache-hit }}\` |"
             echo
