@@ -1592,37 +1592,47 @@ build_xcframework() {
     if find_target_rlib driver_rlib librustc_driver_impl; then
         log "building the static rustios driver (libRustCompiler.a)"
         log "  rustc_driver_impl: ${driver_rlib}"
-        # Every directory that can hold one of the driver's dependencies. The
-        # fixed list covers the layouts bootstrap produces today; the deps
-        # directories found under build/ cover the rest (cargo decides where
-        # proc macros go, and guessing that wrong cost two runs already).
-        local dep_flags=() dep_dir discovered=()
-        for dep_dir in "${XCFRAMEWORK_SEARCH_DIRS[@]}"; do
-            if [[ -d "${dep_dir}" ]]; then
-                dep_flags+=("-L" "dependency=${dep_dir}")
-            fi
-        done
+
+        # rustc resolves rustc_driver_impl's dependencies from -L search paths,
+        # and one crate can exist there twice: for the target (ios) and for the
+        # build machine (darwin, where proc macros must run). Which one rustc
+        # wants depends on the dependency kind, and it stops at the first
+        # candidate it considers - so the order decides between
+        #
+        #   E0463  can't find crate for `derive_where`        (only ios seen)
+        #   E0514  compiled by an incompatible version of rustc (stage0 seen)
+        #   success (the stage-2 artifact it recorded)
+        #
+        # Both orders are tried; the one that works is reported. stage0/stage1
+        # are never searched: they hold the same crates built by rustc 1.93.
+        local host_deps=() target_deps=() dep_dir discovered=()
+        host_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/release/deps")
+        host_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2/release/deps")
+        target_deps+=("${libdir}")
+        target_deps+=("${stage2}/lib")
+        target_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2-rustc/${HOST_TRIPLE}/release/deps")
+        target_deps+=("${BUILD_DIR}/${BUILD_TRIPLE}/stage2/${HOST_TRIPLE}/release/deps")
         while IFS= read -r dep_dir; do
             [[ -n "${dep_dir}" ]] || continue
-            # Only this stage's graph. stage0/stage1 hold the same crates built
-            # by an older compiler, and rustc takes the first match it finds:
-            # searching them produced "found crate `derive_where` compiled by an
-            # incompatible version of rustc" (E0514) instead of a working link.
             case "${dep_dir}" in
                 */stage0*|*/stage1*|*/bootstrap/*) continue ;;
             esac
-            case " ${XCFRAMEWORK_SEARCH_DIRS[*]} " in
-                *" ${dep_dir} "*) continue ;;
-            esac
-            dep_flags+=("-L" "dependency=${dep_dir}")
             discovered+=("${dep_dir}")
         done < <(find "${BUILD_DIR}" -maxdepth 8 -type d -name deps 2>/dev/null | sort)
-        log "  dependency search: ${#dep_flags[@]} -L entries (${#discovered[@]} discovered under ${BUILD_DIR})"
-        report_line "xcframework: ${#dep_flags[@]} dependency search paths for the static driver"
-        if RUSTC_BOOTSTRAP=1 \
-           RUSTIOS_VERSION="${RUST_VERSION}" \
-           IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
-           "${stage1}/bin/rustc" \
+
+        # try_static_driver <label> <dir...>: one rustc run, log kept.
+        try_static_driver() {
+            local label="$1"
+            shift
+            local flags=() d
+            for d in "$@"; do
+                [[ -d "${d}" ]] && flags+=("-L" "dependency=${d}")
+            done
+            log "  static driver attempt: ${label} (${#flags} -L entries)"
+            RUSTC_BOOTSTRAP=1 \
+            RUSTIOS_VERSION="${RUST_VERSION}" \
+            IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
+            "${stage1}/bin/rustc" \
                 --edition 2021 \
                 --crate-name rustios_driver \
                 --crate-type staticlib \
@@ -1630,10 +1640,27 @@ build_xcframework() {
                 --sysroot "${merged}" \
                 -C opt-level=2 \
                 -C debuginfo=0 \
-                "${dep_flags[@]}" \
+                "${flags[@]}" \
                 -o "${out_dir}/lib/libRustCompiler.a" \
                 "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs" \
-                2>&1 | tee "${out_dir}/static-driver.log"; then
+                >> "${out_dir}/static-driver.log" 2>&1
+        }
+
+        : > "${out_dir}/static-driver.log"
+        local attempt
+        if try_static_driver "target directories first" \
+                "${target_deps[@]}" "${host_deps[@]}" "${discovered[@]}"; then
+            attempt="target first"
+        elif try_static_driver "host directories first" \
+                "${host_deps[@]}" "${target_deps[@]}" "${discovered[@]}"; then
+            attempt="host first"
+        else
+            attempt=""
+        fi
+
+        if [[ -n "${attempt}" ]]; then
+            log "  static driver linked (${attempt})"
+            report_line "xcframework: static driver linked (${attempt} search order)"
             static_lib="true"
             c_api="true"
             library="libRustCompiler.a"
@@ -1650,9 +1677,8 @@ build_xcframework() {
                 echo "static driver: dependency layout under ${BUILD_DIR}:"
                 echo '```'
                 find "${BUILD_DIR}" -maxdepth 8 -name 'libderive_where*' -o -maxdepth 8 -name 'librustc_driver_impl*' 2>/dev/null | head -20
-                echo "-- deps directories searched:"
-                printf '%s\n' "${dep_flags[@]}" | grep -c dependency || true
-                find "${BUILD_DIR}" -maxdepth 8 -type d -name deps 2>/dev/null | head -20
+                echo "-- deps directories under build/ (stage 2 only):"
+                printf '  %s\n' "${host_deps[@]}" "${target_deps[@]}" "${discovered[@]}" 2>/dev/null | grep -v '^$' | head -20
                 echo '```'
             } >> "${ARTIFACTS_DIR}/REPORT.txt"
             # The job log is not reachable from everywhere, so put the reason
