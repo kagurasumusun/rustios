@@ -37,6 +37,41 @@ rustc は LLVM を「リンクするライブラリ」としてだけでなく�
 > 無く、**端末上の rustc は `ar` を要求する**状態でした。現在は 14 個を
 > 入れ、`llvm-tools = true` で公式と同じ配置にしています。
 
+### 1.1 共有 LLVM の `bin/` は「自動では」作られない
+
+プリセットは LLVM-On-iOS 由来の `build-toolchain-only=1` を引き継いでおり、
+これは Swift の `utils/build_swift` が LLVM を
+
+```
+-DLLVM_BUILD_TOOLS=NO            # ツールはターゲットを作るが all では作らない
+-DLLVM_INSTALL_TOOLCHAIN_ONLY=YES
+-DLLVM_INCLUDE_UTILS=NO
+-DLLVM_TOOL_LLVM_AR_BUILD=NO     # llvm-ar は「そもそも構成しない」
+```
+
+で configure するということです（`products/llvm.py`）。ライブラリは全部できて
+`llvm-config` もできるのに、**`bin/` にはツールが 1 つも残らない**。
+run 40285701494 はまさにこれで、20 バックエンド・199 ライブラリの完全な
+ツリーを 4 時間 50 分かけて作りながら `swift LLVM: 0/15 rustc LLVM tools` に
+なり、Rust 側は `llvm-tools = false` に落ちていました。
+
+対処（`Scripts/build-swift-toolchain.sh` の `build_llvm_tools`）:
+
+* `build-script` が終わったあと、既存の build tree に対して
+  `cmake -DLLVM_BUILD_TOOLS=ON -DLLVM_TOOL_<NAME>_BUILD=ON …` で再 configure し、
+  `ninja llvm-ar llvm-ranlib … llc opt` で 15 個だけリンクします。
+  ライブラリのフラグは変えないので、**既にビルド済みのものは再ビルドされません**
+  （追加は数分）。
+* macOS ツリーだけ `-DLLVM_INCLUDE_UTILS=ON -DLLVM_BUILD_UTILS=ON` を足して
+  `FileCheck not count` も作ります（`codegen-tests` 用。参照ビルドは
+  `LLVM_INSTALL_UTILS=ON` でこれらを持つ）。
+* `LLVM_TOOL_<NAME>_BUILD` は `create_llvm_tool_options`（`AddLLVM.cmake`）が
+  `llvm/tools/*` を走査して作るキャッシュ変数なので、数時間前に configure された
+  ツリーでも後から ON にできます。`LLVM_BUILD_TOOLS=NO` は
+  「`EXCLUDE_FROM_ALL` にする」だけなので、明示的に `ninja` すれば作れます。
+* 失敗しても **致命的にしません**（5 時間のビルドを捨てない）。その場合は
+  `warn` とレポート行が残り、Rust 側は `llvm-tools = false` として理由を出します。
+
 ---
 
 ## 2. LLVM の CMake 構成: Rust の参照ビルドとの比較
@@ -61,9 +96,11 @@ LLVM 自身の CMake 既定値）。
 | terminfo | 未指定 → 見つかれば ON | `-DLLVM_ENABLE_TERMINFO=ON` | 同一 |
 | バックトレース | 未指定 → 既定 ON | `-DLLVM_ENABLE_BACKTRACES=ON` | 同一 |
 | `llvm_unreachable` の最適化 | `-DLLVM_UNREACHABLE_OPTIMIZE=OFF` | 同じ | 同一 |
+| LLVM のツール | `LLVM_BUILD_TOOLS` 既定 ON、`LLVM_INSTALL_UTILS=ON` | `build-toolchain-only=1` で **OFF** | ビルド後に 15 個だけリンクして揃える（§1.1） |
+| LLVM の utils (FileCheck) | `LLVM_INCLUDE_UTILS` 既定 ON | OFF | macOS ツリーのみ ON にして FileCheck を作る |
 | プラグイン | apple モバイルでは OFF を明示 | 未指定 → CMake 既定（Darwin は `LLVM_ENABLE_PIC` に従い ON） | **共有側が上位互換**（§4.3） |
 | LLVM 自体の LTO | `llvm.thin-lto` 既定 false | 未指定 | 同一 |
-| **バックエンド** | `llvm.targets` 既定 **`all`** | `llvm-targets-to-build=all` | 同一（両者の既定集合を含む上位集合） |
+| **バックエンド** | `llvm.targets` 既定 **`all`** | `llvm-targets-to-build=all` | 同一（両者の既定集合を含む上位集合。CI 実測: 20 個 = AArch64;AMDGPU;ARM;AVR;BPF;Hexagon;Lanai;LoongArch;Mips;MSP430;NVPTX;PowerPC;RISCV;Sparc;SPIRV;SystemZ;VE;WebAssembly;X86;XCore） |
 | テスト | `llvm.tests=false` → OFF | `llvm-include-tests=0` | 同一 |
 | libxml2 | OFF を明示 | 未指定（見つかれば ON） | 共有側が上位互換（rustc は使わない） |
 | Z3 | OFF | 未指定 | 実質同一 |
@@ -183,16 +220,18 @@ CMake 既定（Darwin では `LLVM_ENABLE_PIC` に従い ON）です。
 `artifacts/REPORT.txt`（PR コメントに出る）に、次の行が追加されます。
 
 ```
+swift LLVM (macosx): built 18 LLVM tool target(s)
+swift LLVM (ios): built 14 LLVM tool target(s)
 swift LLVM (ios/bin): 15/15 rustc LLVM tools installed
 swift LLVM (macosx/bin): 15/15 rustc LLVM tools installed
 swift LLVM (macosx/bin): FileCheck present
 swift LLVM: 15/15 rustc LLVM tools present and iOS/arm64
-swift LLVM: 21 backends (AArch64;AMDGPU;ARM;AVR;BPF;...;XCore;Xtensa)
+swift LLVM: 20 backends (AArch64;AMDGPU;ARM;AVR;BPF;...;XCore)
 swift LLVM: backends match the preset (llvm-targets-to-build=all)
 configure: llvm-tools = true (14 tools from the shared LLVM, macOS and iOS)
 configure: optimized-compiler-builtins = true (compiler-rt <commit>)
 configure: codegen-tests = true (FileCheck from the shared LLVM)
-shared LLVM backends: 21 (...) = llvm-targets-to-build=all
+shared LLVM backends: 20 (...) = llvm-targets-to-build=all
 compiler_builtins: compiler-rt C intrinsics built (<dir>/libcompiler-rt.a, N objects)
 llvm-tools: 14/14 tools in lib/rustlib/aarch64-apple-ios/bin (rust-objcopy present)
 RustToolchain: llvm-tools 60M (15 files in lib/rustlib/aarch64-apple-ios/bin)

@@ -329,6 +329,90 @@ LLVM_RUST_TOOLS=(
     llvm-ranlib
 )
 
+# The same tools as *ninja targets*. `build-toolchain-only=1` in the preset
+# (inherited from LLVM-On-iOS) makes Swift configure LLVM with
+# `LLVM_BUILD_TOOLS=NO` and `LLVM_TOOL_LLVM_AR_BUILD=NO`, so the build produces
+# the libraries but almost none of the tools: run 40285701494 shipped an
+# otherwise complete SwiftLLVM with 0 of them. rustc needs all of these in
+# `lib/rustlib/<host>/bin` (LLVM_TOOLS in bootstrap + llvm-ranlib), so they are
+# linked from the finished build tree after build-script returns - see
+# build_llvm_tools.
+LLVM_TOOL_BUILD_TARGETS=(
+    llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip llvm-objdump
+    llvm-readobj llvm-size llvm-cov llvm-profdata llvm-as llvm-dis llvm-link
+    llc opt
+)
+
+# build_llvm_tools <build-tree> <label>
+#
+# Builds any of the tools above that the tree does not have yet. Re-running
+# cmake on the existing build tree only *adds* the tool targets (the options
+# are the ones build-toolchain-only turned off); nothing that is already built
+# is rebuilt, because no library flag changes. The tools link against the
+# static libraries that are already there, so this is minutes, not hours.
+# FileCheck and friends live in llvm/utils, which build-toolchain-only turns
+# off with LLVM_INCLUDE_UTILS=NO. They are only needed on the build machine
+# (codegen tests), so only the macOS tree builds them.
+LLVM_UTIL_BUILD_TARGETS=(FileCheck not count)
+
+build_llvm_tools() {
+    local tree="$1" label="$2" with_utils="${3:-}"
+    local wanted=("${LLVM_TOOL_BUILD_TARGETS[@]}") tool
+    local missing=()
+    [[ "${with_utils}" == "utils" ]] && wanted+=("${LLVM_UTIL_BUILD_TARGETS[@]}")
+
+    [[ -f "${tree}/build.ninja" ]] \
+        || die "${label}: ${tree}/build.ninja is missing; the LLVM for this tree was not built"
+    for tool in "${wanted[@]}"; do
+        [[ -e "${tree}/bin/${tool}" ]] || missing+=("${tool}")
+    done
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        log "${label}: all ${#wanted[@]} LLVM tools are already built"
+        return 0
+    fi
+
+    # -DLLVM_BUILD_TOOLS=ON re-enables llvm/tools for the tools that are only
+    # gated by that option; the per-tool options override the explicit NOs from
+    # build-toolchain-only (they are cache options, so this also works on a
+    # tree that was configured hours ago, and nothing already built is
+    # rebuilt: no library flag changes).
+    local options=("-DLLVM_BUILD_TOOLS=ON")
+    # llvm/tools/* each have an option of their own (create_llvm_tool_options);
+    # llvm/utils/* do not - they are gated by LLVM_INCLUDE_UTILS/LLVM_BUILD_UTILS.
+    for tool in "${LLVM_TOOL_BUILD_TARGETS[@]}"; do
+        options+=("-DLLVM_TOOL_$(printf '%s' "${tool}" | tr 'a-z-' 'A-Z_')_BUILD=ON")
+    done
+    [[ "${with_utils}" == "utils" ]] && options+=("-DLLVM_INCLUDE_UTILS=ON" "-DLLVM_BUILD_UTILS=ON")
+    log "${label}: building ${#missing[@]} LLVM tool target(s): ${missing[*]+${missing[*]}}"
+    cmake "${options[@]}" "${tree}" >/dev/null
+    ninja -C "${tree}" "${missing[@]}"
+    report_line "swift LLVM (${label}): built ${#missing[@]} LLVM tool target(s)"
+
+    local built=0
+    for tool in "${wanted[@]}"; do
+        [[ -e "${tree}/bin/${tool}" ]] && built=$((built + 1))
+    done
+    log "${label}: ${built}/${#wanted[@]} LLVM tools present in ${tree}/bin"
+}
+
+# llvm_tool_source_dirs <build-tree> <host>
+#
+# Where a tool may be: the build tree's bin/ first (build_llvm_tools puts them
+# there), then the DESTDIR tree build-script installs into when it does install
+# a host's LLVM (cross-compile hosts are installed under intermediate-install).
+llvm_tool_source_dirs() {
+    local tree="$1" host="$2" base="${SWIFT_BUILD_ROOT}/${SWIFT_BUILD_SUBDIR}" dir
+    printf '%s\n' "${tree}/bin"
+    for dir in \
+        "${base}/intermediate-install/${host}/usr/bin" \
+        "${base}/intermediate-install/${host}/bin" \
+        "${base}/${host}/usr/bin" \
+        "${base}/${host}/bin"; do
+        [[ -d "${dir}" ]] && printf '%s\n' "${dir}"
+    done
+    return 0
+}
+
 # install_llvm_tools <build-tree> <prefix> <expected-platform> <label>
 #
 # Copies the tools above out of an LLVM build tree, dereferencing symlinks
@@ -337,12 +421,23 @@ LLVM_RUST_TOOLS=(
 # the Rust half checks the list again and only enables its llvm-tools step
 # when it is complete.
 install_llvm_tools() {
-    local source="$1" prefix="$2" platform="$3" label="$4"
-    local tool found=0 missing=() wrong=()
+    local source="$1" prefix="$2" platform="$3" label="$4" host="$5"
+    local tool found=0 missing=() wrong=() dir from
+    local dirs=()
+    while IFS= read -r dir; do
+        dirs+=("${dir}")
+    done < <(llvm_tool_source_dirs "${source}" "${host}")
     mkdir -p "${prefix}/bin"
     for tool in "${LLVM_RUST_TOOLS[@]}"; do
-        if [[ -e "${source}/bin/${tool}" ]]; then
-            cp -aL "${source}/bin/${tool}" "${prefix}/bin/${tool}" \
+        from=""
+        for dir in "${dirs[@]+${dirs[@]}}"; do
+            if [[ -e "${dir}/${tool}" ]]; then
+                from="${dir}/${tool}"
+                break
+            fi
+        done
+        if [[ -n "${from}" ]]; then
+            cp -aL "${from}" "${prefix}/bin/${tool}" \
                 || { missing+=("${tool}"); continue; }
             found=$((found + 1))
             if [[ "${platform}" == "IOS" ]] && ! is_ios_macho "${prefix}/bin/${tool}"; then
@@ -401,6 +496,26 @@ install_llvm() {
     [[ -f "${host_llvm}/bin/llvm-config" ]] || die "missing ${host_llvm}/bin/llvm-config; run 'llvm' first"
     [[ -d "${ios_llvm}/lib" ]] || die "missing ${ios_llvm}/lib"
 
+    # The preset builds with `build-toolchain-only=1`, which configures LLVM
+    # with LLVM_BUILD_TOOLS=NO: the trees above are complete but have almost no
+    # tools in bin/. rustc needs 14 of them (and FileCheck for codegen tests),
+    # so they are linked here, from the trees that are already built.
+    require_cmd cmake
+    require_cmd ninja
+    # Not fatal: a tool that cannot be built costs the Rust toolchain its
+    # llvm-tools step (which it then reports as disabled), and must not throw
+    # away a 5.5 h build.
+    local label tree
+    for label in macosx ios; do
+        if [[ "${label}" == "macosx" ]]; then
+            tree="${host_llvm}"
+            build_llvm_tools "${tree}" "${label}" utils || warn "${label}: could not build the LLVM tools"
+        else
+            tree="${ios_llvm}"
+            build_llvm_tools "${tree}" "${label}" || warn "${label}: could not build the LLVM tools"
+        fi
+    done
+
     local macosx_prefix="${SWIFT_LLVM_DIR}/macosx"
     local ios_prefix="${SWIFT_LLVM_DIR}/ios"
     rm -rf "${macosx_prefix}" "${ios_prefix}"
@@ -429,7 +544,7 @@ install_llvm() {
     # list into the stage-1 (macOS) sysroot, so it has to be here too; it
     # also holds FileCheck, which `x.py` requires next to an external LLVM
     # when codegen tests are enabled.
-    install_llvm_tools "${host_llvm}" "${macosx_prefix}" MACOS "macosx/bin"
+    install_llvm_tools "${host_llvm}" "${macosx_prefix}" MACOS "macosx/bin" "macosx-arm64"
     local tool
     for tool in FileCheck not count llvm-lit; do
         if [[ -x "${host_llvm}/bin/${tool}" ]]; then
@@ -444,7 +559,7 @@ install_llvm() {
     # These run on the device: they end up in the Rust toolchain's
     # `lib/rustlib/aarch64-apple-ios/bin`, where rustc looks for `llvm-ar`
     # and `rust-objcopy`. Every one of them is verified to be iOS/arm64.
-    install_llvm_tools "${ios_llvm}" "${ios_prefix}" IOS "ios/bin"
+    install_llvm_tools "${ios_llvm}" "${ios_prefix}" IOS "ios/bin" "iphoneos-arm64"
 
     local description="swiftlang/llvm-project ${SWIFT_BRANCH} ($(llvm_commit))"
 

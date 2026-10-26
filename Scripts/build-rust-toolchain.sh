@@ -861,7 +861,7 @@ LLVMCFG
             report_line "configure: optimized-compiler-builtins = **false** (no compiler-rt sources)"
         fi
 
-        # `codegen-tests`: only affects whether `x.py test` can run LLVM's
+        # codegen-tests: only affects whether 'x.py test' can run LLVM's
         # FileCheck-based codegen tests. It is switched on when the shared
         # LLVM shipped a FileCheck for the build machine.
         if [[ -x "${SWIFT_LLVM_DIR}/macosx/bin/FileCheck" ]]; then
@@ -899,7 +899,7 @@ locked-deps = true
 # toolchain does not ship.
 sanitizers = false
 # The C implementations of the compiler intrinsics (memcpy, __divti3, ...),
-# from compiler-rt. `fetch` fills src/llvm-project/compiler-rt from the same
+# from compiler-rt. 'fetch' fills src/llvm-project/compiler-rt from the same
 # llvm-project commit as the shared LLVM, so this is the default
 # (CompilerBuiltins::BuildLLVMFuncs) that released toolchains use.
 ${compiler_builtins_line}
@@ -930,7 +930,7 @@ download-rustc = false
 # llvm-ar/rust-objcopy there to build static libraries on the device.
 # build-swift-toolchain.sh installs the same list into the shared LLVM.
 ${llvm_tools_line}
-# Codegen tests are only used by `x.py test`; they need FileCheck next to an
+# Codegen tests are only used by 'x.py test'; they need FileCheck next to an
 # external LLVM (sanity.rs), which the shared LLVM provides when built.
 ${codegen_tests_line}
 

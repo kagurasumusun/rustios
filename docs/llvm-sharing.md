@@ -252,6 +252,11 @@ API 変更がそのままコンパイルエラーになります（実ビルド�
   CI を「ビルド」と「パッケージ」の 2 ジョブに分けています
   （[llvm-parity.md](llvm-parity.md) §4.5）。
 
+`build-toolchain-only=1`（LLVM-On-iOS 由来）のため、`build-script` が作る
+`bin/` にはツールが入りません。rustc が必要とする 15 個は、ビルド後に
+既存のツリーへ `ninja` で追加リンクしています
+（[llvm-parity.md](llvm-parity.md) §1.1）。
+
 | 出力 | 用途 |
 | --- | --- |
 | `llvm-macosx-arm64` | macOS 上で動くツール（Swift コンパイラ本体、tablegen、llvm-config） |

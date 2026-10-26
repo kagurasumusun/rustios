@@ -93,8 +93,9 @@ env:
   # again, and the artifact has to come from a run of the same version.
   # 4: matches build-rust-ios.yml (shared LLVM built with all backends). The
   # swift-llvm artifact this workflow consumes must come from a run of the
-  # current CACHE_VERSION, i.e. one whose LLVM has every backend.
-  CACHE_VERSION: "4"
+  # current CACHE_VERSION, i.e. one whose LLVM has every backend and the 15
+  # rustc LLVM tools in bin/.
+  CACHE_VERSION: "5"
   CARGO_INCREMENTAL: "0"
 
 jobs:

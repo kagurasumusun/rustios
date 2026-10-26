@@ -79,7 +79,10 @@ env:
   # backtraces/terminfo on). A tree from 3 has neither, and llvm-project.txt in
   # it has no `targets=` line, which the "Check the restored build" step treats
   # as a miss - so this only makes the miss explicit and immediate.
-  CACHE_VERSION: "4"
+  # 5: install_llvm now links the rustc LLVM tools into the two finished build
+  # trees (the preset's build-toolchain-only=1 leaves bin/ almost empty) before
+  # installing them. Every tree cached under 4 has 0 of the 15 tools.
+  CACHE_VERSION: "5"
   # Bump when the *build* recipe changes (the llvm/install-llvm/install-swift
   # steps of build-swift-toolchain.sh, or the build-script invocation). Edits to
   # verification or packaging must not invalidate the built tree - that is what
