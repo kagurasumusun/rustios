@@ -64,7 +64,7 @@ SWIFT_LLVM_DIR="${SWIFT_LLVM_DIR:-${WORK_DIR}/SwiftLLVM}"
 # cache check cannot drift away from what is actually built (the preset - not
 # this variable - is what build-script is given). Override with LLVM_TARGETS=…
 # to see what another value would look like; the build still follows the preset.
-LLVM_TARGETS="${LLVM_TARGETS:-$(sed -n 's/^llvm-targets-to-build=//p' "${SWIFT_PRESET_FILE}" 2>/dev/null | head -1)}"
+LLVM_TARGETS="${LLVM_TARGETS:-$(sed -n 's/^llvm-targets-to-build=//p' "${SWIFT_PRESET_FILE}" 2>/dev/null | head -1 || true)}"
 LLVM_TARGETS="${LLVM_TARGETS:-all}"
 
 PACKAGE_PREFIX="iphoneos-arm64"

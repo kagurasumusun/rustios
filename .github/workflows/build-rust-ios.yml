@@ -222,18 +222,25 @@ jobs:
           # prefix, so a tree built with an older preset can still land here.
           # The tree records the backend list it was configured with; a
           # different (or missing) value means "not the tree this run needs".
+          # (`if [ -f ]`: with no tree at all, sed would exit 2 and `set -e`
+          # would abort the job - run 40282836710 did exactly that.)
           expected_targets="$(sed -n 's/^llvm-targets-to-build=//p' Scripts/swift-ios-toolchain-presets.ini | head -1)"
-          recorded_targets="$(sed -n 's/^targets=//p' work/SwiftLLVM/llvm-project.txt 2>/dev/null | head -1)"
+          recorded_targets=""
+          if [ -f work/SwiftLLVM/llvm-project.txt ]; then
+            recorded_targets="$(sed -n 's/^targets=//p' work/SwiftLLVM/llvm-project.txt | head -1)"
+          fi
           if [ "${complete}" = true ] && [ "${recorded_targets}" != "${expected_targets}" ]; then
             echo "cached LLVM was built with targets '${recorded_targets:-unknown}', the preset asks for '${expected_targets}': rebuilding" | tee -a swift.log
             complete=false
           fi
           echo "complete=${complete}" >> "${GITHUB_OUTPUT}"
           if [ "${complete}" = true ]; then
-            echo "reusing the cached Swift + LLVM build:" | tee -a swift.log
-            du -sh work/SwiftLLVM work/SwiftToolchain | tee -a swift.log
-            work/SwiftLLVM/ios/bin/llvm-config --version | tee -a swift.log
-            echo "backends: $(work/SwiftLLVM/ios/bin/llvm-config --targets-built)" | tee -a swift.log
+            {
+              echo "reusing the cached Swift + LLVM build:"
+              du -sh work/SwiftLLVM work/SwiftToolchain
+              work/SwiftLLVM/ios/bin/llvm-config --version
+              echo "backends: $(work/SwiftLLVM/ios/bin/llvm-config --targets-built)"
+            } 2>&1 | tee -a swift.log
           else
             echo "no complete cached build for targets '${expected_targets}'; building Swift + LLVM" | tee -a swift.log
           fi

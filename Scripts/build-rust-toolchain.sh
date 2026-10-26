@@ -2310,8 +2310,11 @@ preflight() {
         die "the shared LLVM has no AArch64 backend (backends: ${built_targets}); rustc could not emit arm64 code"
     fi
     expected_targets="$(sed -n 's/^llvm-targets-to-build=//p' \
-        "${REPO_ROOT}/Scripts/swift-ios-toolchain-presets.ini" 2>/dev/null | head -1)"
-    recorded_targets="$(sed -n 's/^targets=//p' "${SWIFT_LLVM_DIR}/llvm-project.txt" 2>/dev/null | head -1)"
+        "${REPO_ROOT}/Scripts/swift-ios-toolchain-presets.ini" 2>/dev/null | head -1 || true)"
+    recorded_targets=""
+    if [[ -f "${SWIFT_LLVM_DIR}/llvm-project.txt" ]]; then
+        recorded_targets="$(sed -n 's/^targets=//p' "${SWIFT_LLVM_DIR}/llvm-project.txt" | head -1)"
+    fi
     backend_count="$(printf '%s' "${built_targets}" | tr ';' ' ' | wc -w | tr -d ' ')"
     log "backends (${backend_count}): ${built_targets}"
     if [[ -n "${expected_targets}" && "${recorded_targets}" != "${expected_targets}" ]]; then
