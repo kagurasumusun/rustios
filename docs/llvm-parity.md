@@ -90,8 +90,8 @@ LLVM 自身の CMake 既定値）。
 | 例外 (EH) | 未指定 → CMake 既定 OFF | `-DLLVM_ENABLE_EH=OFF` | 同一 |
 | RTTI | 未指定 → CMake 既定 OFF | `-DLLVM_ENABLE_RTTI=ON` | **共有側が上位互換**（§4.2） |
 | スレッド | 未指定 → 既定 ON | `-DLLVM_ENABLE_THREADS=ON` | 同一 |
-| zlib（iOS ツリー） | `*-apple-{ios,tvos,watchos,visionos}` では OFF を明示 | `-DLLVM_ENABLE_ZLIB=OFF` | 同一 |
-| zlib（macOS ツリー） | ホスト向けは ON | OFF（両ツリー同じ値しか渡せない） | **差**（§4.1） |
+| zlib（iOS ツリー） | `*-apple-{ios,tvos,watchos,visionos}` では OFF を明示 | OFF（ツリーごとに seed、§2.1） | 同一 |
+| zlib（macOS ツリー） | ホスト向けは ON | ON（ツリーごとに seed、§2.1） | 同一 |
 | zstd | `llvm.libzstd` 既定 **false** → `-DLLVM_ENABLE_ZSTD=OFF` | `-DLLVM_ENABLE_ZSTD=OFF` | 同一 |
 | terminfo | 未指定 → 見つかれば ON | `-DLLVM_ENABLE_TERMINFO=ON` | 同一 |
 | バックトレース | 未指定 → 既定 ON | `-DLLVM_ENABLE_BACKTRACES=ON` | 同一 |
@@ -100,7 +100,7 @@ LLVM 自身の CMake 既定値）。
 | LLVM の utils (FileCheck) | `LLVM_INCLUDE_UTILS` 既定 ON | OFF | macOS ツリーのみ ON にして FileCheck を作る |
 | プラグイン | apple モバイルでは OFF を明示 | 未指定 → CMake 既定（Darwin は `LLVM_ENABLE_PIC` に従い ON） | **共有側が上位互換**（§4.3） |
 | LLVM 自体の LTO | `llvm.thin-lto` 既定 false | 未指定 | 同一 |
-| **バックエンド** | `llvm.targets` 既定 **`all`** | `llvm-targets-to-build=all` | 同一（両者の既定集合を含む上位集合。CI 実測: 20 個 = AArch64;AMDGPU;ARM;AVR;BPF;Hexagon;Lanai;LoongArch;Mips;MSP430;NVPTX;PowerPC;RISCV;Sparc;SPIRV;SystemZ;VE;WebAssembly;X86;XCore） |
+| **バックエンド** | `llvm.targets` 既定 **`all`** | `llvm-targets-to-build=AArch64` | **意図的な縮小**（§4.5） |
 | テスト | `llvm.tests=false` → OFF | `llvm-include-tests=0` | 同一 |
 | libxml2 | OFF を明示 | 未指定（見つかれば ON） | 共有側が上位互換（rustc は使わない） |
 | Z3 | OFF | 未指定 | 実質同一 |
@@ -108,10 +108,27 @@ LLVM 自身の CMake 既定値）。
 
 CMake のオプションは `Scripts/swift-ios-toolchain-presets.ini`
 （`extra-cmake-options` と `llvm-targets-to-build`）にあります。
+
+### 2.1 ツリーごとに違う値: zlib
+
 `extra-cmake-options` は **macOS 用と iOS 用の両ツリーに同じ値**が渡ります
 （`utils/build-script` の cmake 呼び出しで、Swift 自身の `-D` より後ろに
-`${EXTRA_CMAKE_OPTIONS[@]}` が並ぶ）。そのため片方だけ ON にする設定は
-書けません。§4.1 の zlib が差として残っているのはこの理由です。
+`${EXTRA_CMAKE_OPTIONS[@]}` が並ぶ）。ところが zlib だけは、rust の参照ビルドで
+**ツリーによって値が違います**（ホストは ON、`*-apple-ios` は OFF。`llvm.rs`:
+「Zlib fails to link properly」）。そこで `build-swift-toolchain.sh` の
+`seed_llvm_trees` が、`build-script` を呼ぶ前に各ツリーの `CMakeCache.txt` に
+値を書きます:
+
+- まだ configure されていないツリー: 1 行の `CMakeCache.txt`
+  （`LLVM_ENABLE_ZLIB:BOOL=OFF` など）を置く。cmake はコマンドラインに無い
+  キャッシュ値をそのまま使うので、configure はこの値で走ります。
+- 既に configure 済みのツリー: `cmake -DLLVM_ENABLE_ZLIB:BOOL=… .` で同じ値を
+  設定してから `build-script` に渡す（`reconfigure` はこの値を保持します）。
+
+したがって preset の `extra-cmake-options` に zlib は書かず（書くと両ツリーを
+上書きしてしまう）、`install_llvm` が両ツリーの `llvm/Config/llvm-config.h` と
+`llvm-config --system-libs` で値を確認します（違えば `die`）。両方の値は
+`SwiftLLVM/llvm-project.txt` にも記録され、レポートに出ます。
 
 > 以前の版のこの文書は zstd を「差」と書いていましたが、それは誤りでした。
 > `llvm.libzstd` の既定は `false`（`config.rs`: `llvm_libzstd.unwrap_or(false)`）
@@ -147,24 +164,26 @@ macOS ランナーで stage1+stage2 が 35 分程度だったところから増�
 
 ## 4. 残る差と、その影響の限定
 
-「1% も落とさない」に対する答えは、**上位互換の差しか残っていない**ことです。
-下の 4.1 だけが「共有ツリーのほうが少ない」差で、しかも成果物には現れません。
+残っている差は 2 種類だけです。
 
-### 4.1 zlib（macOS ツリーのみ、成果物には影響しない）
+1. **共有ツリーのほうが上位互換**なもの（§4.2 RTTI、§4.3 プラグイン、
+   libxml2）。どちらも rustc が使わない機能が増えているだけで、失うものが
+   ありません。
+2. **バックエンドを AArch64 だけに絞ったこと**（§4.5）。これは利用者の判断で
+   入れたスコープの縮小で、参照ビルド（`llvm.targets=all`）に対する能力差が
+   1 つだけ残ります: この rustc は **他のターゲット向けにコードを生成できない**。
 
-- `--extra-cmake-options` は両ツリーに同じ値が渡るため、zlib は「両方 OFF」か
-  「両方 ON」しか選べません（§2 の注記）。
-- 共有ツリーは **OFF** を選びました。これは rust が `*-apple-ios` 向けに
-  明示する値（`llvm.rs`: 「Zlib fails to link properly」）と同じで、
-  **出荷される iOS ツリーは参照ビルドと完全に一致**します。
-- 差が残るのは macOS ツリー（＝ビルド機で動く stage1 rustc がリンクする LLVM）
-  だけです。rust のホスト向け LLVM は zlib ON なので、stage1 rustc は
-  `SHF_COMPRESSED` なデバッグセクションを読める、という違いがあります。
-- 成果物への影響: std は release・デバッグ情報なしで作るので圧縮セクションは
-  存在せず、`-Zdebuginfo-compression` は nightly 専用（このビルドは
-  `channel = "stable"`）。**端末で動く rustc の能力に差はありません。**
-- 将来これが必要になったら、macOS ツリーだけ別の cmake オプションで
-  ビルドする（`build-script` を 2 回呼ぶ）ことになり、この文書の範囲外です。
+### 4.1 zlib（差ではなくなった）
+
+- rust の参照ビルドは、ホスト向け LLVM を zlib **ON**、`*-apple-ios` 向けを
+  **OFF** で作ります（`llvm.rs`: 「Zlib fails to link properly」）。
+- 以前は `--extra-cmake-options` が両ツリーに同じ値を渡すため「両方 OFF」を
+  選び、macOS ツリー（＝ビルド機で動く stage1 rustc がリンクする LLVM）だけが
+  参照ビルドより少ない状態でした。
+- 現在は `seed_llvm_trees` が各ツリーの CMake キャッシュに別々の値を入れるので
+  （§2.1）、**iOS ツリー OFF / macOS ツリー ON** と、参照ビルドと同じ値に
+  なっています。`install_llvm` は `llvm-config.h` の値と `-lz` の有無で両方を
+  検証し、`SwiftLLVM/llvm-project.txt` とレポートに両方の値を残します。
 
 ### 4.2 RTTI（共有側が上位互換）
 
@@ -193,17 +212,29 @@ CMake 既定（Darwin では `LLVM_ENABLE_PIC` に従い ON）です。
   `-Z` は stable チャネルでは使えず、iOS の ASan ランタイムは Xcode が
   提供します。**観測できる差はありません**。
 
-### 4.5 バックエンドを `all` にしたコストと CI の分割
+### 4.5 バックエンドを AArch64 だけにしたこと（意図的なスコープ判断）
 
-- 実測（`docs/llvm-sharing.md` の CI 履歴）:
-  - `AArch64` だけ: compiler-rt の builtins が失敗
-    （`-arm-add-build-attributes` は ARM バックエンドにある）;
-  - `AArch64;ARM;X86`: 約 4 時間で通るが、AMDGPU/NVPTX/RISCV/WebAssembly/…
-    が無い。**rustc がそのターゲットのコードを生成できない**ので、参照ビルド
-    に対する能力差になる;
-  - `all`: 両ツリーで約 5 時間 30 分。パッケージングまで同じジョブでやると
-    6 時間のジョブ上限に当たる（実測: 5 時間 55 分でパッケージ中に打ち切り）。
-- 対処: `.github/workflows/build-rust-ios.yml` を 2 ジョブに分割しました。
+- 共有 LLVM は `llvm-targets-to-build=AArch64` です。Swift も rustc も
+  arm64 上で動き、rustc のターゲットは `aarch64-apple-ios` だけなので、
+  他の 19 バックエンドはビルド時間と成果物サイズにしかなりません。
+- **失うもの**: この rustc は `aarch64-apple-ios` 以外のターゲット向けに
+  コードを生成できません（例: 端末上から `--target wasm32-unknown-unknown` や
+  `--target x86_64-unknown-linux-gnu` を使うことはできません）。参照ビルド
+  （`llvm.targets=all`）に対する唯一の実質的な能力差で、
+  「iOS 向けに Swift と Rust をビルドする」という目的の範囲では差になりません。
+  元に戻すときは preset の `llvm-targets-to-build` を広げるだけです
+  （`docs/llvm-sharing.md` の CI 履歴に、`all` と `AArch64;ARM;X86` の実測が
+  あります）。
+- `AArch64` だけで通るようになった理由: 以前は compiler-rt の builtins が
+  32bit ARM（`-arm-add-build-attributes` は ARM バックエンドのオプション）を
+  コンパイルするため失敗していました。builtins は **ホスト向けにしか作られて
+  いません**（`build-script-impl` が Apple の全ホストで
+  `-DCOMPILER_RT_ENABLE_IOS:BOOL=FALSE` などを渡す）ので、
+  `-DCOMPILER_RT_BUILD_BUILTINS:BOOL=OFF` で切っても **端末に出荷されるものは
+  変わりません**。compiler-rt のそれ以外（sanitizer ランタイム）は従来通りです。
+- ビルド時間はこの変更で短くなります（実測は §5）。
+- 6 時間のジョブ上限に対する保険として、`.github/workflows/build-rust-ios.yml`
+  はビルドとパッケージを 2 ジョブに分けたままにしています。
   - `swift`: ビルドしてキャッシュ（`swift-built-*`）に保存するだけ;
   - `swift_package`: 同じキーでキャッシュを復元し、パッケージ・検証・
     アップロードを行う。
@@ -279,6 +310,7 @@ RustToolchain: llvm-tools 380M (15 files in lib/rustlib/aarch64-apple-ios/bin)
 
 - Swift ツールチェーンの中身（stdlib の同梱範囲）は
   [llvm-sharing.md](llvm-sharing.md) §0 の成果物構成の話で、ここでは扱いません。
-- `Rust.xcframework` の静的化（C API 付き）は
-  [llvm-sharing.md](llvm-sharing.md) §6 の継続課題です。
+- `Rust.xcframework` の静的化と C API は
+  [llvm-sharing.md](llvm-sharing.md) §6 で扱います（C API は rustc 本体に
+  コンパイルする方式で、LLVM の設定とは独立です）。
 - Swift 側のビルド時間そのものの短縮（ccache、分散ビルドなど）。

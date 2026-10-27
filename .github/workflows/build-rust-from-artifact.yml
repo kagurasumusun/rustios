@@ -95,6 +95,9 @@ env:
   # swift-llvm artifact this workflow consumes must come from a run of the
   # current CACHE_VERSION, i.e. one whose LLVM has every backend and the 15
   # rustc LLVM tools in bin/.
+  # 5: the shared LLVM is built with llvm-targets-to-build=AArch64 and per-tree
+  # zlib (iOS OFF, macOS ON); Rust.xcframework needs the run that also carries
+  # patches/0003, i.e. a swift-llvm of this CACHE_VERSION or newer.
   CACHE_VERSION: "5"
   CARGO_INCREMENTAL: "0"
 

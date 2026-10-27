@@ -50,6 +50,9 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 | 要求 | 状態 |
 | --- | --- |
 | **両方のコンパイラが機能を失わない** | **CI で成功**（run 40402352677）: 共有 LLVM は 20 バックエンド（`llvm-targets-to-build=all`、rust の `llvm.targets` 既定と同じ）、rustc 用ツール 15/15 が iOS ツリーに、`llvm-tools = true` / `optimized-compiler-builtins = true` / `codegen-tests = true`。詳細は [llvm-parity.md](llvm-parity.md) |
+| **バックエンドは AArch64 のみ**（2026-10-27 の方針） | **実装済み・検証中**: `llvm-targets-to-build=AArch64`。compiler-rt の builtins（ホスト専用）を切ることで通るようにしました。**失うもの**: `aarch64-apple-ios` 以外へのクロスコンパイル（[llvm-parity.md](llvm-parity.md) §4.5） |
+| **zlib もツリーごとに参照ビルドと同じ** | **実装済み・検証中**: iOS ツリー OFF / macOS ツリー ON。preset ではなく `seed_llvm_trees` が各ツリーの CMake キャッシュに入れ、`install_llvm` が `llvm-config.h` と `-lz` で検証（[llvm-parity.md](llvm-parity.md) §2.1） |
+| **`Rust.xcframework` が C API をエクスポートする** | **実装済み・検証中**: C API を `rustc_driver_impl` にコンパイルする `patches/0003` で、静的アーカイブが `rustios_run` / `rustios_version` を出す。§6 |
 | Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、`swift-frontend` は IOS/arm64、`SwiftToolchain` 544 MB。`swiftc`/`swift`/`swift-driver` は macOS のホストドライバ） |
 | Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 240 MB、`LLVM.xcframework` 53 MB。iOS 側 `lib/*.a` のメンバーを `vtool` で検査し `IOS/arm64` を確認） |
 | Rust を Swift の LLVM でビルドする | **CI で成功**（run 40402352677）。`RustToolchain` 112 MB + `RustStd` 352 MB + `Rust.xcframework` 192 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
@@ -107,6 +110,17 @@ CI の履歴:
    （compiler-rt の C 実装 145 objects）、`codegen-tests = true`、
    `lto=thin`/`codegen-units=1` でビルド。**C API 付き `Rust.xcframework` だけが
    未達**（`E0463`、§6）。
+10. **バックエンドを AArch64 だけにし、残りを全部閉じる回**（2026-10-27、検証中: run 40470888454）。
+    * `llvm-targets-to-build=AArch64`。以前これを失敗させていたのは compiler-rt の
+      builtins（ホスト専用にしか作られない）なので、
+      `-DCOMPILER_RT_BUILD_BUILTINS=OFF` で切った。端末に出荷されるものは変わらない。
+    * zlib をツリーごとに設定（iOS OFF / macOS ON = rust の参照ビルドと同じ）。
+      `seed_llvm_trees` が CMake キャッシュに入れ、`install_llvm` が検証する。
+    * C API を `rustc_driver_impl` にコンパイル（`patches/0003`）し、
+      静的アーカイブが `rustios_run` / `rustios_version` をエクスポートするように
+      した。`build_xcframework` はシンボルを確認してから LLVM を同梱し、
+      テストアプリを実際にリンクする（§6「C API の解決」）。
+    * 失うもの: `aarch64-apple-ios` 以外へのクロスコンパイル（§4.5）。
 
 ---
 
@@ -245,21 +259,24 @@ API 変更がそのままコンパイルエラーになります（実ビルド�
 `nyxian_iphoneos_arm64_crosscompiler` を元にしたプリセットで、LLVM を 2 回
 ビルドします（同じソース、同じターゲット構成）。
 
-`llvm-targets-to-build=all` です（[llvm-parity.md](llvm-parity.md) §2）。
+`llvm-targets-to-build=AArch64` です: Swift も rustc も arm64 上で動き、
+rustc のターゲットは `aarch64-apple-ios` だけなので、他のバックエンドは
+ビルド時間とサイズにしかなりません（[llvm-parity.md](llvm-parity.md) §4.5）。
 
-共有 LLVM は**どちらのコンパイラも機能を失わない**ように構成します。rust が
-自前でビルドする LLVM の `llvm.targets` は既定で `all`、Swift の既定は
-`X86;ARM;AArch64;PowerPC;SystemZ;Mips;RISCV;WebAssembly;AVR;BPF` で、
-`all` は両方を含む上位集合です。途中の値は実測で却下しました:
+その代わり、この rustc は **`aarch64-apple-ios` 以外のターゲット向けに
+コードを生成できません**。参照ビルド（`llvm.targets=all`）に対する唯一の
+実質的な能力差で、利用者の判断（2026-10-27）で受け入れています。
 
-* `AArch64` だけ: compiler-rt の builtins が `-arm-add-build-attributes`
-  （ARM バックエンドが登録するオプション）で失敗;
-* `AArch64;ARM;X86`: 約 4 時間で通るが、AMDGPU/NVPTX/RISCV/WebAssembly/… が
-  無く、**rustc がそれらのターゲット向けにコードを生成できない**;
-* `all`: 両ツリーで約 5 時間 30 分。同じジョブでパッケージまで行うと 6 時間の
-  ジョブ上限に当たる（実測 5 時間 55 分でパッケージ中に打ち切り）ため、
-  CI を「ビルド」と「パッケージ」の 2 ジョブに分けています
-  （[llvm-parity.md](llvm-parity.md) §4.5）。
+これを通すために compiler-rt の builtins を `-DCOMPILER_RT_BUILD_BUILTINS=OFF`
+で切っています。builtins は 32bit ARM 向けのコードを含む唯一の部分で、しかも
+**ホスト向けにしか作られていない**（`build-script-impl` は Apple の全ホストで
+`-DCOMPILER_RT_ENABLE_IOS:BOOL=FALSE` を渡す）ため、端末に出荷されるものは
+変わりません。以前 `AArch64` だけで失敗していたのはこの builtins です
+（`-arm-add-build-attributes` は ARM バックエンドのオプション）。
+
+zlib はツリーごとに値が違います（iOS OFF / macOS ON、どちらも rust の参照
+ビルドと同じ）。`--extra-cmake-options` は両ツリー共通なので、preset ではなく
+各ツリーの CMake キャッシュに入れています（[llvm-parity.md](llvm-parity.md) §2.1）。
 
 `build-toolchain-only=1`（LLVM-On-iOS 由来）のため、`build-script` が作る
 `bin/` にはツールが入りません。rustc が必要とする 15 個は、ビルド後に
@@ -419,7 +436,7 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | rust-lang 版 LLVM との API 差 | **2 件検出・パッチ適用**（`PGOOptions` の vfs 引数、`stdc++`→`libc++`）。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`） | **一部達成**: run 40258441852 と 40269093072 で rlib のオブジェクトをまとめた**静的アーカイブ**（`libRustCompiler.a`、展開 685 MB / xz 96 MB、4831 objects / 329 rlibs）を確認。ただし **C API（`rustios.h` / `rustios_run`）は未達**（`"c_api": false`、4 通りすべて `E0463`）。理由は下の「静的ドライバ」節 |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`）+ C API | **静的アーカイブは CI で確認済み**（run 40258441852 / 40269093072 で 4831 objects / 329 rlibs）。C API は run 40428990713 まで**未達**（`"c_api": false`、4 通りすべて `E0463`）→ **方式を変更**（下の「C API の解決」節）: C API を `rustc_driver_impl` にコンパイルする `patches/0003` で、静的アーカイブ自体が `rustios_run` / `rustios_version` をエクスポートします。**検証中**（次の CI 実行で `c_api: true` とリンクテストを確認） |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（`AArch64;ARM;X86` で実測）、`all` では約 5 h 30 m（実測 5 h 55 m でパッケージ中に打ち切り）→ CI をビルド/パッケージの 2 ジョブに分割。Rust は stage1 + stage2 で 1 h 02 m（実測、キャッシュ利用の warm ビルド） |
 
@@ -475,7 +492,9 @@ iOS 用）と `libderive_where-*.dylib`（macOS 用、stage1/stage2 の 3 種類
 **要求された hash の `derive_where` がどこにも無い**。`derive_where` は
 proc-macro crate なので `.dylib` しか作られず、iOS 向け `rustc_driver_impl` の
 メタデータが要求する版と一致しない。探索範囲を広げても解決しないため、
-この経路は**未達のまま**にしている（下の静的アーカイブで代替）。
+この経路は**諦めた**（下の「C API の解決」）。`build_xcframework` は
+`patches/0003` が当たっていないツリーのためにだけ、この 4 通りを
+フォールバックとして残しています。
 
 一方、**フォールバックは機能した**（run 40269093072 でも同じ）: 4 通りが失敗したあと、rlib の中の
 オブジェクトを `libtool -static` で 1 本の `libRustCompiler.a` にまとめ、
@@ -483,8 +502,35 @@ proc-macro crate なので `.dylib` しか作られず、iOS 向け `rustc_drive
 `"c_api": false`、展開 685 MB → xz 96 MB、`ar -t` に `rustc_driver_impl` の
 オブジェクトを含むことを確認。4831 objects / 329 rlibs）。オブジェクトは
 crate メタデータを必要としないので、C シムが失敗しても「静的ライブラリ」
-という要求は満たせる。**C API 付き（第 1 段）は未達**で、`rustios.h` /
-`rustios_run()` は現時点では使えない。
+という要求は満たせます。
+
+### C API の解決（`patches/0003-rustc-1.94.0-rustios-c-api.patch`）
+
+上の 4 通りがすべて `E0463` だったのは、**静的アーカイブに crate メタデータが
+無い**ことの帰結です。シムの crate は `extern crate rustc_driver_impl` を
+解決しないとコンパイルできず、そのメタデータ（`.rmeta`）は rlib の中に
+あっても、そこから読み込む `derive_where` の proc-macro dylib がビルド機の
+cargo ディレクトリにしか存在しません。探索範囲をどう並べても、
+「iOS 向け rustc_driver_impl が要求する hash の dylib」は作られていないのです。
+
+そこで**要求の側を変えました**。C のエントリポイント（`rustios_version` /
+`rustios_run`）を `rustc_driver_impl` 自身のモジュールとして追加し、bootstrap に
+本体と同じメタデータでコンパイルさせます。オブジェクトは最初から
+`libRustCompiler.a` の中に入るので、アプリのリンク時にも実行時にも
+メタデータ解決は不要です。
+
+* パッチは `compiler/rustc_driver_impl/src/lib.rs` に 1 行
+  （`mod rustios_c_api;`）と、同じディレクトリへのモジュール 1 個を足すだけ。
+  モジュールはパッチの中にあります（crate 内のモジュールである必要があり、
+  リポジトリへの `#[path]` 参照は rustc のソースをこのリポジトリの配置に
+  依存させてしまうため）。
+* `build_xcframework` は rlib をまとめた `libRustCompiler.a` を作り、
+  `nm -g` に `_rustios_run` / `_rustios_version` があることを確認して
+  `"c_api": true` とします。ヘッダ（`Scripts/rustios-driver/include/rustios.h`）を
+  `Headers/` に入れ、最後に `clang -target arm64-apple-ios…` で
+  テストアプリを実際にリンクします。
+* スタンドアロンのシム（`Scripts/rustios-driver/rustios_driver.rs`）は、
+  パッチが当たっていないツリー用のフォールバックとして残しています。
 
 既知の割り切り:
 
