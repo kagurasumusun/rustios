@@ -45,13 +45,14 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 
 あるいは分けたまま `rustc --sysroot="$PWD/RustStd/usr" ...` と渡せます。
 
-### 現状（2026-10-24）
+### 現状（2026-10-27）
 
 | 要求 | 状態 |
 | --- | --- |
-| Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、`swift-frontend` は IOS/arm64、`SwiftToolchain` 384 MB。`swiftc`/`swift`/`swift-driver` は macOS のホストドライバ） |
-| Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 96 MB、`LLVM.xcframework` 44 MB。iOS 側 `lib/*.a` のメンバーを `vtool` で検査し `IOS/arm64` を確認） |
-| Rust を Swift の LLVM でビルドする | **CI で成功**（run 40144263022）。`RustToolchain` 35 MB + `RustStd` 256 MB + `Rust.xcframework` 30 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
+| **両方のコンパイラが機能を失わない** | **CI で成功**（run 40402352677）: 共有 LLVM は 20 バックエンド（`llvm-targets-to-build=all`、rust の `llvm.targets` 既定と同じ）、rustc 用ツール 15/15 が iOS ツリーに、`llvm-tools = true` / `optimized-compiler-builtins = true` / `codegen-tests = true`。詳細は [llvm-parity.md](llvm-parity.md) |
+| Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、`swift-frontend` は IOS/arm64、`SwiftToolchain` 544 MB。`swiftc`/`swift`/`swift-driver` は macOS のホストドライバ） |
+| Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 240 MB、`LLVM.xcframework` 53 MB。iOS 側 `lib/*.a` のメンバーを `vtool` で検査し `IOS/arm64` を確認） |
+| Rust を Swift の LLVM でビルドする | **CI で成功**（run 40402352677）。`RustToolchain` 112 MB + `RustStd` 352 MB + `Rust.xcframework` 192 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
 | Rust 専用の LLVM を別にビルドしない | **実装済み**（`src/llvm-project` の LLVM は fetch しない、`llvm-config` を渡す）。`compiler-rt` だけは同じコミットから取る（[llvm-parity.md](llvm-parity.md)） |
 | バージョン整合の証拠 | §1 / §2 |
 | std をツールチェーンから分離 | **実装済み**（`RustStd`）。`RustToolchain` 側に std が漏れていないことを `package` が確認 |
@@ -98,6 +99,14 @@ CI の履歴:
    * ビルドキャッシュのキーがスクリプト全体のハッシュで、検証コードの修正でも
      5.5 時間の再ビルドになっていた → プリセット＋手動の `SWIFT_BUILD_RECIPE`。
      復元したツリーはキー一致ではなく**中身**で判定する。
+9. **共有 LLVM の能力を rust に揃えた回**（run 40402352677、3 時間 36 分で全成功）。
+   `llvm-targets-to-build=all`（20 バックエンド）、backtraces/terminfo/unreachable
+   の設定を rust と同一にし、`build-toolchain-only=1` のせいで空だった
+   `bin/` に rustc 用 15 ツールをビルド後に追加。Rust 側は
+   `llvm-tools = true`（14/14 が sysroot に）、`optimized-compiler-builtins = true`
+   （compiler-rt の C 実装 145 objects）、`codegen-tests = true`、
+   `lto=thin`/`codegen-units=1` でビルド。**C API 付き `Rust.xcframework` だけが
+   未達**（`E0463`、§6）。
 
 ---
 
@@ -449,8 +458,8 @@ stage2 のツリーには `libderive_where-720e60ae…dylib`（iOS 側）と
 `error: unknown unstable option: `verbose`` で即座に落ちた**。`-Z verbose` は
 rustc 1.94 のオプションではない（診断は `-Z verbose-internals`）。
 
-修正後（`-Z verbose-internals`、run 40269093072）は **4 通りすべてが実際に
-走り、4 通りすべて `E0463`** だった:
+修正後（`-Z verbose-internals`、run 40269093072 と 40402352677）は
+**4 通りすべてが実際に走り、4 通りすべて `E0463`** だった:
 
 ```
 attempt 0: --extern for the cargo-built driver, cargo directories first

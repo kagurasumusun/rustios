@@ -113,11 +113,36 @@ llvm_version() {
             | head -3 | paste -sd. -
         return
     fi
+    # The packaging job restores the installed trees, not the sources: take
+    # the version that install_llvm recorded there instead of "unknown" (it
+    # ends up in the artifact names).
+    if [[ -f "${SWIFT_LLVM_DIR}/llvm-project.txt" ]]; then
+        local recorded
+        recorded="$(sed -n 's/^version=//p' "${SWIFT_LLVM_DIR}/llvm-project.txt" | head -1)"
+        if [[ -n "${recorded}" ]]; then
+            printf '%s\n' "${recorded}"
+            return
+        fi
+    fi
     echo unknown
 }
 
 llvm_commit() {
-    git -C "${SWIFT_WORKSPACE_DIR}/llvm-project" rev-parse --short HEAD 2>/dev/null || echo unknown
+    local short
+    short="$(git -C "${SWIFT_WORKSPACE_DIR}/llvm-project" rev-parse --short HEAD 2>/dev/null || true)"
+    if [[ -n "${short}" ]]; then
+        printf '%s\n' "${short}"
+        return
+    fi
+    if [[ -f "${SWIFT_LLVM_DIR}/llvm-project.txt" ]]; then
+        local recorded
+        recorded="$(sed -n 's/^commit=//p' "${SWIFT_LLVM_DIR}/llvm-project.txt" | head -1)"
+        if [[ -n "${recorded}" ]]; then
+            printf '%s\n' "${recorded:0:10}"
+            return
+        fi
+    fi
+    echo unknown
 }
 
 # Full 40-character commit: the Rust half fetches compiler-rt at this commit.

@@ -215,37 +215,65 @@ CMake 既定（Darwin では `LLVM_ENABLE_PIC` に従い ON）です。
   バックエンドを減らすことですが、そのときはこの文書とレポートに
   「どのバックエンドを落としたか」を必ず書きます（黙って減らさない）。
 
-## 5. CI でどう確認しているか
+## 5. CI でどう確認しているか（実測）
 
-`artifacts/REPORT.txt`（PR コメントに出る）に、次の行が追加されます。
+`artifacts/REPORT.txt`（PR コメントに出る）に、次の行が出ます。以下は
+**run 40402352677（`llvm-targets-to-build=all`、2026-10-27）の実出力**です。
+
+Swift 側:
 
 ```
-swift LLVM (macosx): built 18 LLVM tool target(s)
-swift LLVM (ios): built 14 LLVM tool target(s)
-swift LLVM (ios/bin): 15/15 rustc LLVM tools installed
+swift LLVM (macosx): built 16 LLVM tool target(s)
+swift LLVM (ios): built 15 LLVM tool target(s)
 swift LLVM (macosx/bin): 15/15 rustc LLVM tools installed
 swift LLVM (macosx/bin): FileCheck present
+swift LLVM (ios/bin): 15/15 rustc LLVM tools installed
 swift LLVM: 15/15 rustc LLVM tools present and iOS/arm64
-swift LLVM: 20 backends (AArch64;AMDGPU;ARM;AVR;BPF;...;XCore)
+swift LLVM: 20 backends (AArch64;AMDGPU;ARM;AVR;BPF;Hexagon;Lanai;LoongArch;Mips;MSP430;NVPTX;PowerPC;RISCV;Sparc;SPIRV;SystemZ;VE;WebAssembly;X86;XCore)
 swift LLVM: backends match the preset (llvm-targets-to-build=all)
-configure: llvm-tools = true (14 tools from the shared LLVM, macOS and iOS)
-configure: optimized-compiler-builtins = true (compiler-rt <commit>)
-configure: codegen-tests = true (FileCheck from the shared LLVM)
-shared LLVM backends: 20 (...) = llvm-targets-to-build=all
-compiler_builtins: compiler-rt C intrinsics built (<dir>/libcompiler-rt.a, N objects)
-llvm-tools: 14/14 tools in lib/rustlib/aarch64-apple-ios/bin (rust-objcopy present)
-RustToolchain: llvm-tools 60M (15 files in lib/rustlib/aarch64-apple-ios/bin)
+swift LLVM: 265 static libraries (ios/lib)
 ```
+
+Rust 側:
+
+```
+shared LLVM backends: 20 (...) = llvm-targets-to-build=all
+shared LLVM preflight: 21.0.0, 199 libraries, iOS slice confirmed (3 sampled)
+configure: llvm-tools = true (14 tools from the shared LLVM, macOS and iOS)
+configure: optimized-compiler-builtins = true (compiler-rt 903b9faaa)
+configure: codegen-tests = true (FileCheck from the shared LLVM)
+llvm-tools: 14/14 tools in lib/rustlib/aarch64-apple-ios/bin (rust-objcopy present)
+compiler_builtins: compiler-rt C intrinsics built (out/libcompiler-rt.a, 145 objects)
+compiler_builtins: build script emitted the optimized-c cfg
+RustToolchain: llvm-tools 380M (15 files in lib/rustlib/aarch64-apple-ios/bin)
+```
+
+成果物（同じ run）:
+
+| 成果物 | サイズ | 前回（`AArch64;ARM;X86`、llvm-tools 無し） |
+| --- | --- | --- |
+| `SwiftLLVM-…-21.1.6.tar.xz` | 240 M | 96 M |
+| `SwiftToolchain-…-6.4.0.tar.xz` | 544 M | 480 M |
+| `LLVM.xcframework-…` | 53 M | 44 M |
+| `RustToolchain-…-1.94.0.tar.xz` | 112 M | 35 M（llvm-tools の 380M 展開分を含む） |
+| `RustStd-…-1.94.0.tar.xz` | 352 M | 256 M（compiler-rt の C 実装を含む） |
+| `Rust.xcframework-…` | 192 M | 96 M（同じく compiler-rt を含む） |
 
 - ツール（`llvm-tools`）が有効になるのは、**macOS と iOS の両ツリーに
   14 個すべてが揃っているときだけ**です。1 つでも欠ければ
   `llvm-tools = false` に落として理由をレポートに残します（6 時間かけた
-  ビルドを、道具が 1 つ無いせいで落とさないため）。
+  ビルドを、道具が 1 つ無いせいで落とさないため）。要求される一覧は
+  bootstrap のソース（`const LLVM_TOOLS`）から読むので、Rust を上げて
+  一覧が変わっても configure の時点で分かります。
 - バックエンドは、プリセットの値（`all`）と `llvm-config --targets-built`
   の答えを突き合わせます。違えば
   `swift LLVM: **backends differ**` と、Rust 側では
   `shared LLVM backends: **N** ... - not full parity` が出ます。
   `AArch64` が無い場合だけは rustc が動かないので即エラーです。
+- ビルド時間（実測）: Swift のビルド 2 h 25 m + 梱包 25 m + Rust 1 h 25 m、
+  合計 3 h 36 m（run 40402352677）。`all` でも 6 時間のジョブ上限に対して
+  余裕があり、ジョブ分割はそのまま維持します（別の run では 5 h 55 m に
+  達したため）。
 
 ## 6. この文書の範囲外
 

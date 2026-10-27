@@ -324,7 +324,7 @@ jobs:
             echo "Run: ${RUN_URL}"
             echo
             if [ "${JOB_STATUS}" = "success" ]; then
-              echo "Swift 6.4 and its LLVM were built for iOS/arm64. Packaging and verification run in the `swift_package` job."
+              echo "Swift 6.4 and its LLVM were built for iOS/arm64. Packaging and verification run in the swift_package job."
             else
               echo "The Swift half failed. Tail of swift.log:"
             fi
