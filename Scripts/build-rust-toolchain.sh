@@ -1949,7 +1949,7 @@ build_xcframework() {
                 -C debuginfo=0 \
                 -Z verbose-internals \
                 "$@" \
-                -o "${out_dir}/lib/libRustCompiler.a" \
+                -o "${out_dir}/static-driver.a" \
                 "${SCRIPT_DIR}/rustios-driver/rustios_driver.rs" \
                 > "${log_path}" 2>&1
         }
@@ -2011,100 +2011,145 @@ build_xcframework() {
             sed -n "${start},$((start + 13))p" "${log_path}"
         }
 
-        local flags_cargo=() flags_sysroot=() flags_stage2=()
-        append_dependency_flags flags_cargo ${cargo_deps[@]+"${cargo_deps[@]}"} \
-            ${sysroot_deps[@]+"${sysroot_deps[@]}"} ${target_deps[@]+"${target_deps[@]}"} \
-            ${discovered[@]+"${discovered[@]}"}
-        append_dependency_flags flags_sysroot ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
-            ${target_deps[@]+"${target_deps[@]}"} ${cargo_deps[@]+"${cargo_deps[@]}"} \
-            ${discovered[@]+"${discovered[@]}"}
-        append_dependency_flags flags_stage2 ${target_deps[@]+"${target_deps[@]}"} \
-            ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
-            ${discovered[@]+"${discovered[@]}"}
-
-        local attempt="" attempt_log="" attempt_names=() attempt_logs=()
-        try_attempt() {
-            local slug="$1" description="$2"
-            shift 2
-            attempt_log="${out_dir}/static-driver-${slug}.log"
-            attempt_names+=("${description}")
-            attempt_logs+=("${attempt_log}")
-            log "  static driver attempt: ${description}"
-            if try_static_driver "${attempt_log}" "$@"; then
-                attempt="${description}"
-                return 0
-            fi
-            return 1
+        # archive_defines <archive> <symbol...>: does the archive define all
+        # of these (in nm's Mach-O spelling, i.e. with a leading underscore)?
+        archive_defines() {
+            local lib="$1" symbols sym
+            shift
+            command -v nm >/dev/null 2>&1 || return 1
+            symbols="$(nm -g "${lib}" 2>/dev/null || true)"
+            for sym in "$@"; do
+                case "${symbols}" in
+                    *"_${sym}"*) ;;
+                    *) return 1 ;;
+                esac
+            done
+            return 0
         }
 
-        if [[ -n "${cargo_driver}" ]] \
-            && try_attempt "pinned-driver" \
-                "--extern for the cargo-built driver, cargo directories first" \
-                "--extern" "rustc_driver_impl=${cargo_driver}" \
-                ${flags_cargo[@]+"${flags_cargo[@]}"}; then
-            :
-        elif try_attempt "cargo-first" "cargo directories first" \
-                ${flags_cargo[@]+"${flags_cargo[@]}"}; then
-            :
-        elif try_attempt "sysroot-first" "the sysroot first" \
-                ${flags_sysroot[@]+"${flags_sysroot[@]}"}; then
-            :
-        elif try_attempt "stage2-first" "stage-2 compiler directories first" \
-                ${flags_stage2[@]+"${flags_stage2[@]}"}; then
-            :
+        library="libRustCompiler.a"
+
+        # The C API is compiled into rustc_driver_impl itself
+        # (patches/0003), so the archive assembled from the rlibs exports
+        # rustios_run and rustios_version. This is the normal path: it needs
+        # no crate metadata at all, which is exactly what the standalone shim
+        # below can never get.
+        if merge_static_archive "${out_dir}/lib/${library}" \
+                ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"}; then
+            static_lib="true"
+            if archive_defines "${out_dir}/lib/${library}" rustios_run rustios_version; then
+                c_api="true"
+                report_line "xcframework: static archive = ${merged_objects} objects from ${merged_rlibs} rlibs, C API exported (rustios_run, rustios_version)"
+            else
+                report_line "xcframework: static archive = ${merged_objects} objects from ${merged_rlibs} rlibs, but **no C API** - patches/0003 is not applied to this tree"
+            fi
         fi
 
-        if [[ -n "${attempt}" ]]; then
-            log "  static driver linked (${attempt})"
-            report_line "xcframework: static driver linked (${attempt})"
-            static_lib="true"
-            c_api="true"
-            library="libRustCompiler.a"
+        if [[ "${c_api}" == "true" ]]; then
             has_headers="true"
+            log "  $(basename "${out_dir}/lib/${library}") exports the rustios C API"
             bundle_llvm "${out_dir}/lib/${library}"
             mkdir -p "${out_dir}/Headers"
             cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
         else
-            warn "could not build the static rustios driver"
-            report_line "xcframework: the C shim did not compile (rustc could not resolve the driver's crates)"
-            local i=0
-            while [[ ${i} -lt ${#attempt_names[@]} ]]; do
-                report_line ""
-                report_line "attempt ${i}: ${attempt_names[${i}]}"
-                report_line '```'
-                report_line "$(first_error "${attempt_logs[${i}]}")"
-                report_line '```'
-                i=$((i + 1))
-            done
+            # Fallback: compile the standalone shim. It can only work when the
+            # compiler's crate metadata is resolvable from the build tree,
+            # which is why it is no longer the primary path.
+            warn "the archive does not export the C API; trying the standalone shim"
+            local flags_cargo=() flags_sysroot=() flags_stage2=()
+            append_dependency_flags flags_cargo ${cargo_deps[@]+"${cargo_deps[@]}"} \
+                ${sysroot_deps[@]+"${sysroot_deps[@]}"} ${target_deps[@]+"${target_deps[@]}"} \
+                ${discovered[@]+"${discovered[@]}"}
+            append_dependency_flags flags_sysroot ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
+                ${target_deps[@]+"${target_deps[@]}"} ${cargo_deps[@]+"${cargo_deps[@]}"} \
+                ${discovered[@]+"${discovered[@]}"}
+            append_dependency_flags flags_stage2 ${target_deps[@]+"${target_deps[@]}"} \
+                ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
+                ${discovered[@]+"${discovered[@]}"}
 
-            # Which copy of each crate the search could see: the same file name
-            # exists for every cargo run, so the stage is invisible without it.
-            {
-                echo "static driver: candidate crates (kind, path):"
-                echo '```'
-                for d in ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
-                         ${target_deps[@]+"${target_deps[@]}"}; do
-                    [[ -d "${d}" ]] || continue
-                    for f in "${d}"/librustc_driver_impl-*.rlib "${d}"/libderive_where-*.dylib; do
-                        [[ -f "${f}" ]] || continue
-                        printf '  %s  %s\n' "$(file -b "${f}" | cut -d, -f1)" "${f}"
-                    done
-                done | head -40
-                echo '```'
-            } >> "${ARTIFACTS_DIR}/REPORT.txt"
+            local attempt="" attempt_log="" attempt_names=() attempt_logs=()
+            try_attempt() {
+                local slug="$1" description="$2"
+                shift 2
+                attempt_log="${out_dir}/static-driver-${slug}.log"
+                attempt_names+=("${description}")
+                attempt_logs+=("${attempt_log}")
+                log "  static driver attempt: ${description}"
+                if try_static_driver "${attempt_log}" "$@"; then
+                    attempt="${description}"
+                    return 0
+                fi
+                return 1
+            }
 
-            # Still a static library, just without the C ABI on top: the shim
-            # is the only part that needs rustc_driver_impl's metadata.
-            if merge_static_archive "${out_dir}/lib/libRustCompiler.a" \
-                    ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"}; then
+            if [[ -n "${cargo_driver}" ]] \
+                && try_attempt "pinned-driver" \
+                    "--extern for the cargo-built driver, cargo directories first" \
+                    "--extern" "rustc_driver_impl=${cargo_driver}" \
+                    ${flags_cargo[@]+"${flags_cargo[@]}"}; then
+                :
+            elif try_attempt "cargo-first" "cargo directories first" \
+                    ${flags_cargo[@]+"${flags_cargo[@]}"}; then
+                :
+            elif try_attempt "sysroot-first" "the sysroot first" \
+                    ${flags_sysroot[@]+"${flags_sysroot[@]}"}; then
+                :
+            elif try_attempt "stage2-first" "stage-2 compiler directories first" \
+                    ${flags_stage2[@]+"${flags_stage2[@]}"}; then
+                :
+            fi
+
+            if [[ -n "${attempt}" ]]; then
+                mv -f "${out_dir}/static-driver.a" "${out_dir}/lib/${library}"
+                log "  static driver linked (${attempt})"
+                report_line "xcframework: static driver linked (${attempt})"
                 static_lib="true"
-                c_api="false"
-                library="libRustCompiler.a"
-                has_headers="false"
-                report_line "xcframework: static archive = ${merged_objects} objects from ${merged_rlibs} rlibs (no C API: the shim needs the driver's crate metadata)"
+                c_api="true"
+                has_headers="true"
                 bundle_llvm "${out_dir}/lib/${library}"
+                mkdir -p "${out_dir}/Headers"
+                cp "${SCRIPT_DIR}/rustios-driver/include/rustios.h" "${out_dir}/Headers/"
             else
-                report_line "xcframework: **no static archive either**; falling back to the dylib"
+                warn "could not build the standalone rustios driver"
+                local i=0
+                while [[ ${i} -lt ${#attempt_names[@]} ]]; do
+                    report_line ""
+                    report_line "attempt ${i}: ${attempt_names[${i}]}"
+                    report_line '```'
+                    report_line "$(first_error "${attempt_logs[${i}]}")"
+                    report_line '```'
+                    i=$((i + 1))
+                done
+
+                # Which copy of each crate the search could see: the same file
+                # name exists for every cargo run, so the stage is invisible
+                # without it.
+                {
+                    echo "static driver: candidate crates (kind, path):"
+                    echo '```'
+                    for d in ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"} \
+                             ${target_deps[@]+"${target_deps[@]}"}; do
+                        [[ -d "${d}" ]] || continue
+                        for f in "${d}"/librustc_driver_impl-*.rlib "${d}"/libderive_where-*.dylib; do
+                            [[ -f "${f}" ]] || continue
+                            printf '  %s  %s\n' "$(file -b "${f}" | cut -d, -f1)" "${f}"
+                        done
+                    done | head -40
+                    echo '```'
+                } >> "${ARTIFACTS_DIR}/REPORT.txt"
+
+                if [[ "${static_lib}" == "true" ]]; then
+                    report_line "xcframework: staying with the merged archive (static, no C API)"
+                    bundle_llvm "${out_dir}/lib/${library}"
+                elif merge_static_archive "${out_dir}/lib/${library}" \
+                        ${cargo_deps[@]+"${cargo_deps[@]}"} ${sysroot_deps[@]+"${sysroot_deps[@]}"}; then
+                    static_lib="true"
+                    library="libRustCompiler.a"
+                    report_line "xcframework: static archive = ${merged_objects} objects from ${merged_rlibs} rlibs (no C API)"
+                    bundle_llvm "${out_dir}/lib/${library}"
+                else
+                    report_line "xcframework: **no static archive either**; falling back to the dylib"
+                fi
             fi
         fi
     else
@@ -2330,10 +2375,11 @@ preflight() {
         warn "${ios_prefix}/bin/llvm-ar is missing: rustc on the device cannot create archives"
     fi
 
-    # Backends. The shared LLVM is built with `llvm-targets-to-build=all` (the
-    # list rust-lang/rust's own LLVM uses) so that neither compiler loses a
-    # backend - see docs/llvm-parity.md. Report what the tree actually has, and
-    # refuse only when the one backend this compiler emits for is missing.
+    # Backends. The shared LLVM is built with `llvm-targets-to-build=AArch64`:
+    # one backend for the host this compiler runs on and the target it emits
+    # for, arm64-apple-ios, so a second backend is dead weight in a 2 h build
+    # (see docs/llvm-parity.md). Report what the tree actually has, and refuse
+    # only when the one backend this compiler emits for is missing.
     local built_targets expected_targets recorded_targets backend_count backend_line
     built_targets="$("${ios_config}" --targets-built 2>/dev/null | tr ' ' '\n' | paste -sd';' -)"
     [[ -n "${built_targets}" ]] || built_targets="unknown"

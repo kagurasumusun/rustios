@@ -87,7 +87,10 @@ env:
   # steps of build-swift-toolchain.sh, or the build-script invocation). Edits to
   # verification or packaging must not invalidate the built tree - that is what
   # CACHE_VERSION used to do, at the price of a 5.5 h rebuild per typo fix.
-  SWIFT_BUILD_RECIPE: "1"
+  # 2: the trees are configured per tree (zlib OFF for iOS, ON for macOS) by
+  # seeding their CMake caches, and compiler-rt's host builtins are off, which
+  # is what makes llvm-targets-to-build=AArch64 build.
+  SWIFT_BUILD_RECIPE: "2"
   # Never export SDKROOT: the build host is macOS, only the iOS compilation
   # should see the iPhoneOS SDK (the scripts handle that themselves).
   CARGO_INCREMENTAL: "0"
@@ -234,6 +237,18 @@ jobs:
           fi
           if [ "${complete}" = true ] && [ "${recorded_targets}" != "${expected_targets}" ]; then
             echo "cached LLVM was built with targets '${recorded_targets:-unknown}', the preset asks for '${expected_targets}': rebuilding" | tee -a swift.log
+            complete=false
+          fi
+          # zlib differs per tree on purpose (macOS tree ON, iOS tree OFF, like
+          # rust's own host and apple-mobile LLVM); check both, because a tree
+          # restored through the prefix rule may predate that.
+          zlib_of() {
+            sed -n 's/^#define LLVM_ENABLE_ZLIB \([01]\)[[:space:]]*$/\1/p' "$1/include/llvm/Config/llvm-config.h" 2>/dev/null | head -1
+          }
+          macosx_zlib="$(zlib_of work/SwiftLLVM/macosx)"
+          ios_zlib="$(zlib_of work/SwiftLLVM/ios)"
+          if [ "${complete}" = true ] && { [ "${macosx_zlib}" != "1" ] || [ "${ios_zlib}" != "0" ]; }; then
+            echo "cached LLVM has zlib macOS='${macosx_zlib:-unknown}' iOS='${ios_zlib:-unknown}', expected 1/0: rebuilding" | tee -a swift.log
             complete=false
           fi
           echo "complete=${complete}" >> "${GITHUB_OUTPUT}"

@@ -5,6 +5,11 @@
  * the same conventions as the `rustc` command line, except that argv[0] is
  * the program name (as with `main()`).
  *
+ * The entry points are compiled into the compiler itself (the rustios_c_api
+ * module of rustc_driver_impl, added by
+ * patches/0003-rustc-1.94.0-rustios-c-api.patch): a static archive carries no
+ * crate metadata, so an app can only link one if they are already in it.
+ *
  * Example:
  *
  *     #include <rustios.h>

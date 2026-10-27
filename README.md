@@ -215,7 +215,7 @@ make RUST_LLVM_MODE=intree   # 比較用: rust-lang 版 LLVM を bootstrap に�
 | `OS_VER` / `IOS_DEPLOYMENT_TARGET` | `16.0` | iOS deployment target（LLVM-On-iOS と同じ） |
 | `HOST_TRIPLE` | `aarch64-apple-ios` | 生成する rustc が動くプラットフォーム |
 | `STAGE` | `2` | bootstrap のステージ |
-| `LLVM_TARGETS` | `AArch64` | `intree` モードで bootstrap がビルドする LLVM のバックエンド。`swift` モードではプリセットの `llvm-targets-to-build`（`all`）が使われ、この変数は `info` の表示にだけ効く |
+| `LLVM_TARGETS` | `AArch64` | `intree` モードで bootstrap がビルドする LLVM のバックエンド。`swift` モードではプリセットの `llvm-targets-to-build`（`AArch64`）が使われ、この変数は `info` の表示にだけ効く |
 | `JOBS` | CPU 数 | 並列度 |
 
 ---
@@ -455,20 +455,24 @@ int rc = rustios_run(7, argv);   /* RUSTIOS_OK=0, RUSTIOS_FAILED=1, ... */
   およびリンカ・SDK が存在することが必要です。
 * `Rust.xcframework` は `rustc_private` を使うため、Rust のバージョン間で
   互換性がありません。`build-info.json` のバージョンと合わせて使ってください。
-* `Rust.xcframework` は静的ライブラリ（`libRustCompiler.a`）です。ただし
-  実行時に **コード生成バックエンド** を読み込むため、`RustToolchain` の
+* `Rust.xcframework` は静的ライブラリ（`libRustCompiler.a`）で、C API
+  （`rustios_version` / `rustios_run`、ヘッダは `Headers/rustios.h`）を
+  エクスポートします。C API は rustc 本体（`rustc_driver_impl`）に
+  コンパイルされているため（`patches/0003-rustc-1.94.0-rustios-c-api.patch`）、
+  アプリをリンクするときに crate メタデータは一切要りません。実行時に
+  **コード生成バックエンド** を読み込むため、`RustToolchain` の
   `usr/lib/rustlib/aarch64-apple-ios/codegen-backends/*.dylib` をアプリに
-  同梱して署名し、`--sysroot` でそのディレクトリを渡してください。C シムが
-  リンクできなかったビルドでは `"c_api": false` の静的アーカイブ（C API
-  なし）、rlib すら残せなかったビルドでは動的スライスになります。どれも
-  `build-info.json` の `"library"` / `"c_api"` を見れば分かります。
-* ビルドには macOS ランナーと 5 時間以上の時間が必要です（LLVM を 2 回、
-  全バックエンド付きでビルドするため）。CI ではビルドとパッケージを別ジョブに
-  分けて 6 時間のジョブ上限に収めています（`docs/llvm-parity.md` §4.5）。
-* `swift` モード（既定）の共有 LLVM は `llvm-targets-to-build=all` で、
-  rust が自前でビルドする LLVM と同じバックエンド集合を持ちます。`intree`
-  モードでの `LLVM_TARGETS` の既定は `AArch64` のみです（
-  `make LLVM_TARGETS="AArch64;X86"` のように指定できます）。
+  同梱して署名し、`--sysroot` でそのディレクトリを渡してください。
+  `build-info.json` の `"library"` / `"c_api"` が実際の構成です。
+* ビルドには macOS ランナーと数時間が必要です（LLVM を 2 回ビルドするため）。
+  CI ではビルドとパッケージを別ジョブに分けて 6 時間のジョブ上限に収めて
+  います（`docs/llvm-parity.md` §4.5）。
+* `swift` モード（既定）の共有 LLVM は `llvm-targets-to-build=AArch64` です。
+  Swift も rustc も arm64 向けにしかコードを生成せず、rustc 自体が動くのも
+  arm64 なので、他のバックエンドはビルド時間とサイズにしかなりません。
+  その代わり、この rustc は**他のターゲット向けにクロスコンパイルできません**
+  （`docs/llvm-parity.md` §4.5）。`intree` モードの `LLVM_TARGETS` の既定も
+  同じで、`make LLVM_TARGETS="AArch64;X86"` のように指定できます。
 
 ---
 

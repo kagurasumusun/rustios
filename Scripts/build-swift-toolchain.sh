@@ -261,6 +261,80 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# per-tree CMake cache
+# ---------------------------------------------------------------------------
+
+# seed_tree_cache <build tree> <VAR:TYPE=VALUE>...
+#
+# `--extra-cmake-options` reaches *both* LLVM trees, so an option that has to
+# differ between them cannot be written in the preset. CMake keeps a cached
+# value that is not named on its command line, so the value is seeded into the
+# tree's CMakeCache.txt before build-script configures it; on a tree that is
+# already configured the same value is set with cmake itself.
+#
+# Why this matters for zlib: rust-lang/rust links the *host* LLVM with zlib ON
+# and turns it OFF for *-apple-{ios,tvos,watchos,visionos} targets ("Zlib fails
+# to link properly"). Sharing one LLVM cannot mean one value here, so each tree
+# gets what the reference build for that tree has (docs/llvm-parity.md §2).
+seed_tree_cache() {
+    local tree="$1"
+    shift
+    local cache="${tree}/CMakeCache.txt" entry value
+    mkdir -p "${tree}"
+    for entry in "$@"; do
+        value="${entry#*=}"
+        if [[ -f "${cache}" ]]; then
+            log "  $(basename "${tree}"): ${entry} (existing cache)"
+            ( cd "${tree}" && cmake "-D${entry}" . >/dev/null ) \
+                || die "could not set ${entry} in ${tree}"
+        else
+            printf '%s\n' "${entry}" >> "${cache}"
+            log "  $(basename "${tree}"): ${entry} (new cache)"
+        fi
+    done
+}
+
+# The two trees of this recipe, each with the zlib setting its reference build
+# has: the iOS tree matches rust's apple-mobile LLVM (OFF), the macOS tree
+# matches rust's host LLVM (ON, which is also LLVM's default).
+seed_llvm_trees() {
+    [[ -f "${SWIFT_PRESET_FILE}" ]] || die "missing preset file ${SWIFT_PRESET_FILE}"
+    log "seeding the per-tree CMake settings"
+    seed_tree_cache "$(llvm_dir iphoneos)" "LLVM_ENABLE_ZLIB:BOOL=OFF"
+    seed_tree_cache "$(llvm_dir macosx)" "LLVM_ENABLE_ZLIB:BOOL=ON"
+}
+
+# check_tree_zlib <label> <build tree> <expected 0|1>
+#
+# The two trees are configured with different zlib settings on purpose (see
+# seed_llvm_trees). A wrong value is one of the differences that only shows up
+# as a link error hours later - rustc links the iOS tree and its reference
+# build has zlib OFF there - so it is checked before anything is installed.
+check_tree_zlib() {
+    local label="$1" tree="$2" expected="$3" header value
+    header="${tree}/include/llvm/Config/llvm-config.h"
+    [[ -f "${header}" ]] || die "missing ${header}; the LLVM build tree is incomplete"
+    value="$(sed -n 's/^#define LLVM_ENABLE_ZLIB \([0-9]\{1,\}\)[[:space:]]*$/\1/p' "${header}" | head -1)"
+    [[ -n "${value}" ]] || die "no LLVM_ENABLE_ZLIB in ${header}"
+    if [[ "${value}" != "${expected}" ]]; then
+        die "${label}: LLVM_ENABLE_ZLIB=${value}, expected ${expected} (see seed_llvm_trees and docs/llvm-parity.md sec. 2)"
+    fi
+    log "${label}: LLVM_ENABLE_ZLIB=${value}"
+}
+
+# zlib_flag <installed prefix>: ON/OFF, from the installed llvm-config.h.
+zlib_flag() {
+    local value
+    value="$(sed -n 's/^#define LLVM_ENABLE_ZLIB \([0-9]\{1,\}\)[[:space:]]*$/\1/p' \
+        "$1/include/llvm/Config/llvm-config.h" 2>/dev/null | head -1)"
+    case "${value}" in
+        1) echo ON ;;
+        0) echo OFF ;;
+        *) echo unknown ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
 
@@ -296,6 +370,7 @@ build_swift() {
     local args=(--preset-file="${SWIFT_PRESET_FILE}" --preset="${SWIFT_CROSS_PRESET}")
 
     refresh_cmark_cache
+    seed_llvm_trees
 
     log "iPhoneOS SDK : ${sdk}"
     log "swift        : ${SWIFT_BRANCH} ($(swift_commit))"
@@ -521,6 +596,11 @@ install_llvm() {
     [[ -f "${host_llvm}/bin/llvm-config" ]] || die "missing ${host_llvm}/bin/llvm-config; run 'llvm' first"
     [[ -d "${ios_llvm}/lib" ]] || die "missing ${ios_llvm}/lib"
 
+    # What rust-lang/rust would have had in each tree: zlib OFF for the LLVM a
+    # rustc for *-apple-ios links, ON for the host LLVM. See seed_llvm_trees.
+    check_tree_zlib "macosx LLVM" "${host_llvm}" 1
+    check_tree_zlib "iOS LLVM" "${ios_llvm}" 0
+
     # The preset builds with `build-toolchain-only=1`, which configures LLVM
     # with LLVM_BUILD_TOOLS=NO: the trees above are complete but have almost no
     # tools in bin/. rustc needs 14 of them (and FileCheck for codegen tests),
@@ -581,6 +661,9 @@ install_llvm() {
     log "installing the iOS LLVM"
     install_headers "${ios_llvm}" "${ios_prefix}"
     copy_archives "${ios_llvm}/lib" "${ios_prefix}/lib"
+    # The per-tree zlib setting, as it reached the installed headers: this is
+    # the line the parity document and the report quote.
+    report_line "swift LLVM: zlib $(zlib_flag "${macosx_prefix}") in the macOS tree and $(zlib_flag "${ios_prefix}") in the iOS tree (rust's host and apple-mobile values)"
     # These run on the device: they end up in the Rust toolchain's
     # `lib/rustlib/aarch64-apple-ios/bin`, where rustc looks for `llvm-ar`
     # and `rust-objcopy`. Every one of them is verified to be iOS/arm64.
@@ -615,6 +698,22 @@ install_llvm() {
         || warn "llvm-config reports ${host_version}, llvm-project says ${version}"
     log "LLVM ${host_version}: host and iOS trees installed in ${SWIFT_LLVM_DIR}"
     report_line "swift LLVM: ${host_version} ($(llvm_commit)) for macOS and iOS"
+
+    # zlib, from the other side: the host LLVM has to *link* zlib (rust's host
+    # LLVM does, and its compression support comes from there), and the iOS one
+    # must not (rust passes -DLLVM_ENABLE_ZLIB=OFF for *-apple-ios).
+    if "${macosx_prefix}/bin/llvm-config" --link-static --system-libs 2>/dev/null \
+            | tr ' ' '\n' | grep -qx -- '-lz'; then
+        log "the host LLVM links zlib"
+        report_line "swift LLVM: the macOS tree links -lz, the iOS tree does not"
+    else
+        warn "the host llvm-config does not report -lz: zlib is missing from the macOS tree"
+        report_line "swift LLVM: **no -lz** in the macOS tree's link line; zlib parity not achieved"
+    fi
+    if "${ios_prefix}/bin/llvm-config" --link-static --system-libs 2>/dev/null \
+            | tr ' ' '\n' | grep -qx -- '-lz'; then
+        die "the iOS tree reports -lz; zlib has to stay OFF there, like rust's apple-mobile LLVM"
+    fi
     # The Rust half needs compiler-rt sources from the *same* llvm-project
     # commit: rustc's std embeds C implementations of the compiler intrinsics
     # taken from there, and they have to match the LLVM rustc links.
@@ -628,6 +727,10 @@ install_llvm() {
         # older target list is never mistaken for the current one.
         echo "targets=${LLVM_TARGETS}"
         echo "targets_built=$("${ios_prefix}/bin/llvm-config" --targets-built | tr ' ' '\n' | paste -sd';' -)"
+        # zlib is per tree (docs/llvm-parity.md §2); both values travel with
+        # the tree so a restored or downloaded copy can be checked.
+        echo "zlib_macosx=$(zlib_flag "${macosx_prefix}")"
+        echo "zlib_ios=$(zlib_flag "${ios_prefix}")"
     } > "${SWIFT_LLVM_DIR}/llvm-project.txt"
 
     # `--libs` falls back to `-lNAME` for anything the tree does not contain.
@@ -798,6 +901,16 @@ package_llvm() {
     checksum "${tarball}"
     log "swift LLVM: $(human_size "${tarball}")"
     report_line "SwiftLLVM ${version}: $(human_size "${tarball}")"
+
+    # What the tree itself records: the packaging job has no LLVM sources and no
+    # build trees, so llvm-project.txt is the only thing it can read.
+    local info="${SWIFT_LLVM_DIR}/llvm-project.txt"
+    local zl_macosx zl_ios
+    zl_macosx="$(sed -n 's/^zlib_macosx=//p' "${info}" 2>/dev/null | head -1)"
+    zl_ios="$(sed -n 's/^zlib_ios=//p' "${info}" 2>/dev/null | head -1)"
+    if [[ -n "${zl_macosx}" || -n "${zl_ios}" ]]; then
+        report_line "SwiftLLVM: zlib ${zl_macosx:-unknown} in the macOS tree, ${zl_ios:-unknown} in the iOS tree"
+    fi
 }
 
 # llvm.a + headers -> LLVM.xcframework (the LLVM-On-iOS artifact).

@@ -1,18 +1,19 @@
 //! rustios driver: exposes the Rust compiler through a small C ABI so that an
 //! iOS app can embed `rustc` as a library.
 //!
-//! This crate is compiled as a `staticlib` for `aarch64-apple-ios` and wrapped
-//! into `Rust.xcframework` (see `Scripts/build-rust-toolchain.sh`), exactly like
-//! `llvm.a` ships inside the `LLVM.xcframework` produced by
-//! emexlab/LLVM-On-iOS.
+//! FALLBACK ONLY. `Rust.xcframework` ships the compiler as a static archive
+//! (`libRustCompiler.a`, see `Scripts/build-rust-toolchain.sh`), and the C API
+//! is compiled into `rustc_driver_impl` itself by
+//! `patches/0003-rustc-1.94.0-rustios-c-api.patch`. A static archive carries no
+//! crate metadata, so this file - which does `extern crate rustc_driver_impl` -
+//! cannot be compiled against one: it fails with `E0463: can't find crate for
+//! derive_where` in every search order, because the proc-macro dylibs it needs
+//! only exist in the build machine's cargo directories.
 //!
-//! A static archive works because rustios keeps the rustc rlibs in the sysroot
-//! (`patch_bootstrap_rustc_artifacts`); upstream only distributes `.rmeta`,
-//! because `rustc_driver` itself is a dylib crate. This crate therefore links
-//! `rustc_driver_impl` - the real driver, of which `rustc_driver` is only a
-//! re-export - and ends up as one `libRustCompiler.a`.
-//!
-//! The C interface lives in `include/rustios.h`.
+//! It is kept because it is the only way to get the C API when the tree does
+//! not carry that patch, and `build_xcframework` still tries it in that case.
+//! The interface is `include/rustios.h`; the in-crate implementation is the
+//! `rustios_c_api` module of `rustc_driver_impl`.
 //!
 //! NOTE: this uses `rustc_private`, i.e. compiler internals that are not a
 //! stable API. It is pinned to the Rust version recorded in `build-info.json`.
