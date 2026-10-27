@@ -40,7 +40,7 @@ index a328298..2804477 100644
  // Keep the OS parts of this `cfg` in sync with the `cfg` on the `libc`
 diff --git a/compiler/rustc_driver_impl/src/rustios_c_api.rs b/compiler/rustc_driver_impl/src/rustios_c_api.rs
 new file mode 100644
-index 0000000..01a7f38
+index 0000000..d7b5d9b
 --- /dev/null
 +++ b/compiler/rustc_driver_impl/src/rustios_c_api.rs
 @@ -0,0 +1,129 @@
@@ -67,8 +67,8 @@ index 0000000..01a7f38
 +use std::os::raw::{c_char, c_int};
 +use std::sync::{Once, OnceLock};
 +
-+use rustc_errors::ErrorOutputType;
 +use rustc_interface::util;
++use rustc_session::config::ErrorOutputType;
 +use rustc_session::EarlyDiagCtxt;
 +
 +use crate::{
