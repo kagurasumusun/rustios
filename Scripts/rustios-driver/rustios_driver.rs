@@ -39,6 +39,12 @@ pub const RUSTIOS_INVALID_ARGS: c_int = 2;
 /// rustc panicked (ICE); this must be treated as a compiler bug.
 pub const RUSTIOS_ICE: c_int = 101;
 
+/// The string `rustios_version()` returns.
+///
+/// `RUSTIOS_VERSION` is set by `build_xcframework` to what the stage-1
+/// compiler prints for `rustc -V` minus the program name, e.g.
+/// "1.94.0 (1f7f2d1 2026-01-15)". The in-crate implementation of the same API
+/// returns `rustc_version_str()`, which is that string, so both agree.
 const VERSION: &str = match (option_env!("RUSTIOS_VERSION"), option_env!("CARGO_PKG_VERSION")) {
     (Some(v), _) => v,
     (_, Some(v)) => v,

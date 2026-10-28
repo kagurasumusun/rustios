@@ -1,5 +1,10 @@
 # rustios patch: rustc 1.94.0 against upstream LLVM 21.1.6
 #
+# rustios-patch-mode: swift
+#   Only when rustc is linked against the Swift LLVM: this is an API
+#   difference between swiftlang/llvm-project and rust-lang/llvm-project.
+#   See docs/llvm-parity.md sec. 4.
+#
 # Why: rust-lang/llvm-project's `rustc/21.1-2025-08-01` branch still has the
 # `IntrusiveRefCntPtr<vfs::FileSystem>` parameter in llvm::PGOOptions, and
 # rustc 1.94 only drops it for LLVM >= 22. swiftlang/llvm-project at

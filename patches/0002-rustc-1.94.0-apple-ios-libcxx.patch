@@ -1,5 +1,9 @@
 # rustios patch: link libc++ instead of libstdc++ for aarch64-apple-ios
 #
+# rustios-patch-mode: all
+#   Every mode: a rustc built for aarch64-apple-ios links -lstdc++
+#   whatever LLVM it uses (rustc's build script tests for `darwin`).
+#
 # Why: compiler/rustc_llvm/build.rs picks the C++ runtime with
 # `target.contains("darwin")`, which is true for aarch64-apple-darwin but false
 # for aarch64-apple-ios. The iOS compiler then links `-lstdc++`, and no Apple

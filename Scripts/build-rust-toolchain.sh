@@ -375,25 +375,29 @@ sign_tree() {
 }
 
 # ---------------------------------------------------------------------------
-# apply_rust_patches: bring rustc's sources in line with the LLVM we link
+# apply_rust_patches: the rustc changes this build needs
 #
-# The LLVM is Swift's, i.e. upstream llvm-project, not rust-lang/llvm-project.
-# The two 21.1 trees have the same major.minor, but they are not the same
-# commit: where rustc's C++ wrappers branch on the LLVM *version* only, an
-# upstream API change can still break the compile. Each such difference is a
-# file in patches/ whose header explains it. A patch that no longer applies is
-# an error: it means rustc changed the code and the condition has to be
-# re-checked rather than forced.
+# Each file in patches/ starts with a header that explains why it exists and a
+# line that says when it applies:
+#
+#   # rustios-patch-mode: all     every RUST_LLVM_MODE
+#   # rustios-patch-mode: swift   only when rustc links the Swift LLVM
+#
+# The marker is required: a patch whose mode line is missing is an error, not
+# something to guess at. In `swift` mode the LLVM is upstream llvm-project, not
+# rust-lang/llvm-project, and the two 21.1 trees have the same major.minor but
+# are not the same commit, so an API change upstream breaks rustc's C++
+# wrappers. Those patches are `swift`; a patch that fixes something about
+# building rustc for aarch64-apple-ios is `all`, because it has nothing to do
+# with which LLVM is linked. A patch that no longer applies is an error either
+# way: it means rustc changed the code and the condition has to be re-checked
+# rather than forced.
 # ---------------------------------------------------------------------------
 
 PATCH_DIR="${PATCH_DIR:-${REPO_ROOT}/patches}"
 
 apply_rust_patches() {
     APPLIED_PATCHES=""
-    if [[ "${RUST_LLVM_MODE}" != "swift" ]]; then
-        log "rustc patches: none needed (RUST_LLVM_MODE=${RUST_LLVM_MODE} links rust-lang/llvm-project)"
-        return 0
-    fi
     [[ -d "${PATCH_DIR}" ]] || { log "rustc patches: ${PATCH_DIR} does not exist"; return 0; }
 
     local patches=()
@@ -406,13 +410,23 @@ apply_rust_patches() {
         return 0
     fi
 
-    local applied=0 skipped=0
+    local applied=0 in_place=0 applied_names=() skipped_names=()
     while IFS= read -r patch; do
-        local name
+        local name mode
         name="$(basename "${patch}")"
+        # "# rustios-patch-mode: swift" / "all" - see the comment above.
+        mode="$(sed -n 's/^#[[:space:]]*rustios-patch-mode:[[:space:]]*\([a-z]*\).*/\1/p' "${patch}" | head -1)"
+        if [[ -z "${mode}" ]]; then
+            die "${name} has no '# rustios-patch-mode:' line; add one (swift|all)"
+        fi
+        if [[ "${mode}" != "all" && "${mode}" != "${RUST_LLVM_MODE}" ]]; then
+            log "rustc patch skipped: ${name} (rustios-patch-mode=${mode}, RUST_LLVM_MODE=${RUST_LLVM_MODE})"
+            skipped_names+=("${name}")
+            continue
+        fi
         if git -C "${RUST_SOURCE_DIR}" apply --reverse --check "${patch}" >/dev/null 2>&1; then
             log "rustc patch already applied: ${name}"
-            skipped=$((skipped + 1))
+            in_place=$((in_place + 1))
         elif git -C "${RUST_SOURCE_DIR}" apply --check "${patch}" >/dev/null 2>&1; then
             git -C "${RUST_SOURCE_DIR}" apply "${patch}" \
                 || die "could not apply ${name}"
@@ -424,11 +438,25 @@ apply_rust_patches() {
             die "${name} does not apply to ${RUST_SOURCE_DIR}; rustc changed the code it patches"
         fi
         APPLIED_PATCHES="${APPLIED_PATCHES} ${name}"
+        applied_names+=("${name}")
     done < <(printf '%s\n' "${patches[@]}")
-    log "rustc patches: ${applied} applied, ${skipped} already in place:${APPLIED_PATCHES}"
-    # fetch and configure both call this; keep one line in the report.
-    local line="rustc patches (API compatibility with the Swift LLVM):${APPLIED_PATCHES}"
-    grep -qxF "${line}" "${ARTIFACTS_DIR}/REPORT.txt" 2>/dev/null || report_line "${line}"
+    log "rustc patches: ${applied} applied, ${in_place} already in place:${APPLIED_PATCHES}"
+    if [[ "${#skipped_names[@]}" -gt 0 ]]; then
+        log "rustc patches not needed for RUST_LLVM_MODE=${RUST_LLVM_MODE}: ${skipped_names[*]}"
+    fi
+
+    # fetch and configure both call this; keep each line in the report once.
+    local line
+    if [[ "${#applied_names[@]}" -gt 0 ]]; then
+        line="rustc patches applied (RUST_LLVM_MODE=${RUST_LLVM_MODE}): ${applied_names[*]}"
+        grep -qxF "${line}" "${ARTIFACTS_DIR}/REPORT.txt" 2>/dev/null || report_line "${line}"
+    fi
+    if [[ "${#skipped_names[@]}" -gt 0 ]]; then
+        # Named, not silently dropped: the reader has to be able to see that a
+        # patch exists and was not used in this configuration.
+        line="rustc patches not used in RUST_LLVM_MODE=${RUST_LLVM_MODE}: ${skipped_names[*]}"
+        grep -qxF "${line}" "${ARTIFACTS_DIR}/REPORT.txt" 2>/dev/null || report_line "${line}"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1820,6 +1848,19 @@ build_xcframework() {
     [[ "${STAGE}" -ge 2 ]] || die "the xcframework needs --stage 2 output (STAGE=${STAGE})"
     [[ -x "${stage1}/bin/rustc" ]] || die "missing ${stage1}/bin/rustc; run 'build' first"
 
+    # `rustios_version()` has to answer the same thing whichever implementation
+    # is in the archive. The in-crate one returns rustc_version_str(), i.e. the
+    # version as `rustc --version` prints it after the program name
+    # ("1.94.0 (1f7f2d1 2026-01-15)"), so the fallback shim is given that
+    # string and not the bare release number from build-info.json.
+    local rustc_version_string="${RUST_VERSION}" printed_version
+    printed_version="$("${stage1}/bin/rustc" -V 2>/dev/null | sed -n 's/^rustc //p' | head -1 || true)"
+    if [[ -n "${printed_version}" ]]; then
+        rustc_version_string="${printed_version}"
+    else
+        warn "could not read the version from ${stage1}/bin/rustc; rustios_version() falls back to ${RUST_VERSION}"
+    fi
+
     merge_target_std
     [[ -d "${libdir}" ]] || die "missing ${libdir}; run 'build' first"
 
@@ -1937,7 +1978,7 @@ build_xcframework() {
             shift
             : > "${log_path}"
             RUSTC_BOOTSTRAP=1 \
-            RUSTIOS_VERSION="${RUST_VERSION}" \
+            RUSTIOS_VERSION="${rustc_version_string}" \
             IPHONEOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET}" \
             "${stage1}/bin/rustc" \
                 --edition 2021 \

@@ -225,13 +225,30 @@ CMake 既定（Darwin では `LLVM_ENABLE_PIC` に従い ON）です。
   元に戻すときは preset の `llvm-targets-to-build` を広げるだけです
   （`docs/llvm-sharing.md` の CI 履歴に、`all` と `AArch64;ARM;X86` の実測が
   あります）。
-- `AArch64` だけで通るようになった理由: 以前は compiler-rt の builtins が
-  32bit ARM（`-arm-add-build-attributes` は ARM バックエンドのオプション）を
-  コンパイルするため失敗していました。builtins は **ホスト向けにしか作られて
-  いません**（`build-script-impl` が Apple の全ホストで
-  `-DCOMPILER_RT_ENABLE_IOS:BOOL=FALSE` などを渡す）ので、
-  `-DCOMPILER_RT_BUILD_BUILTINS:BOOL=OFF` で切っても **端末に出荷されるものは
-  変わりません**。compiler-rt のそれ以外（sanitizer ランタイム）は従来通りです。
+- `AArch64` だけで通るようになった理由（run 40470888454 で確定）: compiler-rt の
+  builtins プロジェクトが、Darwin では既定で **ベアメタル ARM** の
+  `macho_embedded_<arch>`（armv6m … armv8.1m.main、32bit）も作ります。
+  build-script は Embedded Swift 用に
+  `-DBUILTINS_<host-triple>_COMPILER_RT_FORCE_BUILD_BAREMETAL_MACHO_BUILTINS_ARCHS=…`
+  を渡すため（`utils/swift_build_support/.../products/llvm.py`）、
+  `llvm-targets-to-build=AArch64` でも 32bit ARM のコード生成が必要になり、
+  ARM バックエンドのオプション `-arm-add-build-attributes` が無いと失敗します。
+  preset の `build-embedded-stdlib=0` がこの 1 変数を止めます。
+  - `-DCOMPILER_RT_BUILD_BUILTINS:BOOL=OFF` では止まりません。
+    `llvm/runtimes/CMakeLists.txt` は `builtins-<host-triple>` という**別プロジェクト**を
+    立てて `compiler-rt/lib/builtins` を直接 configure するので、この変数を読みません
+    （sanitizer ランタイム側の builtins を止めるだけです）。
+  - 止まるのはベアメタル ARM の 7 アーキだけです。clang とリンカが実際に使う
+    `libclang_rt.builtins_arm64_osx.a` / `…_ios.a` は SDK から導出される別経路
+    (`builtin-config-ix.cmake`) で作られ続けます（同じ run のログに
+    `ios supported builtin arches: arm64;arm64e` があります）。したがって
+    `llvm-install-components` の `builtins` はそのまま残しています。
+  - 失うのは **AArch64 しか出力できないコンパイラでは元々ターゲットにできない**
+    Embedded Swift のベアメタル ARM 対応だけです。compiler-rt のそれ以外
+    （sanitizer ランタイム）は従来通りです。
+  - この食い違いを再発させないため、`build-swift-toolchain.sh` の `install_llvm` は
+    **両ツリーの `llvm-config --targets-built` が preset と一致しなければ die**
+    します（以前は Rust 側で警告するだけでした）。
 - ビルド時間はこの変更で短くなります（実測は §5）。
 - 6 時間のジョブ上限に対する保険として、`.github/workflows/build-rust-ios.yml`
   はビルドとパッケージを 2 ジョブに分けたままにしています。
@@ -296,11 +313,19 @@ RustToolchain: llvm-tools 380M (15 files in lib/rustlib/aarch64-apple-ios/bin)
   ビルドを、道具が 1 つ無いせいで落とさないため）。要求される一覧は
   bootstrap のソース（`const LLVM_TOOLS`）から読むので、Rust を上げて
   一覧が変わっても configure の時点で分かります。
-- バックエンドは、プリセットの値（`all`）と `llvm-config --targets-built`
-  の答えを突き合わせます。違えば
-  `swift LLVM: **backends differ**` と、Rust 側では
-  `shared LLVM backends: **N** ... - not full parity` が出ます。
-  `AArch64` が無い場合だけは rustc が動かないので即エラーです。
+- バックエンドは 2 か所で突き合わせます。
+  - Swift 側（`install_llvm`）: **両方のビルドツリー**の
+    `llvm-config --targets-built` がプリセットと一致しなければ **die**。
+    何もインストールする前に落ちるので、古い preset で configure された
+    ツリーをそのまま出荷しません。一致すれば
+    `swift LLVM: backends macOS [...] / iOS [...] = llvm-targets-to-build=...`
+    がレポートに出ます。
+  - Rust 側（`preflight`）: `AArch64` が無ければ即エラー、記録された
+    `targets=` がプリセットと違えば
+    `shared LLVM backends: **N** ... - not full parity` を出します
+    （アーティファクト経由で古いツリーを掴んだ場合の保険）。
+  CI のキャッシュ復元も `llvm-project.txt` の `targets=` と
+  `targets_built=` を見て、古い preset のツリーは捨ててビルドし直します。
 - ビルド時間（実測）: Swift のビルド 2 h 25 m + 梱包 25 m + Rust 1 h 25 m、
   合計 3 h 36 m（run 40402352677）。`all` でも 6 時間のジョブ上限に対して
   余裕があり、ジョブ分割はそのまま維持します（別の run では 5 h 55 m に

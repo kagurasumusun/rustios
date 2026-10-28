@@ -1,5 +1,9 @@
 # rustios patch: compile the C API into rustc_driver_impl
 #
+# rustios-patch-mode: all
+#   Every mode: the C API is what Rust.xcframework ships, independent of
+#   which LLVM the compiler links.
+#
 # Why: Rust.xcframework ships the compiler as a static archive
 # (libRustCompiler.a). A separate `staticlib` crate that does
 # `extern crate rustc_driver_impl` cannot be compiled against a *static*

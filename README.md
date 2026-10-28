@@ -473,6 +473,11 @@ int rc = rustios_run(7, argv);   /* RUSTIOS_OK=0, RUSTIOS_FAILED=1, ... */
   その代わり、この rustc は**他のターゲット向けにクロスコンパイルできません**
   （`docs/llvm-parity.md` §4.5）。`intree` モードの `LLVM_TARGETS` の既定も
   同じで、`make LLVM_TARGETS="AArch64;X86"` のように指定できます。
+* 同じ理由でプリセットは `build-embedded-stdlib=0` を指定しています。これが
+  無いと compiler-rt の builtins が Embedded Swift 用のベアメタル ARM
+  （32bit）もビルドし、AArch64 だけのコンパイラには無い ARM バックエンドの
+  オプション `-arm-add-build-attributes` で失敗します（run 40470888454）。
+  clang とリンカが使う osx / ios の builtins は従来通り作られます。
 
 ---
 

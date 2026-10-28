@@ -88,9 +88,12 @@ env:
   # verification or packaging must not invalidate the built tree - that is what
   # CACHE_VERSION used to do, at the price of a 5.5 h rebuild per typo fix.
   # 2: the trees are configured per tree (zlib OFF for iOS, ON for macOS) by
-  # seeding their CMake caches, and compiler-rt's host builtins are off, which
-  # is what makes llvm-targets-to-build=AArch64 build.
-  SWIFT_BUILD_RECIPE: "2"
+  # seeding their CMake caches.
+  # 3: the preset sets build-embedded-stdlib=0. llvm-targets-to-build=AArch64
+  # needs it: without it compiler-rt's builtins project also builds the
+  # bare-metal ARM variants and fails on -arm-add-build-attributes (run
+  # 40470888454). Every tree cached under 2 was configured with the option on.
+  SWIFT_BUILD_RECIPE: "3"
   # Never export SDKROOT: the build host is macOS, only the iOS compilation
   # should see the iPhoneOS SDK (the scripts handle that themselves).
   CARGO_INCREMENTAL: "0"
@@ -238,6 +241,17 @@ jobs:
           if [ "${complete}" = true ] && [ "${recorded_targets}" != "${expected_targets}" ]; then
             echo "cached LLVM was built with targets '${recorded_targets:-unknown}', the preset asks for '${expected_targets}': rebuilding" | tee -a swift.log
             complete=false
+          fi
+          # What the tree actually reports, not just what it was asked for:
+          # `targets_built` is written by install_llvm from `--targets-built`.
+          # Only comparable when the preset names the backends (not `all`).
+          if [ "${complete}" = true ] && [ "${expected_targets}" != all ] && [ -f work/SwiftLLVM/llvm-project.txt ]; then
+            expected_built="$(printf '%s' "${expected_targets}" | tr ';' '\n' | sort | paste -sd';' -)"
+            recorded_built="$(sed -n 's/^targets_built=//p' work/SwiftLLVM/llvm-project.txt | head -1)"
+            if [ "${recorded_built}" != "${expected_built}" ]; then
+              echo "cached LLVM reports backends '${recorded_built:-unknown}', expected '${expected_built}': rebuilding" | tee -a swift.log
+              complete=false
+            fi
           fi
           # zlib differs per tree on purpose (macOS tree ON, iOS tree OFF, like
           # rust's own host and apple-mobile LLVM); check both, because a tree

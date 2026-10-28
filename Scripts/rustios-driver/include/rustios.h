@@ -67,7 +67,16 @@ extern "C" {
 #define RUSTIOS_ICE 101
 
 /*
- * Version of the embedded compiler, e.g. "1.94.0".
+ * Version of the embedded compiler.
+ *
+ * The string is what `rustc --version` prints after the program name, i.e.
+ * "<release> (<short commit> <commit date>)", for example:
+ *
+ *     "1.94.0 (1f7f2d1 2026-01-15)"
+ *
+ * Both implementations of this API (the `rustios_c_api` module compiled into
+ * rustc_driver_impl, and the fallback `rustios_driver.rs`) return that same
+ * string, so a caller does not have to know which one it linked.
  *
  * The returned pointer refers to static storage and must not be freed.
  */

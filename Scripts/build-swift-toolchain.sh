@@ -601,6 +601,27 @@ install_llvm() {
     check_tree_zlib "macosx LLVM" "${host_llvm}" 1
     check_tree_zlib "iOS LLVM" "${ios_llvm}" 0
 
+    # The backends of the two *build* trees, compared with the preset before
+    # anything is installed. An incremental tree keeps the
+    # LLVM_TARGETS_TO_BUILD it was configured with unless this build changes
+    # it, and a tree restored from an older cache can be wider than the preset;
+    # either would be reported as the current configuration for the rest of its
+    # life. `--targets-built` is the tree's own answer.
+    targets_of() { "$1" --targets-built | tr ' ' '\n' | sort | paste -sd';' - ; }
+    local ios_targets macosx_targets expected_targets
+    ios_targets="$(targets_of "${ios_llvm}/bin/llvm-config")"
+    macosx_targets="$(targets_of "${host_llvm}/bin/llvm-config")"
+    if [[ "${LLVM_TARGETS}" == "all" ]]; then
+        # `all` is a valid value for LLVM_TARGETS_TO_BUILD; the trees say what
+        # it expanded to, so the macOS tree is the expectation.
+        expected_targets="${macosx_targets}"
+    else
+        expected_targets="$(printf '%s' "${LLVM_TARGETS}" | tr ';' '\n' | sort | paste -sd';' -)"
+    fi
+    log "LLVM backends : macOS ${macosx_targets} / iOS ${ios_targets} (preset ${LLVM_TARGETS})"
+    [[ "${ios_targets}" == "${expected_targets}" && "${macosx_targets}" == "${expected_targets}" ]] \
+        || die "the LLVM trees report backends macOS [${macosx_targets}] / iOS [${ios_targets}], the preset asks for [${expected_targets}]; rebuild the 'llvm' step from the current preset (build-embedded-stdlib=0 is needed for AArch64-only)"
+
     # The preset builds with `build-toolchain-only=1`, which configures LLVM
     # with LLVM_BUILD_TOOLS=NO: the trees above are complete but have almost no
     # tools in bin/. rustc needs 14 of them (and FileCheck for codegen tests),
@@ -698,6 +719,7 @@ install_llvm() {
         || warn "llvm-config reports ${host_version}, llvm-project says ${version}"
     log "LLVM ${host_version}: host and iOS trees installed in ${SWIFT_LLVM_DIR}"
     report_line "swift LLVM: ${host_version} ($(llvm_commit)) for macOS and iOS"
+    report_line "swift LLVM: backends macOS [${macosx_targets}] / iOS [${ios_targets}] = llvm-targets-to-build=${LLVM_TARGETS}"
 
     # zlib, from the other side: the host LLVM has to *link* zlib (rust's host
     # LLVM does, and its compression support comes from there), and the iOS one
