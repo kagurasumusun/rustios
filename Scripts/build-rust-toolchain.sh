@@ -1837,7 +1837,7 @@ build_xcframework() {
     local stage1 stage2 libdir out_dir merged xcfw slice
     local runtime_driver runtime_std driver_rlib library
     local has_headers="false" c_api="false" static_lib="false"
-    local desc archs build_info merged_objects=0 merged_rlibs=0
+    local desc archs build_info merged_objects=0 merged_rlibs=0 merged_dropped=0
     stage1="$(build_host_dir)"
     stage2="$(stage_dir)"
     libdir="${stage2}/lib/rustlib/${HOST_TRIPLE}/lib"
@@ -1995,6 +1995,44 @@ build_xcframework() {
                 > "${log_path}" 2>&1
         }
 
+        # filter_non_ios_objects <file-list> <out>: remove, from <file-list>,
+        # the objects whose LC_BUILD_VERSION says they were built for another
+        # platform. An archive for the device may contain only iOS objects,
+        # and the directories handed to merge_static_archive are not all iOS:
+        # the units for the build machine are there too (the rlibs of the
+        # crates the compiler's proc macros link). Nothing is dropped unless
+        # vtool names the platform, and a vtool that cannot answer leaves the
+        # list alone - an empty answer must not throw objects away.
+        filter_non_ios_objects() {
+            local list="$1" out="$2" dropped="${2}/merge-dropped.txt" kept total
+            : > "${dropped}"
+            dropped_objects=0
+            if command -v vtool >/dev/null 2>&1; then
+                # One parse of vtool's output; it prints a "<file>:" header per
+                # input and takes a batch per call (argv limit).
+                xargs -n 100 vtool -show-build < "${list}" 2>/dev/null \
+                    | awk '
+                        /^[^ \t].*:[ \t]*$/ { f = $0; sub(/:[ \t]*$/, "", f); next }
+                        /^[ \t]+platform[ \t]/ { if (f != "" && $2 != "IOS") { print f; f = "" } }
+                    ' | sort -u > "${dropped}" || true
+            fi
+            if [[ ! -s "${dropped}" ]]; then
+                : > "${dropped}"
+                return 0
+            fi
+            kept="${out}/merge-keep.txt"
+            if grep -vxF -f "${dropped}" "${list}" > "${kept}" 2>/dev/null && [[ -s "${kept}" ]]; then
+                total="$(wc -l < "${list}" | tr -d ' ')"
+                mv "${kept}" "${list}"
+                dropped_objects="$(wc -l < "${dropped}" | tr -d ' ')"
+                log "  dropped ${dropped_objects}/${total} object(s) built for the build machine"
+            else
+                warn "could not filter the non-iOS objects; keeping every object"
+                : > "${dropped}"
+                dropped_objects=0
+            fi
+        }
+
         # merge_static_archive <dest> <dir...>: assemble an archive out of the
         # objects inside every rlib, first directory wins for a given file
         # name. Objects do not need crate metadata, only the C shim does, so
@@ -2028,6 +2066,8 @@ build_xcframework() {
             done
             find "${work}" -type f -name '*.o' | sort > "${list}"
             [[ -s "${list}" ]] || return 1
+            dropped_objects=0
+            filter_non_ios_objects "${list}" "${out_dir}"
             libtool -static -o "${dest}" -filelist "${list}" \
                 >"${out_dir}/libtool-static.log" 2>&1 || true
             if [[ ! -s "${dest}" ]]; then
@@ -2036,7 +2076,8 @@ build_xcframework() {
             fi
             merged_objects="$(wc -l < "${list}" | tr -d ' ')"
             merged_rlibs="${i}"
-            log "  $(basename "${dest}"): ${merged_objects} objects from ${merged_rlibs} rlibs"
+            merged_dropped="${dropped_objects}"
+            log "  $(basename "${dest}"): ${merged_objects} objects from ${merged_rlibs} rlibs (all iOS)"
             return 0
         }
 
@@ -2080,9 +2121,9 @@ build_xcframework() {
             static_lib="true"
             if archive_defines "${out_dir}/lib/${library}" rustios_run rustios_version; then
                 c_api="true"
-                report_line "xcframework: static archive = ${merged_objects} objects from ${merged_rlibs} rlibs, C API exported (rustios_run, rustios_version)"
+                report_line "xcframework: static archive = ${merged_objects} iOS objects from ${merged_rlibs} rlibs (${merged_dropped} build-machine objects dropped), C API exported (rustios_run, rustios_version)"
             else
-                report_line "xcframework: static archive = ${merged_objects} objects from ${merged_rlibs} rlibs, but **no C API** - patches/0003 is not applied to this tree"
+                report_line "xcframework: static archive = ${merged_objects} iOS objects from ${merged_rlibs} rlibs (${merged_dropped} build-machine objects dropped), but **no C API** - patches/0003 is not applied to this tree"
             fi
         fi
 
