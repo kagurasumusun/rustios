@@ -47,7 +47,7 @@ new file mode 100644
 index 0000000..d7b5d9b
 --- /dev/null
 +++ b/compiler/rustc_driver_impl/src/rustios_c_api.rs
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,155 @@
 +//! The rustios C API: this compiler behind a small `extern "C"` interface.
 +//!
 +//! `Rust.xcframework` ships the compiler as a static archive
@@ -67,9 +67,10 @@ index 0000000..d7b5d9b
 +//! repository; `Scripts/rustios-driver/rustios_driver.rs` is the standalone
 +//! shim it used to be compiled from, kept as a fallback.
 +
-+use std::ffi::{CStr, CString};
++use std::ffi::CStr;
 +use std::os::raw::{c_char, c_int};
-+use std::sync::{Once, OnceLock};
++use std::sync::atomic::{AtomicU8, Ordering};
++use std::sync::Once;
 +
 +use rustc_interface::util;
 +use rustc_session::config::ErrorOutputType;
@@ -96,13 +97,38 @@ index 0000000..d7b5d9b
 +/// library takes the whole app down instead of failing the compilation.
 +const COMPILER_STACK_SIZE: usize = 64 * 1024 * 1024;
 +
-+/// Version of the embedded compiler, e.g. "1.94.0 (1f7f2d1 2026-01-15)".
-+fn version_cstr() -> &'static CStr {
-+    static VERSION: OnceLock<CString> = OnceLock::new();
-+    VERSION.get_or_init(|| {
++/// Reserve for the NUL-terminated version string. `rustc --version` prints
++/// "1.94.0 (1f7f2d1 2026-01-15)"; 128 bytes leave room for a nightly suffix.
++const VERSION_BUF_LEN: usize = 128;
++
++/// Storage for the NUL-terminated version string, filled on first use.
++///
++/// A fixed buffer instead of `CString`/`OnceLock`: `libRustCompiler.a` ships as
++/// a static archive, and the generic instances a `OnceLock` closure needs are
++/// only synthesized by a *final* `rustc` link, so they would be undefined in
++/// the archive (see `add_allocator_shims` in
++/// `Scripts/build-rust-toolchain.sh`). This module therefore stays on plain
++/// non-generic functions and statics, and allocates nothing.
++static VERSION_BUF: [AtomicU8; VERSION_BUF_LEN] = [const { AtomicU8::new(0) }; VERSION_BUF_LEN];
++/// 0 until `VERSION_BUF` holds the version, 1 afterwards.
++static VERSION_READY: AtomicU8 = AtomicU8::new(0);
++
++/// Version of the embedded compiler, e.g. "1.94.0 (1f7f2d1 2026-01-15)",
++/// copied into `VERSION_BUF` and NUL-terminated.
++fn version_cstr() -> *const c_char {
++    if VERSION_READY.load(Ordering::Acquire) == 0 {
 +        let version = util::rustc_version_str().unwrap_or("unknown");
-+        CString::new(version).expect("the compiler version contains a NUL byte")
-+    })
++        let bytes = version.as_bytes();
++        // The version string is ASCII and contains no NUL byte, so the copy is
++        // unconditional; two threads racing here write identical bytes.
++        let len = bytes.len().min(VERSION_BUF_LEN - 1);
++        for (dst, src) in VERSION_BUF.iter().zip(bytes.iter()).take(len) {
++            dst.store(*src, Ordering::Relaxed);
++        }
++        VERSION_BUF[len].store(0, Ordering::Relaxed);
++        VERSION_READY.store(1, Ordering::Release);
++    }
++    VERSION_BUF.as_ptr().cast::<u8>() as *const c_char
 +}
 +
 +/// NUL-terminated version string of the embedded compiler.
@@ -110,7 +136,7 @@ index 0000000..d7b5d9b
 +/// The returned pointer refers to static storage and must not be freed.
 +#[unsafe(no_mangle)]
 +pub extern "C" fn rustios_version() -> *const c_char {
-+    version_cstr().as_ptr()
++    version_cstr()
 +}
 +
 +/// Run the compiler with a conventional `argv` (`argv[0]` is the program name).

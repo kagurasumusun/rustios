@@ -574,6 +574,39 @@ cargo ディレクトリにしか存在しません。探索範囲をどう並�
 * スタンドアロンのシム（`Scripts/rustios-driver/rustios_driver.rs`）は、
   パッチが当たっていないツリー用のフォールバックとして残しています。
 
+#### 静的アーカイブが自分で持たなければならないもの
+
+rlib を 1 本にまとめただけでは、**アプリからリンクできる**ライブラリには
+なりません。rustc は「最終成果物」をリンクするときにしか作らないものが
+2 種類あり、どちらも rlib の中には存在しません。
+
+1. **アロケータのシム**（`__rust_alloc` / `__rust_dealloc` / `__rust_realloc` /
+   `__rust_alloc_zeroed` / `__rust_no_alloc_shim_is_unstable_v2`）。
+   `___rustc` という擬似 crate（記号名の `Cs5QKde7ScR4H` がそれ）の記号で、
+   rustc が bin / cdylib をリンクするときに生成します。`std`・`alloc`・
+   `gimli`・`rustc_driver_impl` のオブジェクトはこれらを**参照する**ので、
+   Swift/C アプリが `libRustCompiler.a` をリンクすると
+   `ld: symbol(s) not found ... ___rust_alloc` で止まります
+   （run 40803539605 で実際に発生）。
+2. **crate 内のジェネリックのインスタンス**（`__RINv…` / `__RNC…` / vtable）。
+   同じ run で未定義だったのは、C API モジュールが `OnceLock<CString>` と
+   `CString::new` を使っていたことに由来する 3 記号でした。
+
+`build-rust-toolchain.sh` の `add_allocator_shims` は 1 を解決します。
+アーカイブの未定義記号を `nm -g -u` から読み（記号名はビルドごとに変わり
+うるのでハードコードしない）、malloc 系（`malloc` / `free` / `realloc`、
+16 バイト超のアラインメントは `posix_memalign`）への**弱い定義**を
+アーカイブに足します。std の `System` アロケータが Apple プラットフォームで
+使うものと同じ系統で、弱いので「アプリ側が本物のシムを持っている」場合は
+そちらが優先されます。2 はパッチ 0003 の側で、`version_cstr()` を
+アトミックな固定バッファに変えて**アロケートもクロージャも使わない**形に
+しました（`rustios_run` は rustc 本体を呼ぶのでアロケートしますが、それは
+アロケータのシムがあれば足ります）。
+
+`add_allocator_shims` と `bundle_llvm` は `finalize_static_archive` から
+この順で呼ばれ、リンクテスト（`clang -target arm64-apple-ios…`）は
+「アプリに落としたときに本当にリンクできるか」を確認します。
+
 既知の割り切り:
 
 - **macOS 用 LLVM も Swift のビルド成果物から取ります。** 別の LLVM を作らないためで、

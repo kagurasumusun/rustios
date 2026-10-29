@@ -111,11 +111,16 @@ Rust のバージョンに強く依存します。ビルドに失敗した場合
 段階は 3 つあり、上から順に試して、成立したものを配布します。
 
 1. **C API 付きの静的ライブラリ** — `rustios.h` + `libRustCompiler.a`。
-   `rustc_driver_impl` を静的リンクし、`rustios_run()` を公開します。**未達**。
+   `rustios_version()` / `rustios_run()` は `rustc_driver_impl` 自身に
+   コンパイルされるので（`patches/0003`）、アーカイブに入ります
+   （run 40803539605 で確認）。併せて、rustc が最終リンク時にしか作らない
+   **アロケータのシム**（`__rust_alloc` 系）もアーカイブに足します
+   （`add_allocator_shims`。docs/llvm-sharing.md の「静的アーカイブが
+   自分で持たなければならないもの」）。アプリからのリンクテストは
+   この修正後の実行で確認します。
 2. **C API なしの静的ライブラリ** — rlib の中のオブジェクトを
-   `libtool -static` で 1 本にまとめます（`"c_api": false`）。crate の
-   メタデータが要るのは C シムだけなので、オブジェクトの結合は通ります。
-   **現在はこれ**（展開 685 MB、xz 96 MB）。
+   `libtool -static` で 1 本にまとめます（`"c_api": false`）。
+   `patches/0003` が当たっていないツリー用のフォールバックです。
 3. **動的スライス** — 上記が両方失敗した場合のみ（`librustc_driver-*.dylib`）。
 
 1 が失敗してきた理由: `rustc_driver_impl` の rlib は見つかるのですが、その
