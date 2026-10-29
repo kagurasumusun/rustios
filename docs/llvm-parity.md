@@ -314,22 +314,31 @@ RustToolchain: llvm-tools 380M (15 files in lib/rustlib/aarch64-apple-ios/bin)
   bootstrap のソース（`const LLVM_TOOLS`）から読むので、Rust を上げて
   一覧が変わっても configure の時点で分かります。
 - バックエンドは 2 か所で突き合わせます。
-  - Swift 側（`install_llvm`）: **両方のビルドツリー**の
-    `llvm-config --targets-built` がプリセットと一致しなければ **die**。
-    何もインストールする前に落ちるので、古い preset で configure された
-    ツリーをそのまま出荷しません。一致すれば
+  - Swift 側（`install_llvm`）: **両方のビルドツリー**が報告するバックエンドが
+    プリセットと一致しなければ **die**。何もインストールする前に落ちるので、
+    古い preset で configure されたツリーをそのまま出荷しません。一致すれば
     `swift LLVM: backends macOS [...] / iOS [...] = llvm-targets-to-build=...`
-    がレポートに出ます。
+    がレポートに出ます。値は `bin/llvm-config --targets-built`、それが無ければ
+    生成ヘッダ `include/llvm/Config/Targets.def` から読みます
+    （`build-toolchain-only=1` のため cross 側のツリーにはツールが 1 つも
+    入りません。run 40768756426 はここで `llvm-config: No such file or
+    directory` で落ちたので、両方の経路を持たせています）。
   - Rust 側（`preflight`）: `AArch64` が無ければ即エラー、記録された
     `targets=` がプリセットと違えば
     `shared LLVM backends: **N** ... - not full parity` を出します
     （アーティファクト経由で古いツリーを掴んだ場合の保険）。
   CI のキャッシュ復元も `llvm-project.txt` の `targets=` と
   `targets_built=` を見て、古い preset のツリーは捨ててビルドし直します。
-- ビルド時間（実測）: Swift のビルド 2 h 25 m + 梱包 25 m + Rust 1 h 25 m、
-  合計 3 h 36 m（run 40402352677）。`all` でも 6 時間のジョブ上限に対して
-  余裕があり、ジョブ分割はそのまま維持します（別の run では 5 h 55 m に
-  達したため）。
+- ビルド時間（実測）:
+  - キャッシュ無しの `AArch64` のみ: **4 h 16 m**（Swift 前半、run 40768756426）。
+    build-script の内訳は LLVM 2 本で 2 h 18 m、Swift コンパイラ 2 本で 1 h 55 m。
+  - キャッシュからの復元が効いた run 40402352677: ビルド 1 h 50 m、梱包 25 m、
+    Rust 1 h 25 m。ただしキャッシュに入るのは `work/SwiftLLVM` と
+    `work/SwiftToolchain` だけで、`swift-source/build`（数十 GB）は入りません。
+    つまり **ビルドそのものは毎回走ります**。6 時間のジョブ上限に対して
+    4 h 16 m は余裕がありますが、検査コードの不具合 1 つが 4 時間の再ビルドに
+    なるので、`install_llvm` / `verify` の変更はローカルのハーネスで先に
+    通しています。
 
 ## 6. この文書の範囲外
 

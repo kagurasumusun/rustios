@@ -110,10 +110,21 @@ CI の履歴:
    （compiler-rt の C 実装 145 objects）、`codegen-tests = true`、
    `lto=thin`/`codegen-units=1` でビルド。**C API 付き `Rust.xcframework` だけが
    未達**（`E0463`、§6）。
-10. **バックエンドを AArch64 だけにし、残りを全部閉じる回**（2026-10-27）。
-    1 回目の run 40470888454 は Swift 側のビルドで失敗し、原因は
-    compiler-rt のベアメタル ARM builtins でした（下記）。修正後
-    （`SWIFT_BUILD_RECIPE: "3"`）に再実行し、結果はこの節に追記します。
+10. **バックエンドを AArch64 だけにし、残りを全部閉じる回**（2026-10-27〜29）。
+    * run 40470888454: Swift 側のビルドで失敗。原因は compiler-rt のベアメタル
+      ARM builtins（下記）。
+    * run 40768756426（`build-embedded-stdlib=0` の修正後）: **Swift 側の
+      ビルド自体は成功**（4 時間 16 分、builtins の失敗は再発せず、zlib は
+      macOS 1 / iOS 0）。ただし `install_llvm` に足したバックエンド検査が
+      `llvm-iphoneos-arm64/bin/llvm-config` を呼んで落ちました。このツリーは
+      `build-toolchain-only=1` → `LLVM_BUILD_TOOLS=NO` で **ツールを 1 つも
+      作りません**（macOS ツリーだけは llvm-config を持ちます）。検査を
+      `include/llvm/Config/Targets.def` から読む形に直して再実行中です。
+    * この失敗で分かったこと: ビルド 4 時間はキャッシュに入らない
+      （`swift-source/build` は 10 GB のキャッシュ上限に対して大きすぎる）ので、
+      検査コードの不具合は毎回 4 時間の再ビルドになります。検査はローカルの
+      ハーネス（`llvm-config` あり / `Targets.def` のみ / 広いツリー / 情報なし）で
+      先に通しています。
     * `llvm-targets-to-build=AArch64`。run 40470888454 で、これを失敗させていたのは
       compiler-rt の builtins プロジェクトが Embedded Swift 用に作るベアメタル ARM
       （`macho_embedded_*`、32bit）だと確定。preset の `build-embedded-stdlib=0` で

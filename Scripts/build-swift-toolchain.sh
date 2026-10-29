@@ -606,11 +606,29 @@ install_llvm() {
     # LLVM_TARGETS_TO_BUILD it was configured with unless this build changes
     # it, and a tree restored from an older cache can be wider than the preset;
     # either would be reported as the current configuration for the rest of its
-    # life. `--targets-built` is the tree's own answer.
-    targets_of() { "$1" --targets-built | tr ' ' '\n' | sort | paste -sd';' - ; }
+    # life. Ask the tree itself, not the preset.
+    #
+    # `llvm-config` cannot be the only source: build-toolchain-only=1 configures
+    # LLVM with LLVM_BUILD_TOOLS=NO, and the cross-compiled (iPhoneOS) tree ends
+    # up without tools in bin/ at all - run 40768756426 died here on a missing
+    # ${ios_llvm}/bin/llvm-config. The generated Targets.def is written by the
+    # same configure step as everything else and lists exactly
+    # LLVM_TARGETS_TO_BUILD, so it is the value that is checked.
+    tree_targets() {
+        local tree="$1"
+        local def="${tree}/include/llvm/Config/Targets.def"
+        if [[ -x "${tree}/bin/llvm-config" ]]; then
+            "${tree}/bin/llvm-config" --targets-built
+        elif [[ -f "${def}" ]]; then
+            sed -n 's/^LLVM_TARGET(\([A-Za-z0-9_]*\))[[:space:]]*$/\1/p' "${def}" | tr '\n' ' '
+        fi
+    }
+    targets_of() { tree_targets "$1" | tr ' ' '\n' | sed '/^$/d' | sort | paste -sd';' - ; }
     local ios_targets macosx_targets expected_targets
-    ios_targets="$(targets_of "${ios_llvm}/bin/llvm-config")"
-    macosx_targets="$(targets_of "${host_llvm}/bin/llvm-config")"
+    ios_targets="$(targets_of "${ios_llvm}")"
+    macosx_targets="$(targets_of "${host_llvm}")"
+    [[ -n "${ios_targets}" && -n "${macosx_targets}" ]] \
+        || die "could not read the backends of the LLVM build trees (${ios_llvm}, ${host_llvm}): no llvm-config and no include/llvm/Config/Targets.def"
     if [[ "${LLVM_TARGETS}" == "all" ]]; then
         # `all` is a valid value for LLVM_TARGETS_TO_BUILD; the trees say what
         # it expanded to, so the macOS tree is the expectation.
