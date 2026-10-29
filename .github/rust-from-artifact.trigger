@@ -4,7 +4,7 @@
 #
 # Put a run id below to use that run's `swift-llvm` artifact, or remove it to
 # use the newest non-expired one in this repository.
-40019585601
+40428990713
 # (the codegen-tests fix re-runs the Rust half against the same artifact)
 # (optimized-compiler-builtins = false)
 # (PGOOptions patch applied)
