@@ -49,10 +49,10 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 
 | 要求 | 状態 |
 | --- | --- |
-| **両方のコンパイラが機能を失わない** | **CI で成功**（run 40402352677）: 共有 LLVM は 20 バックエンド（`llvm-targets-to-build=all`、rust の `llvm.targets` 既定と同じ）、rustc 用ツール 15/15 が iOS ツリーに、`llvm-tools = true` / `optimized-compiler-builtins = true` / `codegen-tests = true`。詳細は [llvm-parity.md](llvm-parity.md) |
-| **バックエンドは AArch64 のみ**（2026-10-27 の方針） | **実装済み・検証中**: `llvm-targets-to-build=AArch64` + `build-embedded-stdlib=0`（run 40470888454 で原因確定: ベアメタル ARM の builtins）。`install_llvm` が両ツリーの `--targets-built` を preset と突き合わせ、違えば die します。**失うもの**: `aarch64-apple-ios` 以外へのクロスコンパイル（[llvm-parity.md](llvm-parity.md) §4.5） |
-| **zlib もツリーごとに参照ビルドと同じ** | **実装済み・検証中**: iOS ツリー OFF / macOS ツリー ON。preset ではなく `seed_llvm_trees` が各ツリーの CMake キャッシュに入れ、`install_llvm` が `llvm-config.h` と `-lz` で検証（[llvm-parity.md](llvm-parity.md) §2.1） |
-| **`Rust.xcframework` が C API をエクスポートする** | **実装済み・検証中**: C API を `rustc_driver_impl` にコンパイルする `patches/0003` で、静的アーカイブが `rustios_run` / `rustios_version` を出す。§6 |
+| **両方のコンパイラが機能を失わない** | **CI で成功**: 20 バックエンド版（run 40402352677）で `llvm-tools = true` / `optimized-compiler-builtins = true` / `codegen-tests = true`。AArch64 のみの版（run 40803245579 / 40809695799）でも Swift 6.4 とその LLVM がビルド・パッケージ・検証まで通り、rustc 側の 3 つのフラグも同じ。詳細は [llvm-parity.md](llvm-parity.md) |
+| **バックエンドは AArch64 のみ**（2026-10-27 の方針） | **CI で成功**（run 40803245579 冷間 3 h 21 m、run 40809695799 キャッシュ 3 m 49 s）: `swift LLVM: 1 backends (AArch64)` / `backends match the preset` / `shared LLVM backends: 1 (AArch64)`、ライブラリ 199 → 102、`SwiftLLVM` 240 → 160 M、`LLVM.xcframework` 53 → 41 M。`build-embedded-stdlib=0` がベアメタル ARM の builtins を止めています（run 40470888454 で原因確定）。`install_llvm` が両ツリーの `--targets-built` を preset と突き合わせ、違えば die します。**失うもの**: `aarch64-apple-ios` 以外へのクロスコンパイル（[llvm-parity.md](llvm-parity.md) §4.5） |
+| **zlib もツリーごとに参照ビルドと同じ** | **CI で成功**: iOS ツリー OFF / macOS ツリー ON（レポート行 `SwiftLLVM: zlib ON in the macOS tree, OFF in the iOS tree`、run 40768756426 / 40809695799）。preset ではなく `seed_llvm_trees` が各ツリーの CMake キャッシュに入れ、`install_llvm` が `llvm-config.h` と `-lz` で検証（[llvm-parity.md](llvm-parity.md) §2.1） |
+| **`Rust.xcframework` が C API をエクスポートする** | **アーカイブに入ったことは CI で確認**（run 40803539605、`"c_api": true`）。アプリからのリンクテストは同じ run で未定義記号により失敗したため、シムの生成（`add_allocator_shims`）と `patches/0003` の修正を入れ、**次の実行で確認**。§6 |
 | Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、`swift-frontend` は IOS/arm64、`SwiftToolchain` 544 MB。`swiftc`/`swift`/`swift-driver` は macOS のホストドライバ） |
 | Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 240 MB、`LLVM.xcframework` 53 MB。iOS 側 `lib/*.a` のメンバーを `vtool` で検査し `IOS/arm64` を確認） |
 | Rust を Swift の LLVM でビルドする | **CI で成功**（run 40402352677）。`RustToolchain` 112 MB + `RustStd` 352 MB + `Rust.xcframework` 192 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
@@ -145,6 +145,24 @@ CI の履歴:
       `0002`（iOS の libc++）と `0003`（C API）は LLVM に依存しないので `all`、
       `0001`（PGOOptions）だけが `swift`。
     * 失うもの: `aarch64-apple-ios` 以外へのクロスコンパイル（§4.5）。
+    * run 40803245579: **AArch64 のみで Swift + LLVM のビルドとパッケージが成功**
+      （3 h 21 m、`1 backends (AArch64)`、`SwiftLLVM 160 M` / `LLVM.xcframework 41 M`、
+      zlib は macOS ON / iOS OFF）。同じ内容がキャッシュから 3 m 49 s で復元される
+      ことも run 40809695799 で確認。
+    * run 40803539605（`build-rust-from-artifact`、20 バックエンドの LLVM を再利用）:
+      **C API が `libRustCompiler.a` に入った**（3664 objects / 329 rlibs、
+      `nm -g` に `_rustios_run` / `_rustios_version`）。ただしアプリのリンクテストで
+      未定義記号が出て失敗。原因は 2 つで、どちらも「rustc の最終リンクでしか
+      作られないもの」: アロケータのシム（`__rust_alloc` 系）と、C API モジュールの
+      `OnceLock<CString>` の generic（§6）。前者は `add_allocator_shims` で
+      アーカイブに弱い定義として同梱し、後者は `patches/0003` を固定バッファに
+      書き換えて消した。
+    * run 40809695799: Rust ジョブが `fetch` で失敗。`rust-src` キャッシュは
+      **パッチ適用後のツリー**なので、`patches/0003` を書き換えるとキャッシュ上の
+      旧版と衝突して「適用も逆適用もできない」状態になり、`die` していました。
+      `apply_rust_patches` はその場合にパッチが触るファイルだけを HEAD に戻して
+      再試行するようにし（7.6 GB のキャッシュを捨てない）、`fetch` も `build.log` に
+      tee するようにしました（それまではレポートに「build.log is empty」とだけ出た）。
 
 ---
 
@@ -478,7 +496,7 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
 | `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
 | rust-lang 版 LLVM との API 差 | **1 件検出・パッチ適用**（`PGOOptions` の vfs 引数 = `0001`。`swift` モード専用）。`stdc++`→`libc++` は LLVM の差ではなく iOS 向けクロスビルドの問題なので `0002`（全モード）に分けた。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`）+ C API | **静的アーカイブは CI で確認済み**（run 40258441852 / 40269093072 で 4831 objects / 329 rlibs）。C API は run 40428990713 まで**未達**（`"c_api": false`、4 通りすべて `E0463`）→ **方式を変更**（下の「C API の解決」節）: C API を `rustc_driver_impl` にコンパイルする `patches/0003` で、静的アーカイブ自体が `rustios_run` / `rustios_version` をエクスポートします。**検証中**（次の CI 実行で `c_api: true` とリンクテストを確認） |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`）+ C API | **C API は入った**（run 40803539605: 3664 iOS objects / 329 rlibs、`nm -g` に `_rustios_run` / `_rustios_version`、`"c_api": true`）。方式は下の「C API の解決」節（`rustc_driver_impl` にコンパイルする `patches/0003`）。**アプリからのリンクテストは同じ run で失敗**し、原因は rustc が最終リンク時にしか作らないアロケータのシムと、C API モジュールの `OnceLock` 由来の generic だった（下の「静的アーカイブが自分で持たなければならないもの」）。両方の修正後の確認が次の実行 |
 | `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
 | ビルド時間 | Swift 4 h 29 m（`AArch64;ARM;X86` で実測）、`all` では約 5 h 30 m（実測 5 h 55 m でパッケージ中に打ち切り）→ CI をビルド/パッケージの 2 ジョブに分割。Rust は stage1 + stage2 で 1 h 02 m（実測、キャッシュ利用の warm ビルド） |
 
@@ -606,6 +624,19 @@ rlib を 1 本にまとめただけでは、**アプリからリンクできる*
 `add_allocator_shims` と `bundle_llvm` は `finalize_static_archive` から
 この順で呼ばれ、リンクテスト（`clang -target arm64-apple-ios…`）は
 「アプリに落としたときに本当にリンクできるか」を確認します。
+
+#### パッチの適用先がキャッシュされていること（run 40809695799 の失敗）
+
+`rust-src-<CACHE_VERSION>-<ver>` キャッシュは、**パッチを当てたあとのツリー**を
+保存します。そのため `patches/0003` を書き換えると、キャッシュされたツリーには
+旧版が当たったままになり、新版は「適用できる」でも「逆適用できる（＝適用済み）」
+でもなくなって `apply_rust_patches` が die しました（`fetch` は `build.log` に
+出力していなかったので、レポートには「build.log is empty」とだけ出ました。
+現在は `fetch` も `build.log` に tee します）。7.6 GB のキャッシュを捨てずに
+済むよう、`apply_rust_patches` はその場合に**パッチが触るファイルだけを HEAD に
+戻して**（`git checkout`、パッチが新規作成するファイルは削除）再試行し、
+成功したら `rustc patches re-applied on a reset tree …` をレポートに残します。
+本当に rustc 側が変わって適用できない場合は、従来通り die します。
 
 既知の割り切り:
 

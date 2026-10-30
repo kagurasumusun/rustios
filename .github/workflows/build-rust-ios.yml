@@ -722,7 +722,14 @@ jobs:
           key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
 
       - name: Fetch Rust sources
-        run: Scripts/build-rust-toolchain.sh fetch
+        # Teed into build.log like the other steps: a failure here (a patch that
+        # does not apply, a git clone that times out) is otherwise reported as
+        # "(build.log is empty - the failure happened before the first command)",
+        # which says nothing. Run 40809695799 failed exactly here.
+        run: |
+          set -o pipefail
+          echo "===== fetch =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh fetch 2>&1 | tee -a build.log
 
       - name: Save Rust sources
         continue-on-error: true

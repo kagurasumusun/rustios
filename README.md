@@ -417,8 +417,9 @@ jailbreak / TrollStore 環境や、Nyxian のような IDE の中では、その
 ```sh
 tar -xJf Rust.xcframework-iphoneos-arm64-1.94.0.tar.xz
 ls Rust.xcframework/ios-arm64
-# 現在:   libRustCompiler.a のみ（C API なし）
-# 目標:   Headers/rustios.h + libRustCompiler.a
+# libRustCompiler.a  Headers/rustios.h  build-info.json
+# （run 40803539605 以降: C API をコンパイルした libRustCompiler.a 1 本。
+#   `build-info.json` の "c_api": true / "library": "static" が目印）
 ```
 
 ```sh

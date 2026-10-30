@@ -396,6 +396,27 @@ sign_tree() {
 
 PATCH_DIR="${PATCH_DIR:-${REPO_ROOT}/patches}"
 
+# reset_patch_paths <patch>
+#
+# Put every file the patch touches back to its committed state. `git checkout`
+# for tracked files, `rm` for the ones the patch creates (a new file is
+# untracked, so a checkout would leave it behind and the patch would refuse to
+# create it again).
+reset_patch_paths() {
+    local patch="$1" path restored=0 removed=0
+    while IFS= read -r path; do
+        [[ -n "${path}" ]] || continue
+        if git -C "${RUST_SOURCE_DIR}" ls-files --error-unmatch -- "${path}" >/dev/null 2>&1; then
+            git -C "${RUST_SOURCE_DIR}" checkout -- "${path}" 2>/dev/null || true
+            restored=$((restored + 1))
+        elif [[ -e "${RUST_SOURCE_DIR}/${path}" ]]; then
+            rm -f "${RUST_SOURCE_DIR}/${path}"
+            removed=$((removed + 1))
+        fi
+    done < <(sed -n 's|^diff --git a/.* b/||p' "${patch}")
+    log "  reset to HEAD: ${restored} file(s) restored, ${removed} removed"
+}
+
 apply_rust_patches() {
     APPLIED_PATCHES=""
     [[ -d "${PATCH_DIR}" ]] || { log "rustc patches: ${PATCH_DIR} does not exist"; return 0; }
@@ -410,7 +431,7 @@ apply_rust_patches() {
         return 0
     fi
 
-    local applied=0 in_place=0 applied_names=() skipped_names=()
+    local applied=0 in_place=0 applied_names=() skipped_names=() reapply_names=()
     while IFS= read -r patch; do
         local name mode
         name="$(basename "${patch}")"
@@ -433,14 +454,36 @@ apply_rust_patches() {
             log "rustc patch applied: ${name}"
             applied=$((applied + 1))
         else
-            printf '%s\n' "--- ${name} (first hunk) ---" >&2
-            sed -n '/^@@/,$p' "${patch}" | head -20 >&2
-            die "${name} does not apply to ${RUST_SOURCE_DIR}; rustc changed the code it patches"
+            # Neither direction applies. The usual reason is not that rustc
+            # changed: it is a *stale* tree. rust-source is cached after the
+            # patches were applied, so the cache can carry an older version of
+            # this same patch ("already applied" is then untrue and "applies
+            # cleanly" is too), and editing a patch would otherwise mean
+            # throwing the 7.6 GB cache away. The files the patch touches are
+            # therefore put back to their committed state and the patch is
+            # tried again; a real incompatibility still fails, below.
+            log "${name} does not apply as-is; resetting its files to HEAD and retrying"
+            reset_patch_paths "${patch}"
+            if git -C "${RUST_SOURCE_DIR}" apply --check "${patch}" >/dev/null 2>&1; then
+                git -C "${RUST_SOURCE_DIR}" apply "${patch}" \
+                    || die "could not apply ${name}"
+                log "rustc patch applied after the reset: ${name}"
+                applied=$((applied + 1))
+                reapply_names+=("${name}")
+            else
+                printf '%s\n' "--- ${name} (first hunk) ---" >&2
+                sed -n '/^@@/,$p' "${patch}" | head -20 >&2
+                die "${name} does not apply to ${RUST_SOURCE_DIR}; rustc changed the code it patches"
+            fi
         fi
         APPLIED_PATCHES="${APPLIED_PATCHES} ${name}"
         applied_names+=("${name}")
     done < <(printf '%s\n' "${patches[@]}")
     log "rustc patches: ${applied} applied, ${in_place} already in place:${APPLIED_PATCHES}"
+    if [[ "${#reapply_names[@]}" -gt 0 ]]; then
+        # Visible in the report: the tree was not pristine when the patch ran.
+        report_line "rustc patches re-applied on a reset tree (cache held an older version): ${reapply_names[*]}"
+    fi
     if [[ "${#skipped_names[@]}" -gt 0 ]]; then
         log "rustc patches not needed for RUST_LLVM_MODE=${RUST_LLVM_MODE}: ${skipped_names[*]}"
     fi

@@ -266,27 +266,24 @@ CMake 既定（Darwin では `LLVM_ENABLE_PIC` に従い ON）です。
 ## 5. CI でどう確認しているか（実測）
 
 `artifacts/REPORT.txt`（PR コメントに出る）に、次の行が出ます。以下は
-**run 40402352677（`llvm-targets-to-build=all`、2026-10-27）の実出力**です。
+**run 40803245579 / 40809695799（`llvm-targets-to-build=AArch64`、2026-10-29）
+の実出力**です。20 バックエンド版（run 40402352677）との差は
+「バックエンド 1 / ライブラリ 102 / SwiftLLVM 160 M」の 3 行に出ています。
 
 Swift 側:
 
 ```
-swift LLVM (macosx): built 16 LLVM tool target(s)
-swift LLVM (ios): built 15 LLVM tool target(s)
-swift LLVM (macosx/bin): 15/15 rustc LLVM tools installed
-swift LLVM (macosx/bin): FileCheck present
-swift LLVM (ios/bin): 15/15 rustc LLVM tools installed
+swift LLVM: backends macOS [AArch64] / iOS [AArch64] = llvm-targets-to-build=AArch64
 swift LLVM: 15/15 rustc LLVM tools present and iOS/arm64
-swift LLVM: 20 backends (AArch64;AMDGPU;ARM;AVR;BPF;Hexagon;Lanai;LoongArch;Mips;MSP430;NVPTX;PowerPC;RISCV;Sparc;SPIRV;SystemZ;VE;WebAssembly;X86;XCore)
-swift LLVM: backends match the preset (llvm-targets-to-build=all)
-swift LLVM: 265 static libraries (ios/lib)
+swift LLVM: 1 backends (AArch64)
+swift LLVM: backends match the preset (llvm-targets-to-build=AArch64)
 ```
 
 Rust 側:
 
 ```
-shared LLVM backends: 20 (...) = llvm-targets-to-build=all
-shared LLVM preflight: 21.0.0, 199 libraries, iOS slice confirmed (3 sampled)
+shared LLVM backends: 1 (AArch64) = llvm-targets-to-build=AArch64
+shared LLVM preflight: 21.0.0, 102 libraries, iOS slice confirmed (3 sampled)
 configure: llvm-tools = true (14 tools from the shared LLVM, macOS and iOS)
 configure: optimized-compiler-builtins = true (compiler-rt 903b9faaa)
 configure: codegen-tests = true (FileCheck from the shared LLVM)
@@ -296,16 +293,20 @@ compiler_builtins: build script emitted the optimized-c cfg
 RustToolchain: llvm-tools 380M (15 files in lib/rustlib/aarch64-apple-ios/bin)
 ```
 
-成果物（同じ run）:
+成果物（サイズは `human_size` の表示、すなわち MiB）:
 
-| 成果物 | サイズ | 前回（`AArch64;ARM;X86`、llvm-tools 無し） |
+| 成果物 | `AArch64`（現在） | 20 バックエンド（run 40402352677） |
 | --- | --- | --- |
-| `SwiftLLVM-…-21.1.6.tar.xz` | 240 M | 96 M |
-| `SwiftToolchain-…-6.4.0.tar.xz` | 544 M | 480 M |
-| `LLVM.xcframework-…` | 53 M | 44 M |
-| `RustToolchain-…-1.94.0.tar.xz` | 112 M | 35 M（llvm-tools の 380M 展開分を含む） |
-| `RustStd-…-1.94.0.tar.xz` | 352 M | 256 M（compiler-rt の C 実装を含む） |
-| `Rust.xcframework-…` | 192 M | 96 M（同じく compiler-rt を含む） |
+| `SwiftLLVM-…-21.1.6.tar.xz` | 160 M | 240 M |
+| `SwiftToolchain-…-6.4.0.tar.xz` | 384 M（`swift-llvm` artifact は 152 MiB） | 544 M |
+| `LLVM.xcframework-…` | 41 M | 53 M |
+| `RustToolchain-…-1.94.0.tar.xz` | 112 M（llvm-tools の展開分を含む） | 112 M |
+| `RustStd-…-1.94.0.tar.xz` | 352 M（compiler-rt の C 実装を含む） | 352 M |
+| `Rust.xcframework-…` | 192 M（同じく compiler-rt を含む） | 192 M |
+
+iOS 用の静的ライブラリはバックエンドを減らしても減りません（`AArch64` の
+コード生成だけが残るため）。サイズが減るのは `SwiftLLVM` と
+`LLVM.xcframework` の、落とした 19 バックエンドの分です。
 
 - ツール（`llvm-tools`）が有効になるのは、**macOS と iOS の両ツリーに
   14 個すべてが揃っているときだけ**です。1 つでも欠ければ
@@ -330,8 +331,11 @@ RustToolchain: llvm-tools 380M (15 files in lib/rustlib/aarch64-apple-ios/bin)
   CI のキャッシュ復元も `llvm-project.txt` の `targets=` と
   `targets_built=` を見て、古い preset のツリーは捨ててビルドし直します。
 - ビルド時間（実測）:
-  - キャッシュ無しの `AArch64` のみ: **4 h 16 m**（Swift 前半、run 40768756426）。
-    build-script の内訳は LLVM 2 本で 2 h 18 m、Swift コンパイラ 2 本で 1 h 55 m。
+  - キャッシュ無しの `AArch64` のみ: **3 h 21 m**（Swift 前半、run 40803245579。
+    01:54:54 → 05:15:48 UTC）。20 バックエンドの同じ条件（run 40768756426）は
+    **4 h 16 m** なので、バックエンドを 1 つに絞った効果は約 55 分です。
+  - そのキャッシュ（`swift-built-*`）が効いた run 40809695799 の Swift 前半は
+    **3 m 49 s**。梱包は 18 m。
   - キャッシュからの復元が効いた run 40402352677: ビルド 1 h 50 m、梱包 25 m、
     Rust 1 h 25 m。ただしキャッシュに入るのは `work/SwiftLLVM` と
     `work/SwiftToolchain` だけで、`swift-source/build`（数十 GB）は入りません。
