@@ -1,0 +1,463 @@
+name: build-rust-from-artifact
+
+# Builds the Rust half of the toolchain from an *already produced*
+# `swift-llvm` artifact, without re-running the ~4.5 h Swift + LLVM build.
+#
+# Why this exists next to `build-rust-ios`:
+#
+#   * `build-rust-ios` runs Swift and Rust as two jobs of one run, so a retry
+#     of the Rust half means re-running the whole run - and the push that
+#     would start it cancels the run in progress (`concurrency`).
+#   * The `swift-llvm` artifact lives for 90 days. A Rust build can therefore
+#     be started from it directly, with its own run, its own concurrency group
+#     (pushes do not cancel it) and its own 6 h budget.
+#
+# The LLVM is *not* rebuilt here and the Swift job is not run: this workflow is
+# proof that the Rust compiler consumes what Swift produced.
+#
+# How to start it:
+#
+#   * Actions -> build-rust-from-artifact -> Run workflow (leave `source_run_id`
+#     empty for the newest non-expired `swift-llvm` artifact), or
+#   * edit `.github/rust-from-artifact.trigger` (put a run id in it, or leave it
+#     empty for "newest") and push - that is the path CI credentials with only
+#     `contents: write` can use, because `workflow_dispatch` needs
+#     `actions: write`.
+#
+# Either way the branch that is checked out (`Scripts/`) does the build, and the
+# artifact may come from any branch or run of this repository.
+#
+# NOTE: the build job below duplicates the `build` job of build-rust-ios.yml.
+# They are kept in sync by hand; once the Rust job is verified, build-rust-ios
+# should call this one through `workflow_call` instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Run id that produced the swift-llvm artifact (empty = newest)"
+        required: false
+        default: ""
+      rust_version:
+        description: "Rust release tag to build (must expect the Swift LLVM)"
+        required: true
+        default: "1.94.0"
+      stage:
+        description: "Bootstrap stage (2 = optimised self-hosting compiler)"
+        required: true
+        default: "2"
+      build_xcframework:
+        description: "Also build Rust.xcframework (needs rustc_private)"
+        type: boolean
+        default: true
+  # Push-to-trigger: see the header. The file itself may be empty (newest
+  # artifact) or hold a run id (with `#` comments allowed).
+  push:
+    paths:
+      - ".github/rust-from-artifact.trigger"
+
+permissions:
+  contents: read
+  # Reading the artifact of another run (actions/download-artifact with
+  # run-id / repository, and the API query in `resolve`).
+  actions: read
+  # The report is posted as a PR comment: job logs live in GitHub's blob
+  # storage, which is not reachable from everywhere.
+  pull-requests: write
+
+# One group *per run*: this workflow builds for two to three hours, and nothing
+# - not a push, not another trigger, not a cancel of a queued sibling run -
+# should be able to take that work away. GitHub cancels a previously *pending*
+# run when a new run enters the same group, so a shared group would silently
+# drop triggers; with a unique group every trigger is a run of its own.
+#
+# The consequence is that two triggers build in parallel (two runners, two sets
+# of artifacts, each in its own run) instead of one replacing the other, which
+# is what we want here: the LLVM artifact is read-only input and the outputs
+# never share a path.
+concurrency:
+  group: build-rust-from-artifact-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+env:
+  # `inputs` is empty for the push trigger, hence the fallbacks.
+  RUST_VERSION: ${{ inputs.rust_version || '1.94.0' }}
+  IOS_DEPLOYMENT_TARGET: "16.0"
+  STAGE: ${{ inputs.stage || '2' }}
+  BUILD_XCFRAMEWORK: ${{ inputs.build_xcframework || 'true' }}
+  # The Swift release whose llvm-project the artifact was built from.
+  SWIFT_BRANCH: swift-6.4.0-RELEASE
+  # Must match build-rust-ios.yml, or the rust source cache is not shared.
+  # 3: rustc's std now embeds compiler-rt (optimized-compiler-builtins) and
+  # the toolchain ships llvm-tools; both need the sources cache to be filled
+  # again, and the artifact has to come from a run of the same version.
+  # 4: matches build-rust-ios.yml (shared LLVM built with all backends). The
+  # swift-llvm artifact this workflow consumes must come from a run of the
+  # current CACHE_VERSION, i.e. one whose LLVM has every backend and the 15
+  # rustc LLVM tools in bin/.
+  # 5: the shared LLVM is built with llvm-targets-to-build=AArch64 and per-tree
+  # zlib (iOS OFF, macOS ON); Rust.xcframework needs the run that also carries
+  # patches/0003, i.e. a swift-llvm of this CACHE_VERSION or newer.
+  CACHE_VERSION: "5"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Which LLVM?
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Find the shared LLVM
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.pick.outputs.run_id }}
+      source_sha: ${{ steps.pick.outputs.source_sha }}
+      source_branch: ${{ steps.pick.outputs.source_branch }}
+      created_at: ${{ steps.pick.outputs.created_at }}
+    steps:
+      - name: Checkout (only to read the trigger file)
+        uses: actions/checkout@v4
+
+      - name: Look up the newest swift-llvm artifact
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WANTED_RUN: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          # The push trigger carries its run id in the file, not in inputs.
+          if [ -z "${WANTED_RUN}" ] && [ -f .github/rust-from-artifact.trigger ]; then
+            WANTED_RUN="$(sed 's/#.*//' .github/rust-from-artifact.trigger | tr -d '[:space:]')"
+          fi
+          # One query, no pagination loop: artifacts are listed newest first
+          # and `sort_by` keeps the result deterministic anyway.
+          pick='[.artifacts[] | select(.name == "swift-llvm" and (.expired | not))]
+                | sort_by(.created_at) | reverse | .[0]'
+          if [ -n "${WANTED_RUN}" ]; then
+            echo "looking for swift-llvm in run ${WANTED_RUN}"
+            entry="$(gh api "repos/${REPO}/actions/runs/${WANTED_RUN}/artifacts?per_page=100" --jq "${pick}")"
+          else
+            echo "looking for the newest swift-llvm artifact in ${REPO}"
+            entry="$(gh api "repos/${REPO}/actions/artifacts?name=swift-llvm&per_page=100" --jq "${pick}")"
+          fi
+          if [ -z "${entry}" ] || [ "${entry}" = "null" ]; then
+            echo "::error::no non-expired swift-llvm artifact found (was the Swift job ever successful?)"
+            exit 1
+          fi
+          echo "${entry}"
+          {
+            echo "run_id=$(jq -r '.workflow_run.id' <<<"${entry}")"
+            echo "source_sha=$(jq -r '.workflow_run.head_sha' <<<"${entry}")"
+            echo "source_branch=$(jq -r '.workflow_run.head_branch' <<<"${entry}")"
+            echo "created_at=$(jq -r '.created_at' <<<"${entry}")"
+          } >> "${GITHUB_OUTPUT}"
+
+  # ---------------------------------------------------------------------------
+  # rustc for iOS, linked against that LLVM
+  # ---------------------------------------------------------------------------
+  build:
+    name: rustc for iOS (aarch64-apple-ios)
+    needs: resolve
+    timeout-minutes: 360
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The LLVM that the compiler is built against: produced by the `swift`
+      # job, consumed here through the relocatable llvm-config shims inside it.
+      - name: Download the shared LLVM
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-llvm
+          path: swift-llvm
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+
+      - name: Unpack the shared LLVM
+        id: llvm
+        run: |-
+          set -euo pipefail
+          mkdir -p work
+          tar -xJf swift-llvm/SwiftLLVM-*.tar.xz -C work
+          test -x work/SwiftLLVM/ios/bin/llvm-config
+          test -x work/SwiftLLVM/macosx/bin/llvm-config
+          test -d work/SwiftLLVM/ios/include/llvm
+          version="$(work/SwiftLLVM/ios/bin/llvm-config --version)"
+          echo "llvm_version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "llvm-config (iOS) says: ${version}"
+          echo "llvm-config (macOS) says: $(work/SwiftLLVM/macosx/bin/llvm-config --version)"
+          ls work/SwiftLLVM/ios/lib | head
+          # Fail in seconds, not after the two compiler stages: these are the
+          # properties whose violation otherwise only shows up as a link error
+          # at the end of the build (a library missing from the iOS slice, a
+          # macOS archive in the iOS tree, headers and libraries that disagree).
+          Scripts/build-rust-toolchain.sh preflight 2>&1 | tee -a build.log
+
+      - name: Show environment
+        run: |-
+          set -euo pipefail
+          {
+            echo "===== provenance ====="
+            echo "this run        : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "swift-llvm from : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${{ needs.resolve.outputs.run_id }}"
+            echo "  commit        : ${{ needs.resolve.outputs.source_sha }} (${{ needs.resolve.outputs.source_branch }}), artifact of ${{ needs.resolve.outputs.created_at }}"
+            echo "scripts from    : ${GITHUB_SHA} (${{ github.ref_name }})"
+            echo "===== environment ====="
+            uname -a
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-path
+            python3 --version
+            df -h /
+            Scripts/build-rust-toolchain.sh info
+          } | tee -a build.log
+
+      - name: Free disk space
+        run: |-
+          set -euo pipefail
+          shopt -s nullglob
+          echo "disk before:"; df -h /
+          selected="$(xcode-select -p)"
+          selected="${selected%/Contents/Developer}"
+          for xcode in /Applications/Xcode*.app; do
+            if [ "${xcode}" != "${selected}" ]; then
+              echo "removing ${xcode}"
+              sudo rm -rf "${xcode}"
+            fi
+          done
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          rm -rf "${HOME}/Library/Developer/Xcode/DerivedData" || true
+          rm -rf "${HOME}/Library/Developer/CoreSimulator" || true
+          echo "disk after:"; df -h /
+
+      - name: Install build dependencies
+        run: |-
+          set -euo pipefail
+          if ! command -v ninja >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ninja
+          fi
+          ninja --version
+
+      # Only the Rust checkout + the submodule it still needs
+      # (library/backtrace). src/llvm-project is *not* fetched: nothing builds
+      # it, and that is the point of the shared LLVM.
+      - name: Restore Rust sources
+        id: cache-rust-src
+        uses: actions/cache/restore@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
+      - name: Fetch Rust sources
+        run: |-
+          set -o pipefail
+          echo "===== fetch =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh fetch 2>&1 | tee -a build.log
+
+      - name: Save Rust sources
+        continue-on-error: true
+        if: steps.cache-rust-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
+      - name: Configure bootstrap
+        run: |-
+          set -o pipefail
+          echo "===== configure =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh configure 2>&1 | tee -a build.log
+
+      # A cross-host build needs a compiler that runs on the build machine:
+      # stage 1 produces that compiler, stage 2 uses it to produce the compiler
+      # that runs on iOS. Both link the Swift LLVM, so there is no second LLVM
+      # build anywhere in this job.
+      - name: Build stage 1 (build-machine compiler)
+        run: |-
+          set -o pipefail
+          echo "===== build stage 1 (host phase) =====" | tee -a build.log
+          RUSTIOS_BUILD_PHASE=host Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
+
+      - name: Build stage 2 (rustc for iOS)
+        run: |-
+          set -o pipefail
+          echo "===== build stage 2 (target phase) =====" | tee -a build.log
+          RUSTIOS_BUILD_PHASE=target Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
+
+      # `set -e` deliberately not used: the exit code is reported explicitly,
+      # and on failure the state that matters is dumped into build.log.
+      - name: Verify artifacts
+        run: |-
+          set -o pipefail
+          echo "===== verify =====" | tee -a build.log
+          rc=0
+          Scripts/build-rust-toolchain.sh verify 2>&1 | tee -a build.log || rc=$?
+          echo "verify exited with ${rc}" | tee -a build.log
+          if [ "${rc}" -ne 0 ]; then
+            for dir in rust-source/build/aarch64-apple-ios/stage2/bin \
+                       rust-source/build/aarch64-apple-ios/stage2/lib \
+                       rust-source/build/aarch64-apple-ios/stage2/lib/rustlib/aarch64-apple-ios/lib \
+                       rust-source/build/aarch64-apple-darwin/stage1/lib/rustlib/aarch64-apple-ios/lib; do
+              echo "--- ${dir} ---" | tee -a build.log
+              ls -la "${dir}" 2>&1 | head -40 | tee -a build.log
+            done
+            echo "--- bootstrap.toml ---" | tee -a build.log
+            sed 's/^/    /' rust-source/bootstrap.toml 2>&1 | tee -a build.log
+            echo "--- llvm-config calls ---" | tee -a build.log
+            tail -n 20 work/SwiftLLVM/ios/llvm-config.log 2>&1 | tee -a build.log
+            echo "--- disk ---" | tee -a build.log
+            df -h / | tee -a build.log
+            du -sh rust-source/build 2>/dev/null | tee -a build.log
+            exit 1
+          fi
+
+      - name: Package RustToolchain
+        run: |-
+          set -o pipefail
+          echo "===== package =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh package 2>&1 | tee -a build.log
+
+      # std is packaged separately from the compiler (the largest part of the
+      # payload, and the part a device often does not need at all).
+      - name: Package std
+        run: |-
+          set -o pipefail
+          echo "===== std =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh std 2>&1 | tee -a build.log
+
+      - name: Build Rust.xcframework
+        if: env.BUILD_XCFRAMEWORK == 'true'
+        run: |-
+          set -o pipefail
+          echo "===== xcframework =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee -a build.log
+
+      - name: Upload RustToolchain + std
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustios-toolchain-${{ env.RUST_VERSION }}
+          path: |-
+            artifacts/RustToolchain-*.tar.xz
+            artifacts/RustStd-*.tar.xz
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload Rust.xcframework
+        if: always() && env.BUILD_XCFRAMEWORK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustios-xcframework-${{ env.RUST_VERSION }}
+          path: artifacts/Rust.xcframework-*.tar.xz
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-from-artifact-logs-${{ env.RUST_VERSION }}
+          path: |-
+            build.log
+            artifacts/REPORT.txt
+            rust-source/bootstrap.toml
+            rust-source/build/*.log
+            rust-source/build/**/*.log
+            work/SwiftLLVM/*/llvm-config.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # `workflow_dispatch` has no pull_request context, so the PR is found
+      # from the branch name. Without one (e.g. dispatched on main) this is
+      # skipped.
+      - name: Report to pull request
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+          LLVM_VERSION: ${{ steps.llvm.outputs.llvm_version }}
+          SOURCE_RUN: ${{ needs.resolve.outputs.run_id }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |-
+          set -euo pipefail
+          pr="$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "${GITHUB_REF_NAME}" \
+                  --state open --json number --jq '.[0].number // empty')"
+          if [ -z "${pr}" ]; then
+            echo "no open pull request for ${GITHUB_REF_NAME}; not commenting"
+            exit 0
+          fi
+          {
+            echo "### rustios (from artifact): ${JOB_STATUS}"
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "Shared LLVM: \`${LLVM_VERSION:-unknown}\` taken from run ${SOURCE_RUN} (commit \`${SOURCE_SHA}\`); the Swift job was **not** re-run. Rust ${RUST_VERSION}."
+            echo
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "| artifact | size |"
+              echo "| --- | --- |"
+              for f in artifacts/*.tar.xz; do
+                if [ -e "$f" ]; then
+                  echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+                fi
+              done
+              echo
+              echo "SHA-256:"
+              echo
+              echo '```'
+              cat artifacts/SHA256SUMS.txt 2>/dev/null || echo "(no checksums)"
+              echo '```'
+              if [ -s artifacts/REPORT.txt ]; then
+                echo
+                echo "<details><summary>artifact report</summary>"
+                echo
+                echo '```'
+                cat artifacts/REPORT.txt
+                echo '```'
+                echo
+                echo "</details>"
+              fi
+            else
+              echo "Build failed. Tail of build.log:"
+              echo
+              echo '```'
+              if [ -s build.log ]; then
+                tail -c 50000 build.log | tail -n 300
+              else
+                echo "(build.log is empty - the failure happened before the first command)"
+              fi
+              echo '```'
+              if [ -s artifacts/REPORT.txt ]; then
+                echo
+                echo "artifact report:"
+                echo
+                echo '```'
+                cat artifacts/REPORT.txt
+                echo '```'
+              fi
+            fi
+          } > report.md
+          PR_NUMBER="${pr}" Scripts/pr-report.sh "rustios-rust-from-artifact-report" report.md
+
+      - name: Summary
+        if: always()
+        run: |-
+          {
+            echo "## rustios ${RUST_VERSION} (Rust only, from artifact)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| host / target | \`aarch64-apple-ios\` |"
+            echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
+            echo "| shared LLVM | \`${{ steps.llvm.outputs.llvm_version }}\` from run ${{ needs.resolve.outputs.run_id }} |"
+            echo "| source commit | \`${{ needs.resolve.outputs.source_sha }}\` |"
+            echo "| cache hit (sources) | \`${{ steps.cache-rust-src.outputs.cache-hit }}\` |"
+            echo
+            echo '```'
+            ls -lh artifacts 2>/dev/null || true
+            echo '```'
+            cat artifacts/SHA256SUMS.txt 2>/dev/null || true
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,205 @@
+# rustios patch: compile the C API into rustc_driver_impl
+#
+# rustios-patch-mode: all
+#   Every mode: the C API is what Rust.xcframework ships, independent of
+#   which LLVM the compiler links.
+#
+# Why: Rust.xcframework ships the compiler as a static archive
+# (libRustCompiler.a). A separate `staticlib` crate that does
+# `extern crate rustc_driver_impl` cannot be compiled against a *static*
+# rustc: loading that crate's metadata needs the proc-macro dependencies
+# (derive_where, ...) as dylibs of the build machine, and a static archive
+# contains no metadata at all. Four search orders were tried and all four
+# stop at:
+#
+#   error[E0463]: can't find crate for `derive_where`
+#     = note: ... which `rustc_driver_impl` depends on
+#
+# (or E0514 once the stage-0 copy of the crate is picked up instead).
+#
+# The C entry points are therefore compiled as part of rustc_driver_impl: the
+# objects are in libRustCompiler.a already, so `rustios_run` and
+# `rustios_version` resolve for the app without any metadata being looked up -
+# at app link time or at run time. The C interface itself (and its
+# documentation) is Scripts/rustios-driver/include/rustios.h in the rustios
+# repository; the module added here implements exactly that interface, and
+# Scripts/rustios-driver/rustios_driver.rs (the standalone shim this replaces)
+# is kept as the fallback for a tree that does not carry this patch.
+#
+# The module lives in the patch rather than in the repository because it has
+# to be an in-crate module: a `#[path]` pointing back into the checkout would
+# make the rustc sources depend on the layout of this repository.
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index a328298..2804477 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -86,6 +86,7 @@
+ pub mod pretty;
+ #[macro_use]
+ mod print;
++mod rustios_c_api;
+ mod session_diagnostics;
+ 
+ // Keep the OS parts of this `cfg` in sync with the `cfg` on the `libc`
+diff --git a/compiler/rustc_driver_impl/src/rustios_c_api.rs b/compiler/rustc_driver_impl/src/rustios_c_api.rs
+new file mode 100644
+index 0000000..d7b5d9b
+--- /dev/null
++++ b/compiler/rustc_driver_impl/src/rustios_c_api.rs
+@@ -0,0 +1,155 @@
++//! The rustios C API: this compiler behind a small `extern "C"` interface.
++//!
++//! `Rust.xcframework` ships the compiler as a static archive
++//! (`libRustCompiler.a`, built by `Scripts/build-rust-toolchain.sh`). A static
++//! archive is a bag of object files: a *separate* crate that says
++//! `extern crate rustc_driver_impl` and is compiled as a `staticlib` against
++//! the sysroot cannot be built, because loading that crate's metadata needs
++//! the proc-macro dependencies (`derive_where` and friends) that only exist as
++//! dylibs of the build machine - `E0463` for every search order.
++//!
++//! The entry points therefore live in `rustc_driver_impl` itself: the objects
++//! are already in the archive, so an app that links `libRustCompiler.a`
++//! resolves `rustios_run` without any crate metadata being found, either when
++//! the app is built or when it runs.
++//!
++//! The interface is `Scripts/rustios-driver/include/rustios.h` in the rustios
++//! repository; `Scripts/rustios-driver/rustios_driver.rs` is the standalone
++//! shim it used to be compiled from, kept as a fallback.
++
++use std::ffi::CStr;
++use std::os::raw::{c_char, c_int};
++use std::sync::atomic::{AtomicU8, Ordering};
++use std::sync::Once;
++
++use rustc_interface::util;
++use rustc_session::config::ErrorOutputType;
++use rustc_session::EarlyDiagCtxt;
++
++use crate::{
++    DEFAULT_BUG_REPORT_URL, EXIT_FAILURE, EXIT_SUCCESS, TimePassesCallbacks, catch_with_exit_code,
++    init_rustc_env_logger, install_ice_hook, run_compiler,
++};
++
++/// Compilation finished without errors (`RUSTIOS_OK` in `rustios.h`).
++pub const RUSTIOS_OK: c_int = EXIT_SUCCESS;
++/// Compilation failed; diagnostics were emitted (`RUSTIOS_FAILED`).
++pub const RUSTIOS_FAILED: c_int = EXIT_FAILURE;
++/// The argument vector was invalid (`RUSTIOS_INVALID_ARGS`).
++pub const RUSTIOS_INVALID_ARGS: c_int = 2;
++/// The compiler panicked, i.e. this is an ICE (`RUSTIOS_ICE`).
++pub const RUSTIOS_ICE: c_int = 101;
++
++/// Stack size of the thread the compiler runs on.
++///
++/// `rustc` is normally started by a shell with a multi-megabyte stack. An iOS
++/// app's main thread has one megabyte, and overflowing it inside a static
++/// library takes the whole app down instead of failing the compilation.
++const COMPILER_STACK_SIZE: usize = 64 * 1024 * 1024;
++
++/// Reserve for the NUL-terminated version string. `rustc --version` prints
++/// "1.94.0 (1f7f2d1 2026-01-15)"; 128 bytes leave room for a nightly suffix.
++const VERSION_BUF_LEN: usize = 128;
++
++/// Storage for the NUL-terminated version string, filled on first use.
++///
++/// A fixed buffer instead of `CString`/`OnceLock`: `libRustCompiler.a` ships as
++/// a static archive, and the generic instances a `OnceLock` closure needs are
++/// only synthesized by a *final* `rustc` link, so they would be undefined in
++/// the archive (see `add_allocator_shims` in
++/// `Scripts/build-rust-toolchain.sh`). This module therefore stays on plain
++/// non-generic functions and statics, and allocates nothing.
++static VERSION_BUF: [AtomicU8; VERSION_BUF_LEN] = [const { AtomicU8::new(0) }; VERSION_BUF_LEN];
++/// 0 until `VERSION_BUF` holds the version, 1 afterwards.
++static VERSION_READY: AtomicU8 = AtomicU8::new(0);
++
++/// Version of the embedded compiler, e.g. "1.94.0 (1f7f2d1 2026-01-15)",
++/// copied into `VERSION_BUF` and NUL-terminated.
++fn version_cstr() -> *const c_char {
++    if VERSION_READY.load(Ordering::Acquire) == 0 {
++        let version = util::rustc_version_str().unwrap_or("unknown");
++        let bytes = version.as_bytes();
++        // The version string is ASCII and contains no NUL byte, so the copy is
++        // unconditional; two threads racing here write identical bytes.
++        let len = bytes.len().min(VERSION_BUF_LEN - 1);
++        for (dst, src) in VERSION_BUF.iter().zip(bytes.iter()).take(len) {
++            dst.store(*src, Ordering::Relaxed);
++        }
++        VERSION_BUF[len].store(0, Ordering::Relaxed);
++        VERSION_READY.store(1, Ordering::Release);
++    }
++    VERSION_BUF.as_ptr().cast::<u8>() as *const c_char
++}
++
++/// NUL-terminated version string of the embedded compiler.
++///
++/// The returned pointer refers to static storage and must not be freed.
++#[unsafe(no_mangle)]
++pub extern "C" fn rustios_version() -> *const c_char {
++    version_cstr()
++}
++
++/// Run the compiler with a conventional `argv` (`argv[0]` is the program name).
++///
++/// # Safety
++///
++/// `argv` must point to `argc` valid, NUL-terminated C strings that stay alive
++/// for the duration of the call.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn rustios_run(argc: c_int, argv: *const *const c_char) -> c_int {
++    if argc <= 0 || argv.is_null() {
++        return RUSTIOS_INVALID_ARGS;
++    }
++
++    let mut args: Vec<String> = Vec::with_capacity(argc as usize);
++    for i in 0..argc as usize {
++        // SAFETY: the caller guarantees that `argv` has `argc` valid entries.
++        let ptr = unsafe { *argv.add(i) };
++        if ptr.is_null() {
++            return RUSTIOS_INVALID_ARGS;
++        }
++        // SAFETY: non-null and NUL-terminated per the function contract above.
++        match unsafe { CStr::from_ptr(ptr) }.to_str() {
++            Ok(arg) => args.push(arg.to_owned()),
++            Err(_) => return RUSTIOS_INVALID_ARGS,
++        }
++    }
++
++    let in_thread = args.clone();
++    match std::thread::Builder::new()
++        .name("rustios".to_owned())
++        .stack_size(COMPILER_STACK_SIZE)
++        .spawn(move || run_args(&in_thread))
++    {
++        // A panic that is not a fatal error is an ICE; the ICE hook has
++        // already printed it, so only the exit code is left to report.
++        Ok(handle) => handle.join().unwrap_or(RUSTIOS_ICE),
++        // Could not spawn a thread (out of memory): compile on the caller's
++        // stack rather than refusing to run at all.
++        Err(_) => run_args(&args),
++    }
++}
++
++/// Process-wide initialisation, done once: the logger can be installed only
++/// once per process and the app may call `rustios_run` many times.
++///
++/// `install_ctrlc_handler` is deliberately not called: iOS apps get their
++/// interrupts as signals from the system, and installing rustc's handler would
++/// fight the app's own.
++fn init_once() {
++    static INIT: Once = Once::new();
++    INIT.call_once(|| {
++        let early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
++        init_rustc_env_logger(&early_dcx);
++        install_ice_hook(DEFAULT_BUG_REPORT_URL, |_| ());
++    });
++}
++
++fn run_args(args: &[String]) -> c_int {
++    init_once();
++    let mut callbacks = TimePassesCallbacks::default();
++    match catch_with_exit_code(|| run_compiler(args, &mut callbacks)) {
++        EXIT_SUCCESS => RUSTIOS_OK,
++        _ => RUSTIOS_FAILED,
++    }
++}

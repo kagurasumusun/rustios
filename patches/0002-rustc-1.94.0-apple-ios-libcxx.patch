@@ -1,0 +1,42 @@
+# rustios patch: link libc++ instead of libstdc++ for aarch64-apple-ios
+#
+# rustios-patch-mode: all
+#   Every mode: a rustc built for aarch64-apple-ios links -lstdc++
+#   whatever LLVM it uses (rustc's build script tests for `darwin`).
+#
+# Why: compiler/rustc_llvm/build.rs picks the C++ runtime with
+# `target.contains("darwin")`, which is true for aarch64-apple-darwin but false
+# for aarch64-apple-ios. The iOS compiler then links `-lstdc++`, and no Apple
+# SDK ships that library:
+#
+#   ld: library 'stdc++' not found
+#   clang: error: linker command failed with exit code 1
+#
+# Every Apple platform uses libc++, so the test becomes `apple` (which also
+# covers darwin, tvos, watchos, visionos). This is not a difference between the
+# two LLVM trees - it is a cross-host build of rustc that rustc does not
+# exercise by itself.
+#
+# Note: the `-lz` branch a few lines above uses the same `darwin` test and is
+# deliberately left alone - the shared Swift LLVM is built with
+# -DLLVM_ENABLE_ZLIB:BOOL=OFF, so zlib is not a dependency of these libraries.
+
+diff --git a/compiler/rustc_llvm/build.rs b/compiler/rustc_llvm/build.rs
+index c58dd64..7cea385 100644
+--- a/compiler/rustc_llvm/build.rs
++++ b/compiler/rustc_llvm/build.rs
+@@ -385,9 +385,13 @@ fn main() {
+     let llvm_static_stdcpp = tracked_env_var_os("LLVM_STATIC_STDCPP");
+     let llvm_use_libcxx = tracked_env_var_os("LLVM_USE_LIBCXX");
+ 
++    // rustios: this check is `darwin` upstream, which is false for
++    // aarch64-apple-ios; the target then fell through to `stdc++`, a library no
++    // Apple SDK provides ("ld: library 'stdc++' not found"). Every Apple
++    // platform uses libc++.
+     let stdcppname = if target.contains("openbsd") {
+         if target.contains("sparc64") { "estdc++" } else { "c++" }
+-    } else if target.contains("darwin")
++    } else if target.contains("apple")
+         || target.contains("freebsd")
+         || target.contains("windows-gnullvm")
+         || target.contains("aix")

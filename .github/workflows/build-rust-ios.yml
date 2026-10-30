@@ -1,0 +1,969 @@
+name: build-rust-ios
+
+# Builds, from *one* LLVM, both compilers of a shared-LLVM iOS toolchain:
+#
+#   swift job : Swift 6.4 for iOS + the LLVM it is built from (macOS and iOS
+#               slices), packaged as SwiftToolchain / SwiftLLVM / LLVM.xcframework
+#   rust job  : rustc for iOS built against *that* LLVM - bootstrap is given a
+#               `llvm-config` in the Swift LLVM tree, so src/llvm-project is
+#               never checked out and no Rust-specific LLVM is built
+#
+# Both jobs run on macOS, which is only the build environment: every shipped
+# binary is verified to be iOS/arm64 (see `verify`). Packaging follows
+# emexlab/LLVM-On-iOS, but - unlike the reference workflow - every artifact is
+# actually produced and uploaded (`if-no-files-found: error`).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      # A push cancels the run in progress (see `concurrency`), and a run is
+      # ~4.5 h of LLVM/Swift plus the Rust build, so only changes to the Swift
+      # half start one. Rust-side iteration (`Scripts/build-rust-toolchain.sh`,
+      # `Scripts/llvm-config-shim.py`, docs) uses build-rust-from-artifact,
+      # which takes the LLVM from an existing artifact - otherwise every Rust
+      # fix would throw away a Swift build that is hours old.
+      - ".github/workflows/build-rust-ios.yml"
+      - "Makefile"
+      - "Scripts/build-swift-toolchain.sh"
+      - "Scripts/swift-ios-toolchain-presets.ini"
+  workflow_dispatch:
+    inputs:
+      rust_version:
+        description: "Rust release tag to build (must expect the Swift LLVM, see docs/llvm-sharing.md)"
+        required: true
+        default: "1.94.0"
+      ios_deployment_target:
+        description: "iOS deployment target"
+        required: true
+        default: "16.0"
+      stage:
+        description: "Bootstrap stage (2 = optimised self-hosting compiler)"
+        required: true
+        default: "2"
+      build_xcframework:
+        description: "Also build Rust.xcframework (needs rustc_private)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  # The build reports its outcome (and the reason for a failure) as a PR
+  # comment, because the job logs are not reachable from everywhere.
+  pull-requests: write
+
+concurrency:
+  group: build-rust-ios-${{ github.ref }}
+  # Do *not* cancel a run in progress: a run is ~4.5 h of Swift + LLVM, and
+  # GitHub's `pull_request` path filter matches the whole PR diff, so every
+  # push to a branch that touches `Scripts/` starts a run - which used to throw
+  # away a build that had been going for hours. With `false`, a push only
+  # replaces the *pending* run, and the one that is running finishes (and saves
+  # the Swift cache, so the next run skips the 4.5 h build entirely).
+  cancel-in-progress: false
+
+env:
+  RUST_VERSION: ${{ github.event.inputs.rust_version || '1.94.0' }}
+  IOS_DEPLOYMENT_TARGET: ${{ github.event.inputs.ios_deployment_target || '16.0' }}
+  STAGE: ${{ github.event.inputs.stage || '2' }}
+  BUILD_XCFRAMEWORK: ${{ github.event.inputs.build_xcframework || 'true' }}
+  # The Swift release whose llvm-project the Rust compiler links.
+  SWIFT_BRANCH: swift-6.4.0-RELEASE
+  # Bump these to invalidate the caches below (e.g. after changing configure).
+  # 3: the shared LLVM now ships the whole rustc LLVM tool set
+  # (llvm-tools for lib/rustlib/<host>/bin), which only exists in a tree
+  # installed by the current build-swift-toolchain.sh.
+  # 4: the shared LLVM is built with llvm-targets-to-build=all (and with
+  # backtraces/terminfo on). A tree from 3 has neither, and llvm-project.txt in
+  # it has no `targets=` line, which the "Check the restored build" step treats
+  # as a miss - so this only makes the miss explicit and immediate.
+  # 5: install_llvm now links the rustc LLVM tools into the two finished build
+  # trees (the preset's build-toolchain-only=1 leaves bin/ almost empty) before
+  # installing them. Every tree cached under 4 has 0 of the 15 tools.
+  CACHE_VERSION: "5"
+  # Bump when the *build* recipe changes (the llvm/install-llvm/install-swift
+  # steps of build-swift-toolchain.sh, or the build-script invocation). Edits to
+  # verification or packaging must not invalidate the built tree - that is what
+  # CACHE_VERSION used to do, at the price of a 5.5 h rebuild per typo fix.
+  # 2: the trees are configured per tree (zlib OFF for iOS, ON for macOS) by
+  # seeding their CMake caches.
+  # 3: the preset sets build-embedded-stdlib=0. llvm-targets-to-build=AArch64
+  # needs it: without it compiler-rt's builtins project also builds the
+  # bare-metal ARM variants and fails on -arm-add-build-attributes (run
+  # 40470888454). Every tree cached under 2 was configured with the option on.
+  SWIFT_BUILD_RECIPE: "3"
+  # Never export SDKROOT: the build host is macOS, only the iOS compilation
+  # should see the iPhoneOS SDK (the scripts handle that themselves).
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Swift + the shared LLVM: build
+  #
+  # This job only *builds*; packaging, verification and the uploads are in
+  # `swift_package` below. The split exists because GitHub-hosted runners kill
+  # a job after 6 hours: with LLVM's full backend set (llvm-targets-to-build=all,
+  # the same list rust-lang/rust builds) the build fills most of that budget,
+  # and the run that also packaged it was cut off at 5 h 55 min while
+  # packaging, losing both artifacts.
+  # ---------------------------------------------------------------------------
+  swift:
+    name: swift 6.4 + LLVM for iOS (build)
+    timeout-minutes: 360
+    runs-on: macos-latest
+    outputs:
+      swift_version: ${{ steps.versions.outputs.swift_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |-
+          set -euo pipefail
+          # Everything below is also written to swift.log: the failure report
+          # only has that file, not the job log.
+          : > swift.log
+          {
+            uname -a
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-path
+            python3 --version
+            cmake --version | sed -n 1p
+            df -h /
+            Scripts/build-swift-toolchain.sh info
+          } 2>&1 | tee -a swift.log
+          info="$(Scripts/build-swift-toolchain.sh info)"
+          echo "llvm_version=$(printf '%s\n' "${info}" | sed -n 's/^llvm version *: //p')" >> "${GITHUB_OUTPUT}"
+          echo "swift_version=${SWIFT_BRANCH#swift-}" >> "${GITHUB_OUTPUT}"
+        id: versions
+
+      - name: Free disk space
+        run: |-
+          set -euo pipefail
+          shopt -s nullglob
+          echo "disk before:"; df -h /
+          # Keep the selected Xcode, drop the other copies.
+          selected="$(xcode-select -p)"
+          selected="${selected%/Contents/Developer}"
+          for xcode in /Applications/Xcode*.app; do
+            if [ "${xcode}" != "${selected}" ]; then
+              echo "removing ${xcode}"
+              sudo rm -rf "${xcode}"
+            fi
+          done
+          # Simulators are useless for device builds.
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          rm -rf "${HOME}/Library/Developer/Xcode/DerivedData" || true
+          rm -rf "${HOME}/Library/Developer/CoreSimulator" || true
+          echo "disk after:"; df -h /
+
+      - name: Install build dependencies
+        run: |-
+          set -euo pipefail
+          if ! command -v ninja >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ninja
+          fi
+          ninja --version
+
+      # A cold `update-checkout` of ~40 sibling repositories is 10-20 minutes of
+      # network time; the checkout itself is immutable for a given release, so
+      # it is worth caching. The build trees are not cached: they are far
+      # larger than the 10 GB cache limit of a repository.
+      - name: Restore Swift sources
+        id: cache-swift-src
+        uses: actions/cache/restore@v4
+        with:
+          path: swift-source
+          key: swift-src-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}
+
+      - name: Fetch Swift sources
+        run: |-
+          set -o pipefail
+          echo "===== swift fetch =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh fetch 2>&1 | tee -a swift.log
+
+      - name: Save Swift sources
+        continue-on-error: true
+        if: steps.cache-swift-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: swift-source
+          key: swift-src-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}
+
+      # The build itself is ~4.5 h on a 3-core runner and is a pure function of
+      # (sources, preset, this script), so its *outputs* are cached. The build
+      # trees are far too large for a cache; the two installed trees are not,
+      # and they are what the rest of the pipeline uses.
+      # The key must describe the *build* only: SWIFT_BUILD_RECIPE is bumped by
+      # hand when the build steps change, and the presets decide what
+      # build-script is asked to build. Hashing the whole script (as this used)
+      # made every edit to a verification or packaging function throw away
+      # 5.5 hours of work. `restore-keys` is the prefix, so an entry saved with
+      # an older recipe suffix is still restored - and then checked below
+      # rather than trusted.
+      - name: Restore the built LLVM and Swift compiler
+        id: cache-swift-built
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/SwiftLLVM
+            work/SwiftToolchain
+          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ env.SWIFT_BUILD_RECIPE }}-${{ hashFiles('Scripts/swift-ios-toolchain-presets.ini') }}
+          restore-keys: |
+            swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-
+
+      # A restored tree may be incomplete (a cancelled run saves whatever it
+      # has). Decide from the contents, not from the cache key.
+      - name: Check the restored build
+        id: swift-built
+        run: |-
+          set -euo pipefail
+          complete=false
+          if [ -x work/SwiftToolchain/bin/swift-frontend ] \
+             && [ -d work/SwiftLLVM/ios/lib ] && [ -d work/SwiftLLVM/macosx/lib ] \
+             && [ -x work/SwiftLLVM/ios/bin/llvm-config ]; then
+            complete=true
+          fi
+          # The cache key hashes the preset, but `restore-keys` is only a
+          # prefix, so a tree built with an older preset can still land here.
+          # The tree records the backend list it was configured with; a
+          # different (or missing) value means "not the tree this run needs".
+          # (`if [ -f ]`: with no tree at all, sed would exit 2 and `set -e`
+          # would abort the job - run 40282836710 did exactly that.)
+          expected_targets="$(sed -n 's/^llvm-targets-to-build=//p' Scripts/swift-ios-toolchain-presets.ini | head -1)"
+          recorded_targets=""
+          if [ -f work/SwiftLLVM/llvm-project.txt ]; then
+            recorded_targets="$(sed -n 's/^targets=//p' work/SwiftLLVM/llvm-project.txt | head -1)"
+          fi
+          if [ "${complete}" = true ] && [ "${recorded_targets}" != "${expected_targets}" ]; then
+            echo "cached LLVM was built with targets '${recorded_targets:-unknown}', the preset asks for '${expected_targets}': rebuilding" | tee -a swift.log
+            complete=false
+          fi
+          # What the tree actually reports, not just what it was asked for:
+          # `targets_built` is written by install_llvm from `--targets-built`.
+          # Only comparable when the preset names the backends (not `all`).
+          if [ "${complete}" = true ] && [ "${expected_targets}" != all ] && [ -f work/SwiftLLVM/llvm-project.txt ]; then
+            expected_built="$(printf '%s' "${expected_targets}" | tr ';' '\n' | sort | paste -sd';' -)"
+            recorded_built="$(sed -n 's/^targets_built=//p' work/SwiftLLVM/llvm-project.txt | head -1)"
+            if [ "${recorded_built}" != "${expected_built}" ]; then
+              echo "cached LLVM reports backends '${recorded_built:-unknown}', expected '${expected_built}': rebuilding" | tee -a swift.log
+              complete=false
+            fi
+          fi
+          # zlib differs per tree on purpose (macOS tree ON, iOS tree OFF, like
+          # rust's own host and apple-mobile LLVM); check both, because a tree
+          # restored through the prefix rule may predate that.
+          zlib_of() {
+            sed -n 's/^#define LLVM_ENABLE_ZLIB \([01]\)[[:space:]]*$/\1/p' "$1/include/llvm/Config/llvm-config.h" 2>/dev/null | head -1
+          }
+          macosx_zlib="$(zlib_of work/SwiftLLVM/macosx)"
+          ios_zlib="$(zlib_of work/SwiftLLVM/ios)"
+          if [ "${complete}" = true ] && { [ "${macosx_zlib}" != "1" ] || [ "${ios_zlib}" != "0" ]; }; then
+            echo "cached LLVM has zlib macOS='${macosx_zlib:-unknown}' iOS='${ios_zlib:-unknown}', expected 1/0: rebuilding" | tee -a swift.log
+            complete=false
+          fi
+          echo "complete=${complete}" >> "${GITHUB_OUTPUT}"
+          if [ "${complete}" = true ]; then
+            {
+              echo "reusing the cached Swift + LLVM build:"
+              du -sh work/SwiftLLVM work/SwiftToolchain
+              work/SwiftLLVM/ios/bin/llvm-config --version
+              echo "backends: $(work/SwiftLLVM/ios/bin/llvm-config --targets-built)"
+            } 2>&1 | tee -a swift.log
+          else
+            echo "no complete cached build for targets '${expected_targets}'; building Swift + LLVM" | tee -a swift.log
+          fi
+      # Swift 6.4's build-script builds the two LLVM trees (macOS: the compiler
+      # that does the work, iOS: the one that is shipped and that rustc links
+      # against) and the two Swift compilers in one invocation; see
+      # Scripts/build-swift-toolchain.sh. ~4 hours on a 3-core runner.
+      - name: Build Swift + LLVM for iOS
+        if: steps.swift-built.outputs.complete != 'true'
+        run: |-
+          set -o pipefail
+          echo "===== swift llvm =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh llvm 2>&1 | tee -a swift.log
+
+      - name: Collect the iOS Swift compiler
+        if: steps.swift-built.outputs.complete != 'true'
+        run: |-
+          set -o pipefail
+          echo "===== swift install-swift =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh install-swift 2>&1 | tee -a swift.log
+
+      - name: Save the built LLVM and Swift compiler
+        continue-on-error: true
+        if: always() && steps.swift-built.outputs.complete != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            work/SwiftLLVM
+            work/SwiftToolchain
+          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ env.SWIFT_BUILD_RECIPE }}-${{ hashFiles('Scripts/swift-ios-toolchain-presets.ini') }}
+
+      - name: Upload Swift logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-logs
+          path: |-
+            swift.log
+            artifacts/REPORT.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |-
+          {
+            echo "## rustios: Swift + shared LLVM (build)"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| Swift | \`${SWIFT_BRANCH}\` |"
+            echo "| LLVM | \`$(work/SwiftLLVM/ios/bin/llvm-config --version 2>/dev/null || echo unknown)\` (macOS + iOS) |"
+            echo "| backends | \`$(sed -n 's/^llvm-targets-to-build=//p' Scripts/swift-ios-toolchain-presets.ini | head -1)\` |"
+            echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
+            echo "| cache hit (sources) | \`${{ steps.cache-swift-src.outputs.cache-hit }}\` |"
+            echo "| reused the cached build | \`${{ steps.swift-built.outputs.complete }}\` |"
+            echo
+            echo '```'
+            du -sh work/SwiftLLVM work/SwiftToolchain 2>/dev/null || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      # This job owns its own comment (Scripts/pr-report.sh finds it by a marker
+      # and edits it), so the Rust job's report cannot overwrite the reason why
+      # the Swift half failed - which is exactly what happened to run
+      # 40150617119, whose failure text was replaced by the Rust report.
+      - name: Report to pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |-
+          set -euo pipefail
+          {
+            echo "### rustios Swift half: ${JOB_STATUS}"
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "Swift 6.4 and its LLVM were built for iOS/arm64. Packaging and verification run in the swift_package job."
+            else
+              echo "The Swift half failed. Tail of swift.log:"
+            fi
+            echo
+            if [ "${JOB_STATUS}" != "success" ]; then
+              echo '```'
+              if [ -s swift.log ]; then
+                # `swift.log` without the compiler's progress lines, which are
+                # thousands of lines long and hide the reason.
+                grep -v -E '^\[[0-9]+/[0-9]+\]|^\s*(Compiling|Building|Linking) ' swift.log \
+                  | tail -n 250 || tail -n 250 swift.log
+              else
+                echo "(swift.log is empty - the failure happened before the first command)"
+              fi
+              echo '```'
+            fi
+            if [ -s artifacts/REPORT.txt ]; then
+              echo
+              echo "<details><summary>artifact report</summary>"
+              echo
+              echo '```'
+              cat artifacts/REPORT.txt
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "Artifacts of this run: [swift-llvm](${RUN_URL}#artifacts) / swift-toolchain"
+          } > swift-report.md
+          Scripts/pr-report.sh "rustios-swift-report" swift-report.md
+
+  # ---------------------------------------------------------------------------
+  # Swift + the shared LLVM: package, verify, upload
+  #
+  # Everything here used to live at the end of `swift` and pushed that job over
+  # the 6 h limit. The two trees are handed over through the cache entries the
+  # build job saves (`swift-built-*`: work/SwiftLLVM + work/SwiftToolchain),
+  # restored with the identical key.
+  # ---------------------------------------------------------------------------
+  swift_package:
+    name: swift 6.4 + LLVM for iOS (package)
+    needs: swift
+    timeout-minutes: 180
+    runs-on: macos-latest
+    outputs:
+      # Read from the LLVM that was packaged, not from the source tree: with a
+      # restored build the checkout may not carry the version file, and
+      # "unknown" in the report hides which LLVM rustc was linked against.
+      llvm_version: ${{ steps.llvm-version.outputs.llvm_version }}
+      swift_version: ${{ steps.versions.outputs.swift_version }}
+      # Whether the shared LLVM artifact exists. The rust job only needs that,
+      # so it runs even when the Swift toolchain part of this job fails.
+      llvm_uploaded: ${{ steps.llvm-ready.outputs.uploaded }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show environment
+        id: versions
+        run: |-
+          set -euo pipefail
+          : > swift.log
+          {
+            uname -a
+            xcodebuild -version
+            python3 --version
+            df -h /
+          } 2>&1 | tee -a swift.log
+          echo "swift_version=${SWIFT_BRANCH#swift-}" >> "${GITHUB_OUTPUT}"
+
+      # The build itself is ~4.5 h on a 3-core runner and is a pure function of
+      # (sources, preset, this script), so its *outputs* are cached. The build
+      # trees are far too large for a cache; the two installed trees are not,
+      # and they are what the rest of the pipeline uses.
+      # The key must describe the *build* only: SWIFT_BUILD_RECIPE is bumped by
+      # hand when the build steps change, and the presets decide what
+      # build-script is asked to build. Hashing the whole script (as this used)
+      # made every edit to a verification or packaging function throw away
+      # 5.5 hours of work. `restore-keys` is the prefix, so an entry saved with
+      # an older recipe suffix is still restored - and then checked below
+      # rather than trusted.
+      - name: Restore the built LLVM and Swift compiler
+        id: cache-swift-built
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/SwiftLLVM
+            work/SwiftToolchain
+          key: swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-${{ env.SWIFT_BUILD_RECIPE }}-${{ hashFiles('Scripts/swift-ios-toolchain-presets.ini') }}
+          restore-keys: |
+            swift-built-${{ env.CACHE_VERSION }}-${{ env.SWIFT_BRANCH }}-
+
+      # The build job hands its result over through the cache, so fail in
+      # seconds with a readable reason when that did not happen.
+      - name: Check the restored build
+        run: |-
+          set -euo pipefail
+          missing=""
+          [ -x work/SwiftToolchain/bin/swift-frontend ] || missing="${missing} SwiftToolchain/bin/swift-frontend"
+          [ -x work/SwiftLLVM/ios/bin/llvm-config ] || missing="${missing} SwiftLLVM/ios/bin/llvm-config"
+          [ -d work/SwiftLLVM/ios/lib ] || missing="${missing} SwiftLLVM/ios/lib"
+          [ -d work/SwiftLLVM/macosx/lib ] || missing="${missing} SwiftLLVM/macosx/lib"
+          if [ -n "${missing}" ]; then
+            echo "the tree saved by the swift job is missing:${missing}" >&2
+            echo "(the build job must finish and save swift-built-* before this job can package)" >&2
+            exit 1
+          fi
+          du -sh work/SwiftLLVM work/SwiftToolchain | tee -a swift.log
+          cat work/SwiftLLVM/llvm-project.txt | tee -a swift.log
+      # Package and upload before verifying: four and a half hours of build
+      # must not be thrown away by a bug (or a stricter check) in a later step,
+      # and the rust job can start from the artifact either way.
+      - name: Package the shared LLVM
+        run: |-
+          set -o pipefail
+          echo "===== swift package-llvm =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh package-llvm 2>&1 | tee -a swift.log
+
+      - name: Record the shared LLVM version
+        id: llvm-version
+        run: |-
+          set -euo pipefail
+          v="$(work/SwiftLLVM/ios/bin/llvm-config --version)"
+          echo "llvm_version=${v}" >> "${GITHUB_OUTPUT}"
+          echo "llvm-config (iOS) reports ${v}" | tee -a swift.log
+
+      - name: Upload SwiftLLVM
+        id: upload-llvm
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-llvm
+          path: artifacts/SwiftLLVM-*.tar.xz
+          if-no-files-found: error
+          retention-days: 90
+
+      # Read by the rust job, which needs the LLVM but not the Swift compiler.
+      - name: Record that the shared LLVM is available
+        if: always()
+        run: |-
+          if compgen -G "artifacts/SwiftLLVM-*.tar.xz" >/dev/null; then
+            echo "uploaded=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "uploaded=false" >> "${GITHUB_OUTPUT}"
+          fi
+        id: llvm-ready
+
+      - name: Verify the LLVM slices
+        run: |-
+          set -o pipefail
+          echo "===== swift verify (llvm) =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
+
+      # Packaging comes *before* the verification: a bug in a check must never
+      # throw away a build that took hours (that is how the 5.5 h run
+      # 40150617119 ended with no SwiftToolchain artifact at all).
+      - name: Package SwiftToolchain and LLVM.xcframework
+        run: |-
+          set -o pipefail
+          echo "===== swift package =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh package 2>&1 | tee -a swift.log
+          echo "===== swift llvm-xcframework =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh llvm-xcframework 2>&1 | tee -a swift.log
+
+      - name: Upload Swift artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-toolchain
+          path: |-
+            artifacts/SwiftToolchain-*.tar.xz
+            artifacts/LLVM.xcframework-*.tar.xz
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Verify the Swift toolchain
+        run: |-
+          set -o pipefail
+          echo "===== swift verify =====" | tee -a swift.log
+          Scripts/build-swift-toolchain.sh verify 2>&1 | tee -a swift.log
+
+      - name: Upload Swift logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-package-logs
+          path: |-
+            swift.log
+            artifacts/REPORT.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |-
+          {
+            echo "## rustios: Swift + shared LLVM"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| Swift | \`${SWIFT_BRANCH}\` |"
+            echo "| LLVM | \`${{ steps.llvm-version.outputs.llvm_version }}\` (macOS + iOS) |"
+            echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
+            echo "| cache hit (sources) | \`${{ steps.cache-swift-src.outputs.cache-hit }}\` |"
+            echo
+            echo '```'
+            cat artifacts/SHA256SUMS.txt 2>/dev/null || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Own marker: the build job has its own comment (found by a marker
+      # too), so neither report can overwrite the other
+      # the Swift half failed - which is exactly what happened to run
+      # 40150617119, whose failure text was replaced by the Rust report.
+      - name: Report to pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |-
+          set -euo pipefail
+          {
+            echo "### rustios Swift half (package): ${JOB_STATUS}"
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "Swift 6.4 and its LLVM were built, packaged and verified for iOS/arm64."
+            else
+              echo "The Swift half failed. Tail of swift.log:"
+            fi
+            echo
+            if [ "${JOB_STATUS}" != "success" ]; then
+              echo '```'
+              if [ -s swift.log ]; then
+                # `swift.log` without the compiler's progress lines, which are
+                # thousands of lines long and hide the reason.
+                grep -v -E '^\[[0-9]+/[0-9]+\]|^\s*(Compiling|Building|Linking) ' swift.log \
+                  | tail -n 250 || tail -n 250 swift.log
+              else
+                echo "(swift.log is empty - the failure happened before the first command)"
+              fi
+              echo '```'
+            fi
+            if [ -s artifacts/REPORT.txt ]; then
+              echo
+              echo "<details><summary>artifact report</summary>"
+              echo
+              echo '```'
+              cat artifacts/REPORT.txt
+              echo '```'
+              echo
+              echo "</details>"
+            fi
+            echo
+            echo "Artifacts of this run: [swift-llvm](${RUN_URL}#artifacts) / swift-toolchain"
+          } > swift-report.md
+          Scripts/pr-report.sh "rustios-swift-package-report" swift-report.md
+
+  # ---------------------------------------------------------------------------
+  # rustc, linked against the Swift LLVM
+  # ---------------------------------------------------------------------------
+  build:
+    name: rustc for iOS (aarch64-apple-ios)
+    # Everything this job produces is iOS/arm64 (macOS is only the build
+    # environment). Non-iOS binaries make `verify`/`package` fail.
+    needs: swift_package
+    # Run as long as the shared LLVM exists: a failure in the Swift compiler
+    # half must not hide the answer to the question this job exists for (does
+    # rustc link Swift's LLVM?).
+    if: always() && needs.swift_package.outputs.llvm_uploaded == 'true'
+    # Stage 1 (build-machine rustc) and stage 2 (rustc that runs on iOS) each
+    # compile the compiler, so this is the second longest job in the workflow.
+    # GitHub-hosted runners allow at most 6 h; a timeout discards every product
+    # of the run, so use the whole budget.
+    timeout-minutes: 360
+    runs-on: macos-latest
+    outputs:
+      rust_version: ${{ steps.version.outputs.rust_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The LLVM that the compiler is built against: built by the swift job,
+      # packaged and uploaded by the swift_package job, consumed here through
+      # the relocatable llvm-config shims inside it.
+      - name: Download the shared LLVM
+        uses: actions/download-artifact@v4
+        with:
+          name: swift-llvm
+          path: swift-llvm
+
+      - name: Unpack the shared LLVM
+        run: |-
+          set -euo pipefail
+          mkdir -p work
+          tar -xJf swift-llvm/SwiftLLVM-*.tar.xz -C work
+          test -x work/SwiftLLVM/ios/bin/llvm-config
+          test -x work/SwiftLLVM/macosx/bin/llvm-config
+          echo "llvm-config (iOS) says: $(work/SwiftLLVM/ios/bin/llvm-config --version)"
+          echo "llvm-config (macOS) says: $(work/SwiftLLVM/macosx/bin/llvm-config --version)"
+          test -d work/SwiftLLVM/ios/include/llvm
+          ls work/SwiftLLVM/ios/lib | head
+          # Fail in seconds, not after the two compiler stages: these are the
+          # properties whose violation otherwise only shows up as a link error
+          # at the end of the build (a library missing from the iOS slice, a
+          # macOS archive in the iOS tree, headers and libraries that disagree).
+          Scripts/build-rust-toolchain.sh preflight
+
+      - name: Show environment
+        run: |-
+          set -euo pipefail
+          uname -a
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          python3 --version
+          df -h /
+          Scripts/build-rust-toolchain.sh info
+          echo "rust_version=${RUST_VERSION}" >> "${GITHUB_OUTPUT}"
+        id: version
+
+      - name: Free disk space
+        run: |-
+          set -euo pipefail
+          shopt -s nullglob
+          echo "disk before:"; df -h /
+          selected="$(xcode-select -p)"
+          selected="${selected%/Contents/Developer}"
+          for xcode in /Applications/Xcode*.app; do
+            if [ "${xcode}" != "${selected}" ]; then
+              echo "removing ${xcode}"
+              sudo rm -rf "${xcode}"
+            fi
+          done
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          rm -rf "${HOME}/Library/Developer/Xcode/DerivedData" || true
+          rm -rf "${HOME}/Library/Developer/CoreSimulator" || true
+          echo "disk after:"; df -h /
+
+      - name: Install build dependencies
+        run: |-
+          set -euo pipefail
+          if ! command -v ninja >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install ninja
+          fi
+          ninja --version
+
+      # Only the Rust checkout + the submodule it still needs
+      # (library/backtrace). src/llvm-project is *not* fetched: nothing builds
+      # it, and that is the point of the shared LLVM.
+      #
+      # sccache is deliberately not used: its GitHub Actions backend talks to
+      # Azure storage, and a single transient storage error there aborts the
+      # compiler invocation (it killed a run at the first LLVM object file with
+      # "cache storage failed to read").
+      - name: Restore Rust sources
+        id: cache-rust-src
+        uses: actions/cache/restore@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
+      - name: Fetch Rust sources
+        # Teed into build.log like the other steps: a failure here (a patch that
+        # does not apply, a git clone that times out) is otherwise reported as
+        # "(build.log is empty - the failure happened before the first command)",
+        # which says nothing. Run 40809695799 failed exactly here.
+        run: |
+          set -o pipefail
+          echo "===== fetch =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh fetch 2>&1 | tee -a build.log
+
+      - name: Save Rust sources
+        continue-on-error: true
+        if: steps.cache-rust-src.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: rust-source
+          key: rust-src-${{ env.CACHE_VERSION }}-${{ env.RUST_VERSION }}
+
+      - name: Configure bootstrap
+        run: |-
+          set -o pipefail
+          echo "===== configure =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh configure 2>&1 | tee -a build.log
+
+      # A cross-host build needs a compiler that runs on the build machine:
+      # stage 1 produces that compiler, stage 2 uses it to produce the compiler
+      # that runs on iOS. Both link the Swift LLVM, so there is no second LLVM
+      # build anywhere in this job.
+      - name: Build stage 1 (build-machine compiler)
+        run: |-
+          set -o pipefail
+          echo "===== build stage 1 (host phase) =====" | tee -a build.log
+          RUSTIOS_BUILD_PHASE=host Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
+
+      - name: Build stage 2 (rustc for iOS)
+        run: |-
+          set -o pipefail
+          echo "===== build stage 2 (target phase) =====" | tee -a build.log
+          RUSTIOS_BUILD_PHASE=target Scripts/build-rust-toolchain.sh build 2>&1 | tee -a build.log
+
+      # `set -e` deliberately not used: the exit code is reported explicitly,
+      # and on failure the state that matters is dumped into build.log (the
+      # only part of the run that is visible from the PR comment).
+      - name: Verify artifacts
+        run: |-
+          set -o pipefail
+          echo "===== verify =====" | tee -a build.log
+          rc=0
+          Scripts/build-rust-toolchain.sh verify 2>&1 | tee -a build.log || rc=$?
+          echo "verify exited with ${rc}" | tee -a build.log
+          if [ "${rc}" -ne 0 ]; then
+            for dir in rust-source/build/aarch64-apple-ios/stage2/bin \
+                       rust-source/build/aarch64-apple-ios/stage2/lib \
+                       rust-source/build/aarch64-apple-ios/stage2/lib/rustlib/aarch64-apple-ios/lib \
+                       rust-source/build/aarch64-apple-darwin/stage1/lib/rustlib/aarch64-apple-ios/lib; do
+              echo "--- ${dir} ---" | tee -a build.log
+              ls -la "${dir}" 2>&1 | head -40 | tee -a build.log
+            done
+            echo "--- bootstrap.toml ---" | tee -a build.log
+            sed 's/^/    /' rust-source/bootstrap.toml 2>&1 | tee -a build.log
+            echo "--- llvm-config calls ---" | tee -a build.log
+            tail -n 20 work/SwiftLLVM/ios/llvm-config.log 2>&1 | tee -a build.log
+            echo "--- disk ---" | tee -a build.log
+            df -h / | tee -a build.log
+            du -sh rust-source/build 2>/dev/null | tee -a build.log
+            exit 1
+          fi
+
+      - name: Package RustToolchain
+        run: |-
+          set -o pipefail
+          echo "===== package =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh package 2>&1 | tee -a build.log
+
+      # std is packaged separately from the compiler (the largest part of the
+      # payload, and the part a device often does not need at all).
+      - name: Package std
+        run: |-
+          set -o pipefail
+          echo "===== std =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh std 2>&1 | tee -a build.log
+
+      - name: Build Rust.xcframework
+        if: env.BUILD_XCFRAMEWORK == 'true'
+        run: |-
+          set -o pipefail
+          echo "===== xcframework =====" | tee -a build.log
+          Scripts/build-rust-toolchain.sh xcframework 2>&1 | tee -a build.log
+
+      - name: Upload RustToolchain + std
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustios-toolchain-${{ env.RUST_VERSION }}
+          path: |-
+            artifacts/RustToolchain-*.tar.xz
+            artifacts/RustStd-*.tar.xz
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload Rust.xcframework
+        if: always() && env.BUILD_XCFRAMEWORK == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustios-xcframework-${{ env.RUST_VERSION }}
+          path: artifacts/Rust.xcframework-*.tar.xz
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustios-logs-${{ env.RUST_VERSION }}
+          path: |-
+            build.log
+            artifacts/REPORT.txt
+            rust-source/bootstrap.toml
+            rust-source/build/*.log
+            rust-source/build/**/*.log
+            work/SwiftLLVM/*/llvm-config.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Job logs are only downloadable from GitHub's blob storage, which is not
+      # reachable from every environment; a PR comment with the tail of
+      # build.log is. It is edited in place on every run, so the PR never fills
+      # up with bot comments.
+      - name: Report to pull request
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+          SWIFT_LLVM_VERSION: ${{ needs.swift_package.outputs.llvm_version }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |-
+          set -euo pipefail
+          {
+            echo "### rustios build: ${JOB_STATUS}"
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "Shared LLVM: \`${SWIFT_LLVM_VERSION:-unknown}\` (from swift-6.4.0-RELEASE), Rust ${RUST_VERSION}."
+            echo
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo "| artifact | size |"
+              echo "| --- | --- |"
+              for f in artifacts/*.tar.xz; do
+                if [ -e "$f" ]; then
+                  echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+                fi
+              done
+              echo
+              echo "SHA-256:"
+              echo
+              echo '```'
+              cat artifacts/SHA256SUMS.txt 2>/dev/null || echo "(no checksums)"
+              echo '```'
+              if [ -s artifacts/REPORT.txt ]; then
+                echo
+                echo "<details><summary>artifact report</summary>"
+                echo
+                echo '```'
+                cat artifacts/REPORT.txt
+                echo '```'
+                echo
+                echo "</details>"
+              fi
+            else
+              echo "Build failed. Tail of build.log:"
+              echo
+              echo '```'
+              if [ -s build.log ]; then
+                tail -c 50000 build.log | tail -n 300
+              else
+                echo "(build.log is empty - the failure happened before the first command)"
+              fi
+              echo '```'
+              if [ -s artifacts/REPORT.txt ]; then
+                echo
+                echo "artifact report:"
+                echo
+                echo '```'
+                cat artifacts/REPORT.txt
+                echo '```'
+              fi
+            fi
+          } > report.md
+          Scripts/pr-report.sh "rustios-rust-report" report.md
+
+      - name: Summary
+        if: always()
+        run: |-
+          {
+            echo "## rustios ${RUST_VERSION}"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| host / target | \`${HOST_TRIPLE:-aarch64-apple-ios}\` |"
+            echo "| iOS deployment target | \`${IOS_DEPLOYMENT_TARGET}\` |"
+            echo "| shared LLVM | \`${{ needs.swift_package.outputs.llvm_version }}\` (Swift's) |"
+            echo "| cache hit (sources) | \`${{ steps.cache-rust-src.outputs.cache-hit }}\` |"
+            echo
+            echo '```'
+            ls -lh artifacts 2>/dev/null || true
+            echo '```'
+            cat artifacts/SHA256SUMS.txt 2>/dev/null || true
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  release:
+    name: Publish release
+    needs: [swift_package, build]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.swift_package.result == 'success' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "rustios ${GITHUB_REF_NAME}" \
+              --notes "Rust ${RUST_VERSION} + Swift 6.4 for aarch64-apple-ios (iOS ${IOS_DEPLOYMENT_TARGET}).
+
+          One LLVM (${{ needs.swift_package.outputs.llvm_version }}, the one Swift is built
+          from) is shared by both compilers:
+
+          * \`SwiftToolchain-*.tar.xz\` - the Swift compiler that runs on iOS
+          * \`SwiftLLVM-*.tar.xz\` - the shared LLVM (macOS + iOS static libraries)
+          * \`LLVM.xcframework-*.tar.xz\` - \`llvm.a\` + headers for iOS apps
+          * \`RustToolchain-*.tar.xz\` - rustc/rustdoc that run on iOS (no std)
+          * \`RustStd-*.tar.xz\` - std for iOS, shipped separately
+          * \`Rust.xcframework-*.tar.xz\` - the compiler as a static library with a C API"
+          fi
