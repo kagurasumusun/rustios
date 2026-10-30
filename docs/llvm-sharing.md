@@ -108,8 +108,8 @@ CI の履歴:
    `bin/` に rustc 用 15 ツールをビルド後に追加。Rust 側は
    `llvm-tools = true`（14/14 が sysroot に）、`optimized-compiler-builtins = true`
    （compiler-rt の C 実装 145 objects）、`codegen-tests = true`、
-   `lto=thin`/`codegen-units=1` でビルド。**C API 付き `Rust.xcframework` だけが
-   未達**（`E0463`、§6）。
+   `lto=thin`/`codegen-units=1` でビルド。当時は **C API 付き
+   `Rust.xcframework` だけが未達**（`E0463`）で、これを次の回で解決しました（§6）。
 10. **バックエンドを AArch64 だけにし、残りを全部閉じる回**（2026-10-27〜29）。
     * run 40470888454: Swift 側のビルドで失敗。原因は compiler-rt のベアメタル
       ARM builtins（下記）。
@@ -498,18 +498,18 @@ SWIFT_LLVM_DIR=/tmp/x     ARTIFACTS_DIR=/tmp/artifacts RUST_SOURCE_DIR=/tmp/rust
 | `bootstrap.toml` の生成、`src/llvm-project` を fetch しないこと、`patch_bootstrap_llvm` を適用しないこと | **実装済み・ローカルで確認済み**（スタブ環境） |
 | `verify_llvm_source()` の 3 チェック | **実装済み・ローカルで確認済み**（成功/失敗の両方） |
 | `llvm-config` shim の回答と再配置 | **CI で確認済み**（ホスト/iOS 両方の shim が LLVM 21.1.6 を報告、96 MB の artifact として受け渡し） |
-| Swift 6.4 の iOS ビルド（LLVM 2 種 + swift-frontend） | **CI で成功**（4 時間 21 分、`swift-frontend` は iOS/arm64） |
-| `swiftc`（ドライバ）の iOS 性 | **未確認／おそらくホスト用**: 直近の実行で macOS バイナリと判定。`swift-frontend` が iOS なのでコンパイラとしては成立するが、ドライバをデバイスで使うには追加対応が要る |
+| Swift 6.4 の iOS ビルド（LLVM 2 種 + swift-frontend） | **CI で成功**（冷間 3 h 21 m / `AArch64` のみ、キャッシュ復元時 3 m 49 s。`swift-frontend` は iOS/arm64） |
+| `swiftc`（ドライバ）の iOS 性 | **未確認／おそらくホスト用**: 直近の実行で macOS バイナリと判定（レポート `swiftc: MACOS (host binary; not counted as an iOS artifact)`）。`swift-frontend` が iOS なのでコンパイラとしては成立するが、ドライバをデバイスで使うには追加対応が要る |
 | Swift ツールチェーンに混ざるホスト（macOS）バイナリ | **既知**: LLVM-On-iOS も `lib/swift/host/compiler/*.dylib` を同梱。`verify` は内訳をレポートし、iOS と偽らない |
-| 静的ライブラリの iOS 性 | **実装**: シンボルテーブル（`__.SYMDEF`）を除いたメンバー（`.o`）を抽出して `vtool` で `platform IOS` を確認（`file` では ar archive としか出ないため）。実アーカイブでの確認は次回実行 |
-| Rust 1.94.0 が LLVM 21.1.6 でリンク・動作すること | **未検証**。このワークフローで初めて実行する |
+| 静的ライブラリの iOS 性 | **CI で確認済み**: シンボルテーブル（`__.SYMDEF`）を除いたメンバー（`.o`）を `vtool` で `platform IOS` と照合し、非 iOS のオブジェクトはアーカイブから除外（`filter_non_ios_objects`）。run 41124748670 は `2730 iOS objects from 329 rlibs (0 build-machine objects dropped)` |
+| Rust 1.94.0 が LLVM 21.1.6 でリンク・動作すること | **リンクは CI で成功**（rustc 本体・`llvm-tools`・`compiler_builtins` の C 実装まで、run 40402352677 / 41124748670）。**iOS 実機/シミュレータ上での実行は未検証**（この CI はビルドとリンクまでで、実行はできない） |
 | rust-lang/llvm-project 固有パッチの全列挙 | **未完了**。`rustc/21.1-2025-08-01` は upstream `release/21.x` のマージが主で、bootstrap 側の分岐は `LLVM_RUSTLLVM` の定義だけ。ただし「1 つも無い」ことまでは確認できていない |
-| 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。C++ API の互換性は同一と判断しているが、実際のコンパイルで確認する |
-| `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | プリセット側で ON、shim の `--has-rtti` も `YES`。実ビルドでの確認は未 |
+| 21.1.6 と 21.1.8 の差 | **patch のみ**（`release/21.x`）。実際に rustc を 21.1.6 の C++ API で**ビルドできた**ので（run 40402352677 / 41124748670）、必要だった API 差分は `0001`（`PGOOptions` の vfs 引数）1 件だけだった |
+| `LLVM_ENABLE_RTTI=ON` と rustc_llvm の組み合わせ | **CI で確認済み**: プリセット側で ON、shim の `--has-rtti` も `YES` で、`rustc_llvm` のビルドスクリプトがそのまま通り、`libRustCompiler.a` が LLVM とリンクして動くテストアプリまで到達（run 41124748670） |
 | rust-lang 版 LLVM との API 差 | **1 件検出・パッチ適用**（`PGOOptions` の vfs 引数 = `0001`。`swift` モード専用）。`stdc++`→`libc++` は LLVM の差ではなく iOS 向けクロスビルドの問題なので `0002`（全モード）に分けた。他にも同種の差があれば実ビルドで判明する |
-| 静的 `Rust.xcframework`（`libRustCompiler.a`）+ C API | **C API は入った**（run 40803539605: 3664 iOS objects / 329 rlibs、`nm -g` に `_rustios_run` / `_rustios_version`、`"c_api": true`）。方式は下の「C API の解決」節（`rustc_driver_impl` にコンパイルする `patches/0003`）。**アプリからのリンクテストは同じ run で失敗**し、原因は rustc が最終リンク時にしか作らないアロケータのシムと、C API モジュールの `OnceLock` 由来の generic だった（下の「静的アーカイブが自分で持たなければならないもの」）。両方の修正後の確認が次の実行 |
-| `preflight`（ビルド前の数十秒チェック） | **実装済み・スタブで確認済み**: 成功経路、iOS 側のライブラリ欠落、macOS アーカイブの混入、`RUST_LLVM_MODE=intree` の各経路。実アーカイブでの確認は次回実行 |
-| ビルド時間 | Swift 4 h 29 m（`AArch64;ARM;X86` で実測）、`all` では約 5 h 30 m（実測 5 h 55 m でパッケージ中に打ち切り）→ CI をビルド/パッケージの 2 ジョブに分割。Rust は stage1 + stage2 で 1 h 02 m（実測、キャッシュ利用の warm ビルド） |
+| 静的 `Rust.xcframework`（`libRustCompiler.a`）+ C API | **CI で成功**（run 41124748670: `2730 iOS objects from 329 rlibs (0 dropped)`、`_rustios_run` / `_rustios_version` をエクスポート、`943M` with LLVM、`Headers/rustios.h` を include したテストアプリが `clang -target arm64-apple-ios16.0` でリンク成功、`"c_api": true`）。方式は下の「C API の解決」節。**アプリからの実行は未検証**（リンクまで） |
+| `preflight`（ビルド前の数十秒チェック） | **実アーカイブで確認済み**（run 41124748670: `shared LLVM preflight: 21.0.0, 102 libraries, iOS slice confirmed (3 sampled)`）。エラー経路はスタブで確認済み |
+| ビルド時間 | Swift は **3 h 21 m**（`AArch64` のみ・冷間、run 40803245579）、キャッシュ復元なら 3 m 49 s + 梱包 18 m。`all`（20 バックエンド）は 4 h 16 m。CI はビルド/パッケージを 2 ジョブに分割。Rust は stage1 + stage2 で約 1 h（run 41124748670: 21:13 → 22:10 UTC、xcframework のリンクテスト込み） |
 
 静的ドライバの試行錯誤（すべて CI で実測）:
 
