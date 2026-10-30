@@ -300,9 +300,13 @@ RustToolchain: llvm-tools 380M (15 files in lib/rustlib/aarch64-apple-ios/bin)
 | `SwiftLLVM-…-21.1.6.tar.xz` | 160 M | 240 M |
 | `SwiftToolchain-…-6.4.0.tar.xz` | 384 M（`swift-llvm` artifact は 152 MiB） | 544 M |
 | `LLVM.xcframework-…` | 41 M | 53 M |
-| `RustToolchain-…-1.94.0.tar.xz` | 112 M（llvm-tools の展開分を含む） | 112 M |
-| `RustStd-…-1.94.0.tar.xz` | 352 M（compiler-rt の C 実装を含む） | 352 M |
-| `Rust.xcframework-…` | 192 M（同じく compiler-rt を含む） | 192 M |
+| `RustToolchain-…-1.94.0.tar.xz` | 80 M（llvm-tools の展開分 181 M を含む） | 112 M（llvm-tools 380 M） |
+| `RustStd-…-1.94.0.tar.xz` | 336 M（compiler-rt の C 実装 145 objects を含む） | 352 M |
+| `Rust.xcframework-…` | 176 M（`libRustCompiler.a` = rustc + LLVM で展開 943 M） | 192 M |
+
+Rust 側の数値は run 41124748670（AArch64 のみの LLVM）です。`llvm-tools` が
+380 M → 181 M と半分以下になっているのがバックエンド削減の効果で、std と
+xcframework は compiler-rt の C 実装を含むためほぼ変わりません。
 
 iOS 用の静的ライブラリはバックエンドを減らしても減りません（`AArch64` の
 コード生成だけが残るため）。サイズが減るのは `SwiftLLVM` と

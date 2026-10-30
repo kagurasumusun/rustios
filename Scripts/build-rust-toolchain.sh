@@ -1983,16 +1983,26 @@ add_allocator_shims() {
     fi
     mv -f "${merged}" "${lib}"
 
-    # The merge has to have closed the references, not merely added the object.
-    local still sym
-    still="$(nm -g -u "${lib}" 2>/dev/null | awk '$1 == "U" || $1 == "u" { print $2 }' | sort -u || true)"
+    # Did the merge turn the references into definitions? Ask for the symbols
+    # that are defined somewhere in the archive - *not* for the undefined ones:
+    # `nm -u` on an archive lists the undefined list of every member, so a
+    # reference that the shim object closes is still printed as long as another
+    # member (alloc-*.o, std-*.o, ...) mentions it. Run 41124748670 reported
+    # "not effective" that way while its link test passed, which is exactly the
+    # false alarm this replaces. The clang link test is the authority; this is
+    # only here to leave a line of evidence in the report.
+    local defined sym missing=0
+    defined="$(nm -g "${lib}" 2>/dev/null | awk '$1 != "U" && $1 != "u" && NF >= 2 { print $NF }' || true)"
     for sym in ${u_alloc} ${u_dealloc} ${u_realloc} ${u_zeroed} ${u_marker}; do
-        if [[ "${still}" == *"${sym}"* ]]; then
-            warn "$(basename "${lib}"): ${sym} is still undefined after the shim merge"
-            report_line "xcframework: allocator shims **not** effective ($(basename "${lib}") still lists ${sym})"
-            return 0
+        if [[ "${defined}" != *"${sym}"* ]]; then
+            warn "$(basename "${lib}"): ${sym} has no definition in the archive after the shim merge"
+            missing=$((missing + 1))
         fi
     done
+    if [[ "${missing}" -gt 0 ]]; then
+        report_line "xcframework: allocator shims **incomplete** (${missing} symbol(s) without a definition in $(basename "${lib}"))"
+        return 0
+    fi
     log "$(basename "${lib}"): ${count} allocator shims (${names# }) for the C API"
     report_line "xcframework: allocator shims = ${count} (${names# }), the definitions a final rustc link synthesizes; they forward to the system allocator (malloc/free/realloc/posix_memalign) and are weak, so an app's own shims win"
 }

@@ -52,10 +52,10 @@ tar -xJf RustStd-iphoneos-arm64-<ver>.tar.xz -C RustToolchain   # 完成した s
 | **両方のコンパイラが機能を失わない** | **CI で成功**: 20 バックエンド版（run 40402352677）で `llvm-tools = true` / `optimized-compiler-builtins = true` / `codegen-tests = true`。AArch64 のみの版（run 40803245579 / 40809695799）でも Swift 6.4 とその LLVM がビルド・パッケージ・検証まで通り、rustc 側の 3 つのフラグも同じ。詳細は [llvm-parity.md](llvm-parity.md) |
 | **バックエンドは AArch64 のみ**（2026-10-27 の方針） | **CI で成功**（run 40803245579 冷間 3 h 21 m、run 40809695799 キャッシュ 3 m 49 s）: `swift LLVM: 1 backends (AArch64)` / `backends match the preset` / `shared LLVM backends: 1 (AArch64)`、ライブラリ 199 → 102、`SwiftLLVM` 240 → 160 M、`LLVM.xcframework` 53 → 41 M。`build-embedded-stdlib=0` がベアメタル ARM の builtins を止めています（run 40470888454 で原因確定）。`install_llvm` が両ツリーの `--targets-built` を preset と突き合わせ、違えば die します。**失うもの**: `aarch64-apple-ios` 以外へのクロスコンパイル（[llvm-parity.md](llvm-parity.md) §4.5） |
 | **zlib もツリーごとに参照ビルドと同じ** | **CI で成功**: iOS ツリー OFF / macOS ツリー ON（レポート行 `SwiftLLVM: zlib ON in the macOS tree, OFF in the iOS tree`、run 40768756426 / 40809695799）。preset ではなく `seed_llvm_trees` が各ツリーの CMake キャッシュに入れ、`install_llvm` が `llvm-config.h` と `-lz` で検証（[llvm-parity.md](llvm-parity.md) §2.1） |
-| **`Rust.xcframework` が C API をエクスポートする** | **アーカイブに入ったことは CI で確認**（run 40803539605、`"c_api": true`）。アプリからのリンクテストは同じ run で未定義記号により失敗したため、シムの生成（`add_allocator_shims`）と `patches/0003` の修正を入れ、**次の実行で確認**。§6 |
+| **`Rust.xcframework` が C API をエクスポートする** | **CI で成功**（run 41124748670）: `libRustCompiler.a` に `rustios_run` / `rustios_version`、`Headers/rustios.h` を `#include` したテストアプリが `clang -target arm64-apple-ios16.0` で**リンク成功**（`"c_api": true`）。run 40803539605 で未定義だったアロケータのシムと generic を潰した結果。§6 |
 | Swift コンパイラを iOS 向けにビルドする | **CI で成功**（Swift 6.4、`swift-frontend` は IOS/arm64、`SwiftToolchain` 544 MB。`swiftc`/`swift`/`swift-driver` は macOS のホストドライバ） |
 | Swift が使う LLVM を iOS 設定でビルドする | **CI で成功**（`SwiftLLVM` 240 MB、`LLVM.xcframework` 53 MB。iOS 側 `lib/*.a` のメンバーを `vtool` で検査し `IOS/arm64` を確認） |
-| Rust を Swift の LLVM でビルドする | **CI で成功**（run 40402352677）。`RustToolchain` 112 MB + `RustStd` 352 MB + `Rust.xcframework` 192 MB。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
+| Rust を Swift の LLVM でビルドする | **CI で成功**（20 バックエンド: run 40402352677、AArch64 のみ: run 41124748670 で `RustToolchain` 80 MB + `RustStd` 336 MB + `Rust.xcframework` 176 MB）。`verify` が「Swift の LLVM を使った」ことをビルド生成物から確認 |
 | Rust 専用の LLVM を別にビルドしない | **実装済み**（`src/llvm-project` の LLVM は fetch しない、`llvm-config` を渡す）。`compiler-rt` だけは同じコミットから取る（[llvm-parity.md](llvm-parity.md)） |
 | バージョン整合の証拠 | §1 / §2 |
 | std をツールチェーンから分離 | **実装済み**（`RustStd`）。`RustToolchain` 側に std が漏れていないことを `package` が確認 |
@@ -157,6 +157,17 @@ CI の履歴:
       `OnceLock<CString>` の generic（§6）。前者は `add_allocator_shims` で
       アーカイブに弱い定義として同梱し、後者は `patches/0003` を固定バッファに
       書き換えて消した。
+    * run 41124748670（AArch64 のみの LLVM、Swift はキャッシュから 3 m 49 s）:
+      **全ステップ成功**。`static archive = 2730 iOS objects from 329 rlibs (0 dropped),
+      C API exported`、`libRustCompiler.a = rustc + LLVM, 943M`、そして
+      **`link test passed`**（`clang -target arm64-apple-ios16.0`）。テストアプリは
+      `Headers/rustios.h` を `#include` して `rustios_version()` を呼ぶので、
+      C API とアロケータのシムが実際に解決されることの証明になります。
+      この run のレポートには `allocator shims **not** effective` という**誤った**
+      行が残りました（`nm -u` はアーカイブの**全メンバー**の未定義記号を並べるので、
+      シムが定義しても他のメンバーの参照が残って見える）。判定を「アーカイブ内に
+      定義があるか」に直し、その偽陽性を再現するケースをローカルのハーネスに
+      追加しました。
     * run 40809695799: Rust ジョブが `fetch` で失敗。`rust-src` キャッシュは
       **パッチ適用後のツリー**なので、`patches/0003` を書き換えるとキャッシュ上の
       旧版と衝突して「適用も逆適用もできない」状態になり、`die` していました。
